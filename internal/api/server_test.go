@@ -284,13 +284,48 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rangeBody struct {
-		Total int               `json:"total"`
-		Items []index.GridAsset `json:"items"`
+		Total  int               `json:"total"`
+		Exact  bool              `json:"exact"`
+		Assets []index.GridAsset `json:"assets"`
 	}
 	_ = json.NewDecoder(rangeResp.Body).Decode(&rangeBody)
 	_ = rangeResp.Body.Close()
-	if rangeBody.Total != 1 || len(rangeBody.Items) != 1 || rangeBody.Items[0].Rating != 5 {
+	if rangeBody.Total != 1 || !rangeBody.Exact || len(rangeBody.Assets) != 1 || rangeBody.Assets[0].Rating != 5 || !rangeBody.Assets[0].EditedByHdrToys {
 		t.Fatalf("unexpected range result: %+v", rangeBody)
+	}
+
+	// Single asset carries thumbnailUrl, rawUrl, recipeUrl, editedByHdrToys, and full exif.
+	singleResp, err := http.Get(ts.URL + "/assets/" + assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var single index.Asset
+	_ = json.NewDecoder(singleResp.Body).Decode(&single)
+	_ = singleResp.Body.Close()
+	if single.ThumbnailURL == "" || single.RawURL == "" || single.RecipeURL == "" || !single.EditedByHdrToys || len(single.EXIF) == 0 {
+		t.Fatalf("missing URLs/exif/editedByHdrToys on single asset: %+v", single)
+	}
+
+	// Non-tombstoned variant includes name, recipeUrl, and serves GET /assets/{id}/variants/{variantId}/recipe.
+	varBeforeResp, err := http.Get(ts.URL + "/assets/" + assetID + "/variants")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var varBefore struct {
+		Variants []map[string]any `json:"variants"`
+	}
+	_ = json.NewDecoder(varBeforeResp.Body).Decode(&varBefore)
+	_ = varBeforeResp.Body.Close()
+	if len(varBefore.Variants) != 1 || varBefore.Variants[0]["name"] != "Sunset" || !strings.HasSuffix(varBefore.Variants[0]["recipeUrl"].(string), "/variants/v1/recipe") {
+		t.Fatalf("unexpected variants payload before tombstone: %+v", varBefore.Variants)
+	}
+	vrResp, err := http.Get(varBefore.Variants[0]["recipeUrl"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = vrResp.Body.Close()
+	if vrResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on variant recipeUrl, got %d", vrResp.StatusCode)
 	}
 
 	// Reject non-JPEG edit-thumbnail with 415.
@@ -348,6 +383,7 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 		t.Fatalf("expected 200 on DELETE variant, got %d", delResp.StatusCode)
 	}
 
+	// After tombstoning, default GET /variants filters out tombstones; ?includeTombstones=true returns them.
 	varResp, err := http.Get(ts.URL + "/assets/" + assetID + "/variants")
 	if err != nil {
 		t.Fatal(err)
@@ -357,8 +393,21 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 	}
 	_ = json.NewDecoder(varResp.Body).Decode(&varBody)
 	_ = varResp.Body.Close()
-	if len(varBody.Variants) != 1 || varBody.Variants[0]["tombstone"] != true {
-		t.Fatalf("expected tombstoned v1, got %+v", varBody.Variants)
+	if len(varBody.Variants) != 0 {
+		t.Fatalf("expected tombstoned variant filtered out by default, got %+v", varBody.Variants)
+	}
+
+	varAllResp, err := http.Get(ts.URL + "/assets/" + assetID + "/variants?includeTombstones=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var varAllBody struct {
+		Variants []map[string]any `json:"variants"`
+	}
+	_ = json.NewDecoder(varAllResp.Body).Decode(&varAllBody)
+	_ = varAllResp.Body.Close()
+	if len(varAllBody.Variants) != 1 || varAllBody.Variants[0]["tombstone"] != true {
+		t.Fatalf("expected tombstoned v1 when includeTombstones=true, got %+v", varAllBody.Variants)
 	}
 
 	// POST /auth/session issues session + blobToken that work for authenticated reads.

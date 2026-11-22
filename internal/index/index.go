@@ -33,32 +33,36 @@ import (
 
 // Asset represents one indexed photo or RAW file.
 type Asset struct {
-	ID              string   `json:"id"`
-	FolderID        string   `json:"folderId"`
-	RelPath         string   `json:"relPath"`
-	Name            string   `json:"name"`
-	Kind            string   `json:"kind"`
-	MIME            string   `json:"mimeType"`
-	SizeBytes       int64    `json:"sizeBytes"`
-	MTimeMs         int64    `json:"mtimeMs"`
-	ContentHash     string   `json:"contentHash,omitempty"`
-	SourceRevision  string   `json:"sourceRevision"`
-	Width           int      `json:"width,omitempty"`
-	Height          int      `json:"height,omitempty"`
-	Orientation     int      `json:"orientation,omitempty"`
-	HasGainMap      bool     `json:"hasGainMap"`
-	CapturedAt      string   `json:"capturedAt"`
-	ImportedAt      string   `json:"importedAt"`
-	EditedAt        string   `json:"editedAt,omitempty"`
-	Rating          int      `json:"rating"`
-	Flag            *string  `json:"flag"`
-	ColorLabel      *string  `json:"colorLabel"`
-	Keywords        []string `json:"keywords"`
-	EditedByHdrtoys bool     `json:"editedByHdrtoys"`
-	EXIFJSON        string   `json:"-"`
-	FolderRoot      string   `json:"-"`
-	SidecarRoot     string   `json:"-"`
-	AbsPath         string   `json:"-"`
+	ID              string         `json:"id"`
+	FolderID        string         `json:"folderId"`
+	RelPath         string         `json:"relPath"`
+	Name            string         `json:"name"`
+	Kind            string         `json:"kind"`
+	MIME            string         `json:"mimeType"`
+	SizeBytes       int64          `json:"sizeBytes"`
+	MTimeMs         int64          `json:"mtimeMs"`
+	ContentHash     string         `json:"contentHash,omitempty"`
+	SourceRevision  string         `json:"sourceRevision"`
+	Width           int            `json:"width"`
+	Height          int            `json:"height"`
+	Orientation     int            `json:"orientation,omitempty"`
+	HasGainMap      bool           `json:"hasGainMap"`
+	CapturedAt      string         `json:"capturedAt"`
+	ImportedAt      string         `json:"importedAt"`
+	EditedAt        string         `json:"editedAt,omitempty"`
+	Rating          int            `json:"rating"`
+	Flag            *string        `json:"flag"`
+	ColorLabel      *string        `json:"colorLabel"`
+	Keywords        []string       `json:"keywords"`
+	EditedByHdrToys bool           `json:"editedByHdrToys"`
+	ThumbnailURL    string         `json:"thumbnailUrl,omitempty"`
+	RawURL          string         `json:"rawUrl,omitempty"`
+	RecipeURL       string         `json:"recipeUrl,omitempty"`
+	EXIF            map[string]any `json:"exif,omitempty"`
+	EXIFJSON        string         `json:"-"`
+	FolderRoot      string         `json:"-"`
+	SidecarRoot     string         `json:"-"`
+	AbsPath         string         `json:"-"`
 }
 
 // GridAsset is the compact projection returned for fields=grid range queries.
@@ -69,18 +73,19 @@ type GridAsset struct {
 	Kind            string   `json:"kind"`
 	MIME            string   `json:"mimeType"`
 	SourceRevision  string   `json:"sourceRevision"`
-	Width           int      `json:"width,omitempty"`
-	Height          int      `json:"height,omitempty"`
+	Width           int      `json:"width"`
+	Height          int      `json:"height"`
 	HasGainMap      bool     `json:"hasGainMap"`
 	CapturedAt      string   `json:"capturedAt"`
 	Rating          int      `json:"rating"`
 	Flag            *string  `json:"flag"`
 	ColorLabel      *string  `json:"colorLabel"`
 	Keywords        []string `json:"keywords,omitempty"`
-	EditedByHdrtoys bool     `json:"editedByHdrtoys"`
+	EditedByHdrToys bool     `json:"editedByHdrToys"`
+	ThumbnailURL    string   `json:"thumbnailUrl,omitempty"`
 }
 
-// ToGrid converts an Asset to its compact grid representation.
+// ToGrid converts an Asset to its compact grid representation (omitting heavy EXIF).
 func (a Asset) ToGrid() GridAsset {
 	return GridAsset{
 		ID:              a.ID,
@@ -97,22 +102,24 @@ func (a Asset) ToGrid() GridAsset {
 		Flag:            a.Flag,
 		ColorLabel:      a.ColorLabel,
 		Keywords:        a.Keywords,
-		EditedByHdrtoys: a.EditedByHdrtoys,
+		EditedByHdrToys: a.EditedByHdrToys,
+		ThumbnailURL:    a.ThumbnailURL,
 	}
 }
 
 // Filter specifies filtering and sorting parameters for asset queries.
 type Filter struct {
-	Query     string
-	Rating    *int
-	RatingGte *int
-	Flag      string
-	Label     string
-	Keywords  []string
-	Kind      string
-	Folder    string
-	Sort      string // captured | imported | edited | name | rating
-	Dir       string // asc | desc
+	Query         string
+	Rating        *int
+	RatingGte     *int
+	RatingUnrated bool
+	Flag          string
+	Label         string
+	Keywords      []string
+	Kind          string
+	Folder        string
+	Sort          string // captured | imported | edited | name | rating
+	Dir           string // asc | desc
 }
 
 // OpReceipt reports the durable outcome of one op in POST /ops.
@@ -125,13 +132,15 @@ type OpReceipt struct {
 
 // ChangeOp represents one journaled op returned by GET /changes.
 type ChangeOp struct {
-	Seq     int64           `json:"seq"`
-	Device  string          `json:"device"`
-	HLC     string          `json:"hlc"`
-	AssetID string          `json:"assetId"`
-	Field   string          `json:"field"`
-	Outcome string          `json:"outcome"`
-	Op      json.RawMessage `json:"op"`
+	Seq      int64           `json:"seq"`
+	Device   string          `json:"device"`
+	HLC      string          `json:"hlc"`
+	AssetKey string          `json:"assetKey"`
+	AssetID  string          `json:"assetId"`
+	Field    string          `json:"field"`
+	Value    any             `json:"value"`
+	Outcome  string          `json:"outcome"`
+	Op       json.RawMessage `json:"op,omitempty"`
 }
 
 // ChangesFeed is returned by GET /changes?since=<cursor>.
@@ -360,7 +369,9 @@ func buildWhere(f Filter) (clause string, args []any) {
 		conds = append(conds, `(LOWER(a.name) LIKE ? OR LOWER(a.rel_path) LIKE ? OR EXISTS (SELECT 1 FROM asset_keywords ak WHERE ak.asset_id = a.id AND LOWER(ak.keyword) LIKE ?))`)
 		args = append(args, like, like, like)
 	}
-	if f.Rating != nil {
+	if f.RatingUnrated {
+		conds = append(conds, `a.rating = 0`)
+	} else if f.Rating != nil {
 		conds = append(conds, `a.rating = ?`)
 		args = append(args, *f.Rating)
 	}
@@ -577,7 +588,7 @@ func (idx *Index) scanAssets(ctx context.Context, rows *sql.Rows) ([]Asset, erro
 		}
 		a.MTimeMs = mtimeNs / int64(time.Millisecond)
 		a.HasGainMap = gainMap != 0
-		a.EditedByHdrtoys = edited != 0
+		a.EditedByHdrToys = edited != 0
 		if flagStr != "" {
 			v := flagStr
 			a.Flag = &v
@@ -587,6 +598,7 @@ func (idx *Index) scanAssets(ctx context.Context, rows *sql.Rows) ([]Asset, erro
 			a.ColorLabel = &v
 		}
 		a.Keywords = []string{}
+		a.EXIF = buildFullEXIF(a)
 		idx.attachPaths(&a)
 		out = append(out, a)
 	}
@@ -798,15 +810,16 @@ func (idx *Index) syncAssetFromSidecarLocked(ctx context.Context, assetID string
 	return tx.Commit()
 }
 
-// ChangesSince returns all journaled ops after sinceCursor and the current state
-// of affected assets for multi-device convergence.
+// ChangesSince returns all applied journaled ops after sinceCursor and the
+// current state of affected assets for multi-device convergence.
 func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit int) (*ChangesFeed, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	var sinceSeq int64
 	if sinceCursor != "" {
-		if n, err := strconv.ParseInt(sinceCursor, 10, 64); err == nil && n >= 0 {
+		trimmed := strings.TrimPrefix(strings.TrimSpace(sinceCursor), "c")
+		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil && n >= 0 {
 			sinceSeq = n
 		}
 	}
@@ -814,7 +827,7 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 	rows, err := idx.db.QueryContext(ctx, `
 		SELECT seq, device, hlc, asset_id, field, outcome, op_json
 		FROM ops_log
-		WHERE seq > ?
+		WHERE seq > ? AND outcome = 'applied'
 		ORDER BY seq ASC
 		LIMIT ?`, sinceSeq, limit)
 	if err != nil {
@@ -834,6 +847,14 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 			return nil, err
 		}
 		c.Op = json.RawMessage(opText)
+		c.AssetKey = c.AssetID
+		var parsed sidecar.TruthOp
+		if err := json.Unmarshal([]byte(opText), &parsed); err == nil {
+			if parsed.AssetKey != "" {
+				c.AssetKey = parsed.AssetKey
+			}
+			c.Value = parsed.Value
+		}
 		ops = append(ops, c)
 		if c.AssetID != "" && c.AssetID != "@library" {
 			assetIDs[c.AssetID] = true
@@ -844,6 +865,15 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+
+	// On bootstrap (empty feed), anchor nextCursor at the current max seq so
+	// callers have a valid fence even when ops_log is empty or had stale entries.
+	if len(ops) == 0 && sinceSeq == 0 {
+		var maxSeq sql.NullInt64
+		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err == nil && maxSeq.Valid && maxSeq.Int64 > lastSeq {
+			lastSeq = maxSeq.Int64
+		}
 	}
 
 	assets := make([]Asset, 0, len(assetIDs))
@@ -857,8 +887,40 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 	return &ChangesFeed{
 		Ops:        ops,
 		Assets:     assets,
-		NextCursor: strconv.FormatInt(lastSeq, 10),
+		NextCursor: fmt.Sprintf("c%d", lastSeq),
 	}, nil
+}
+
+func buildFullEXIF(a Asset) map[string]any {
+	m := map[string]any{}
+	if a.EXIFJSON != "" && a.EXIFJSON != "{}" {
+		_ = json.Unmarshal([]byte(a.EXIFJSON), &m)
+	}
+	if _, ok := m["orientation"]; !ok {
+		m["orientation"] = a.Orientation
+	}
+	if _, ok := m["width"]; !ok {
+		m["width"] = a.Width
+	}
+	if _, ok := m["height"]; !ok {
+		m["height"] = a.Height
+	}
+	if _, ok := m["lens"]; !ok {
+		m["lens"] = nil
+	}
+	if _, ok := m["aperture"]; !ok {
+		m["aperture"] = nil
+	}
+	if _, ok := m["shutterSpeed"]; !ok {
+		m["shutterSpeed"] = nil
+	}
+	if _, ok := m["focalLength"]; !ok {
+		m["focalLength"] = nil
+	}
+	if _, ok := m["whiteBalance"]; !ok {
+		m["whiteBalance"] = nil
+	}
+	return m
 }
 
 // WALSizeBytes returns the current SQLite WAL file size in bytes (0 if absent).

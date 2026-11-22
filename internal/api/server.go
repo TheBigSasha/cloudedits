@@ -60,6 +60,7 @@ type Server struct {
 	authz         auth.Authorizer
 	sessions      *auth.SessionManager
 	clock         *hlc.Clock
+	v1Clock       *hlc.Clock
 	streamSem     chan struct{}
 	activeStreams atomic.Int64
 	routes        []RouteSpec
@@ -112,6 +113,7 @@ func New(opts Options) (*Server, error) {
 		authz:     opts.Authorizer,
 		sessions:  opts.Sessions,
 		clock:     opts.Clock,
+		v1Clock:   hlc.NewClock("v1", func() time.Time { return time.UnixMilli(1) }),
 		streamSem: make(chan struct{}, maxConcurrentStreams),
 	}
 
@@ -127,8 +129,17 @@ func New(opts Options) (*Server, error) {
 		specCopy := spec
 		mux.HandleFunc(specCopy.Method+" "+specCopy.Pattern, s.wrapRoute(specCopy))
 	}
+	mux.HandleFunc("/", s.handleFallback)
 	s.handler = s.withHeadersLaw(mux)
 	return s, nil
+}
+
+func (s *Server) handleFallback(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/__dev/") {
+		writeAPIError(w, http.StatusNotFound, "not-found", "not found")
+		return
+	}
+	writeAPIError(w, http.StatusNotImplemented, "unsupported-capability", "unsupported capability")
 }
 
 // Routes returns a copy of the registered declarative RouteSpecs.
@@ -158,7 +169,9 @@ func (s *Server) coreRoutes() []RouteSpec {
 		{Method: http.MethodGet, Pattern: "/assets/{id}/blob", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 40, Handler: s.handleAssetBlob},
 		{Method: http.MethodGet, Pattern: "/assets/{id}/file", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 40, Handler: s.handleAssetBlob},
 		{Method: http.MethodGet, Pattern: "/assets/{id}/recipe", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 30, Handler: s.handleAssetRecipe},
+		{Method: http.MethodPost, Pattern: "/assets/{id}/rating", Auth: auth.AuthAuthenticated, Permission: auth.PermEditsWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 50, Handler: s.handlePostRating},
 		{Method: http.MethodGet, Pattern: "/assets/{id}/variants", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 30, Handler: s.handleAssetVariants},
+		{Method: http.MethodGet, Pattern: "/assets/{id}/variants/{variantId}/recipe", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 30, Handler: s.handleVariantRecipe},
 		{Method: http.MethodDelete, Pattern: "/assets/{id}/variants/{variantId}", Auth: auth.AuthAuthenticated, Permission: auth.PermVariantsWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 50, Handler: s.handleDeleteVariant},
 		{Method: http.MethodPut, Pattern: "/assets/{id}/edit-thumbnail", Auth: auth.AuthAuthenticated, Permission: auth.PermMediaWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 80, Handler: s.handlePutEditThumbnail},
 		{Method: http.MethodPost, Pattern: "/assets/{id}/renders", Auth: auth.AuthAuthenticated, Permission: auth.PermVariantsWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 150, Handler: s.handlePostRender},
@@ -229,7 +242,7 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 			h.Set("Access-Control-Allow-Origin", "*")
 		}
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id")
 		h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 
 		if r.Method == http.MethodOptions {
@@ -347,10 +360,14 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"variants":       true,
 		"ops":            true,
 		"changes":        true,
+		"changeFeed":     true,
+		"rangeQueries":   true,
 		"writeBack":      true,
 		"originals":      "ranged",
 		"handoff":        true,
 		"acceptsRenders": true,
+		"blobs":          []string{"t0", "t1", "t2", "original"},
+		"search":         []string{"q", "rating", "flag", "label", "keyword", "kind", "folder"},
 	}
 	s.extraCaps(caps)
 
@@ -363,7 +380,12 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":     1,
+		"version": 1,
+		"protocol": map[string]any{
+			"name":      "hdrtoys-lp",
+			"version":   2,
+			"minCompat": 1,
+		},
 		"profiles":    []string{remoteLibraryProfile},
 		"caps":        caps,
 		"permissions": perms,
@@ -413,8 +435,10 @@ func parseFilter(r *http.Request) index.Filter {
 		Sort:     q.Get("sort"),
 		Dir:      q.Get("dir"),
 	}
-	if v := q.Get("rating"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+	if v := strings.TrimSpace(q.Get("rating")); v != "" {
+		if strings.EqualFold(v, "unrated") {
+			f.RatingUnrated = true
+		} else if n, err := strconv.Atoi(v); err == nil {
 			f.Rating = &n
 		}
 	}
@@ -426,13 +450,28 @@ func parseFilter(r *http.Request) index.Filter {
 	return f
 }
 
+func (s *Server) populateAssetURLs(r *http.Request, a *index.Asset, includeFullEXIF bool) {
+	origin := s.selfOrigin(r)
+	esc := url.PathEscape(a.ID)
+	a.ThumbnailURL = origin + "/assets/" + esc + "/file?tier=thumb"
+	a.RawURL = origin + "/assets/" + esc + "/file?tier=original"
+	a.RecipeURL = origin + "/assets/" + esc + "/recipe"
+	if !includeFullEXIF {
+		a.EXIF = nil
+	}
+}
+
 func (s *Server) handleAssetsCount(w http.ResponseWriter, r *http.Request) {
 	cnt, err := s.idx.Count(r.Context(), parseFilter(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"count": cnt})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": cnt,
+		"count": cnt,
+		"exact": true,
+	})
 }
 
 func (s *Server) handleAssetsRange(w http.ResponseWriter, r *http.Request) {
@@ -455,23 +494,29 @@ func (s *Server) handleAssetsRange(w http.ResponseWriter, r *http.Request) {
 
 	if fields == "grid" {
 		grid := make([]index.GridAsset, len(items))
-		for i, a := range items {
-			grid[i] = a.ToGrid()
+		for i := range items {
+			s.populateAssetURLs(r, &items[i], false)
+			grid[i] = items[i].ToGrid()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"offset": offset,
 			"limit":  limit,
 			"total":  total,
-			"items":  grid,
+			"exact":  true,
+			"assets": grid,
 		})
 		return
 	}
 
+	for i := range items {
+		s.populateAssetURLs(r, &items[i], true)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"offset": offset,
 		"limit":  limit,
 		"total":  total,
-		"items":  items,
+		"exact":  true,
+		"assets": items,
 	})
 }
 
@@ -494,18 +539,23 @@ func (s *Server) handleAssetsList(w http.ResponseWriter, r *http.Request) {
 	}
 	if fields == "grid" {
 		grid := make([]index.GridAsset, len(items))
-		for i, a := range items {
-			grid[i] = a.ToGrid()
+		for i := range items {
+			s.populateAssetURLs(r, &items[i], false)
+			grid[i] = items[i].ToGrid()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"items":      grid,
+			"assets":     grid,
 			"nextCursor": nextCursor,
 			"total":      total,
 		})
 		return
 	}
+	for i := range items {
+		// Thin list projection (omit heavy full EXIF; GET /assets/{id} serves full EXIF).
+		s.populateAssetURLs(r, &items[i], false)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items":      items,
+		"assets":     items,
 		"nextCursor": nextCursor,
 		"total":      total,
 	})
@@ -521,6 +571,7 @@ func (s *Server) handleAssetGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.populateAssetURLs(r, asset, true)
 	writeJSON(w, http.StatusOK, asset)
 }
 
@@ -635,14 +686,65 @@ func (s *Server) handleAssetRecipe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if res.Sidecar == nil || res.Sidecar.Recipe == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"assetId": asset.ID, "recipe": nil, "hlc": ""})
+	if res.Sidecar == nil || res.Sidecar.Recipe == nil || res.Sidecar.Recipe.V == nil {
+		writeError(w, http.StatusNotFound, "recipe not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"assetId": asset.ID,
 		"recipe":  res.Sidecar.Recipe.V,
 		"hlc":     res.Sidecar.Recipe.HLC,
+	})
+}
+
+func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	var req struct {
+		Rating *int `json:"rating"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == nil {
+		writeError(w, http.StatusBadRequest, "invalid rating payload")
+		return
+	}
+	rating := *req.Rating
+	if rating < 0 || rating > 5 {
+		writeError(w, http.StatusBadRequest, "rating must be between 0 and 5")
+		return
+	}
+	// Legacy v1 non-HLC rating write: use the monotonic v1 clock when no modern
+	// HLC has touched this asset's rating yet so real HLC sync clients with
+	// slight clock skew remain authoritative; otherwise advance the server clock.
+	writeHLC := s.v1Clock.Tick()
+	if asset, aerr := s.idx.GetAsset(r.Context(), assetID); aerr == nil {
+		if res, rerr := s.idx.Sidecars().Read(asset.FolderRoot, asset.SidecarRoot, asset.RelPath); rerr == nil && res.Sidecar != nil {
+			if cell, ok := res.Sidecar.Fields["rating"]; ok && !strings.HasSuffix(cell.HLC, "-v1") {
+				_ = s.clock.Observe(cell.HLC)
+				writeHLC = s.clock.Tick()
+			}
+		}
+	}
+	op := sidecar.TruthOp{
+		HLC:      writeHLC,
+		Device:   "cloudedits-v1",
+		AssetKey: assetID,
+		Field:    "rating",
+		Value:    rating,
+	}
+	receipts, err := s.idx.ApplyOpsBatch(r.Context(), []sidecar.TruthOp{op})
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"assetId":  assetID,
+		"rating":   rating,
+		"durable":  true,
+		"receipts": receipts,
 	})
 }
 
@@ -661,15 +763,25 @@ func (s *Server) handleAssetVariants(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	incTomb := strings.EqualFold(r.URL.Query().Get("includeTombstones"), "true") || r.URL.Query().Get("includeTombstones") == "1"
+	origin := s.selfOrigin(r)
+	escAsset := url.PathEscape(asset.ID)
+
 	variants := []map[string]any{}
 	if res.Sidecar != nil {
 		for _, vr := range res.Sidecar.Variants {
-			m := map[string]any{
-				"id":  vr.ID,
-				"hlc": vr.HLC,
+			if vr.Tombstone && !incTomb {
+				continue
 			}
-			if vr.Name != nil {
-				m["name"] = *vr.Name
+			name := vr.ID
+			if vr.Name != nil && strings.TrimSpace(*vr.Name) != "" {
+				name = *vr.Name
+			}
+			m := map[string]any{
+				"id":        vr.ID,
+				"name":      name,
+				"hlc":       vr.HLC,
+				"recipeUrl": origin + "/assets/" + escAsset + "/variants/" + url.PathEscape(vr.ID) + "/recipe",
 			}
 			if vr.Recipe != nil {
 				m["recipe"] = vr.Recipe
@@ -687,6 +799,33 @@ func (s *Server) handleAssetVariants(w http.ResponseWriter, r *http.Request) {
 		"assetId":  asset.ID,
 		"variants": variants,
 	})
+}
+
+func (s *Server) handleVariantRecipe(w http.ResponseWriter, r *http.Request) {
+	asset, err := s.idx.GetAsset(r.Context(), r.PathValue("id"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	variantID := strings.TrimSpace(r.PathValue("variantId"))
+	res, err := s.idx.Sidecars().Read(asset.FolderRoot, asset.SidecarRoot, asset.RelPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if res.Sidecar != nil {
+		for _, vr := range res.Sidecar.Variants {
+			if vr.ID == variantID && !vr.Tombstone && vr.Recipe != nil {
+				writeJSON(w, http.StatusOK, vr.Recipe)
+				return
+			}
+		}
+	}
+	writeError(w, http.StatusNotFound, "variant recipe not found")
 }
 
 func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
@@ -723,25 +862,57 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
-	dec := json.NewDecoder(r.Body)
-	dec.UseNumber()
-
-	var req struct {
-		Ops []sidecar.TruthOp `json:"ops"`
-	}
-	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid ops JSON: "+err.Error())
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read ops body")
 		return
 	}
-	if len(req.Ops) > maxOpsBatch {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		writeError(w, http.StatusBadRequest, "empty ops body")
+		return
+	}
+
+	var ops []sidecar.TruthOp
+	switch trimmed[0] {
+	case '[':
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		dec.UseNumber()
+		if err := dec.Decode(&ops); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid ops array JSON: "+err.Error())
+			return
+		}
+	case '{':
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid ops envelope JSON: "+err.Error())
+			return
+		}
+		rawOps, ok := env["ops"]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
+			return
+		}
+		dec := json.NewDecoder(strings.NewReader(string(rawOps)))
+		dec.UseNumber()
+		if err := dec.Decode(&ops); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid ops array: "+err.Error())
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
+		return
+	}
+
+	if len(ops) > maxOpsBatch {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("batch exceeds max %d ops", maxOpsBatch))
 		return
 	}
-	for _, op := range req.Ops {
+	for _, op := range ops {
 		_ = s.clock.Observe(op.HLC)
 	}
 
-	receipts, err := s.idx.ApplyOpsBatch(r.Context(), req.Ops)
+	receipts, err := s.idx.ApplyOpsBatch(r.Context(), ops)
 	if errors.Is(err, os.ErrNotExist) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -750,9 +921,24 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	applied, duplicates, stale := 0, 0, 0
+	for _, rc := range receipts {
+		switch rc.Status {
+		case "applied":
+			applied++
+		case "duplicate":
+			duplicates++
+		case "stale":
+			stale++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"durable":  true,
-		"receipts": receipts,
+		"durable":    true,
+		"applied":    applied,
+		"duplicates": duplicates,
+		"stale":      stale,
+		"receipts":   receipts,
 	})
 }
 
@@ -763,6 +949,9 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	for i := range feed.Assets {
+		s.populateAssetURLs(r, &feed.Assets[i], false)
 	}
 	writeJSON(w, http.StatusOK, feed)
 }
@@ -932,6 +1121,38 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeAPIError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{
+			"code":    code,
+			"message": msg,
+		},
+	})
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	code := "internal-error"
+	switch status {
+	case http.StatusBadRequest:
+		code = "bad-request"
+	case http.StatusUnauthorized:
+		code = "unauthorized"
+	case http.StatusForbidden:
+		code = "forbidden"
+	case http.StatusNotFound:
+		code = "not-found"
+	case http.StatusRequestEntityTooLarge:
+		code = "payload-too-large"
+	case http.StatusUnsupportedMediaType:
+		code = "unsupported-media-type"
+	case http.StatusUnprocessableEntity:
+		code = "unprocessable-entity"
+	case http.StatusTooManyRequests:
+		code = "rate-limited"
+	case http.StatusNotImplemented:
+		code = "unsupported-capability"
+	case http.StatusServiceUnavailable:
+		code = "service-unavailable"
+	}
+	writeAPIError(w, status, code, msg)
 }

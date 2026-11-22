@@ -118,7 +118,7 @@ func TestScanOpsIdempotencyFilterAndLosslessRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAsset after rebuild: %v", err)
 	}
-	if a2.Rating != 5 || a2.Flag == nil || *a2.Flag != "pick" || !a2.EditedByHdrtoys || len(a2.Keywords) != 2 {
+	if a2.Rating != 5 || a2.Flag == nil || *a2.Flag != "pick" || !a2.EditedByHdrToys || len(a2.Keywords) != 2 {
 		t.Fatalf("lossless rebuild lost metadata: %+v", a2)
 	}
 }

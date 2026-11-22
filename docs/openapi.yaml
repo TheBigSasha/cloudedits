@@ -21,10 +21,20 @@ components:
   schemas:
     CapabilitiesResponse:
       type: object
-      required: [version, profiles, caps, permissions, limits, library]
+      required: [version, protocol, profiles, caps, permissions, limits, library]
       properties:
         version:
           type: integer
+        protocol:
+          type: object
+          required: [name, version, minCompat]
+          properties:
+            name:
+              type: string
+            version:
+              type: integer
+            minCompat:
+              type: integer
         profiles:
           type: array
           items:
@@ -95,8 +105,17 @@ components:
           type: array
           items:
             type: string
-        editedByHdrtoys:
+        editedByHdrToys:
           type: boolean
+        thumbnailUrl:
+          type: string
+        rawUrl:
+          type: string
+        recipeUrl:
+          type: string
+        exif:
+          type: object
+          additionalProperties: true
     TruthOp:
       type: object
       required: [hlc, device, assetKey, field]

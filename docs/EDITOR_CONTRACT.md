@@ -37,17 +37,19 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 | `GET` | `/` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&gallery_name=<name>` (or JSON if `Accept: application/json`) |
 | `GET` | `/open` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&image_id=<a>` |
 | `GET` | `/h/{id}` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&handoff=<id>` |
-| `GET` | `/capabilities` | Public | — | Advertise `profiles`, `caps`, `permissions`, `limits`, and `library` |
+| `GET` | `/capabilities` | Public | — | Advertise `protocol` (`hdrtoys-lp` v2), `profiles`, `caps`, `permissions`, `limits`, and `library` |
 | `POST` | `/auth/session` | Public | — | Exchange Tailnet WhoIs identity or bearer token for a short-lived session token and blob signing key scope |
-| `GET` | `/assets/count` | Authenticated | `library:read` | Count assets matching filter params |
-| `GET` | `/assets/range` | Authenticated | `library:read` | Offset/limit slice (`limit <= 500`, `fields=grid|full`) |
-| `GET` | `/assets` | Authenticated | `library:read` | Cursor-paginated list (`limit <= 200`) |
-| `GET` | `/assets/{id}` | Authenticated | `asset:read` | Full asset metadata |
+| `GET` | `/assets/count` | Authenticated | `library:read` | Count matching assets (`{ total, count, exact }`) |
+| `GET` | `/assets/range` | Authenticated | `library:read` | Offset/limit slice (`{ total, exact, offset, limit, assets[] }`, `limit <= 500`, `fields=grid|full`) |
+| `GET` | `/assets` | Authenticated | `library:read` | Cursor-paginated list (`{ assets[], nextCursor, total }`, `limit <= 200`) |
+| `GET` | `/assets/{id}` | Authenticated | `asset:read` | Full asset metadata (including `thumbnailUrl`, `rawUrl`, `recipeUrl`, `editedByHdrToys`, full `exif`) |
 | `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`, supports `&bt=<signed>`) |
 | `GET` | `/assets/{id}/file` | Authenticated | `asset:read` | Alias for `/assets/{id}/blob` |
-| `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ v, hlc }` |
-| `GET` | `/assets/{id}/variants` | Authenticated | `asset:read` | Append-only variants list (including tombstones) |
-| `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint; `(device, hlc)` idempotent |
+| `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ v, hlc }` (`404` `not-found` when unedited) |
+| `POST` | `/assets/{id}/rating` | Authenticated | `edits:write` | Write asset rating (`0`–`5`) durably as an HLC op |
+| `GET` | `/assets/{id}/variants` | Authenticated | `asset:read` | Active immutable variants (`{ id, name, hlc, recipeUrl, recipe }`; pass `?includeTombstones=true` for deleted entries) |
+| `GET` | `/assets/{id}/variants/{variantId}/recipe` | Authenticated | `asset:read` | Fetch one variant's recipe JSON |
+| `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint (accepts raw `[op, ...]` or `{ "ops": [...] }`; returns `{ durable, applied, duplicates, stale, receipts }`) |
 | `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<seq>` |
 | `PUT` | `/assets/{id}/edit-thumbnail` | Authenticated | `media:write` | Persist edited JPEG preview (<= 4 MiB, `FF D8` verified) |
 | `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` / `renderId`) |
