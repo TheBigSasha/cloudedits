@@ -9,7 +9,7 @@ Serve your local photo folders over your private Tailscale network (`https://lib
 - **Source files are strictly read-only.** `cloudedits` never modifies, renames, or deletes original photos. All mutations write exclusively inside `<folder>/.hdrtoys/` (or an explicit `--sidecar-dir` for `:ro` mounts).
 - **100% on-disk intercompatibility.** Sidecars use the canonical `.hdrtoys/<rel-posix-path>.edits` (`hdrt: 1`) HLC format so opening the same folder locally in `hdr.toys` or remotely through `cloudedits` shares every edit, rating, keyword, variant, and preview thumbnail with zero migration.
 - **Rebuildable index.** The SQLite WAL index and thumbnail cache live outside your photo folders. Deleting them and restarting reconstructs library state losslessly from source files and `.hdrtoys/`.
-- **Dedicated Tailscale identity (`tsnet`).** Embeds userspace `tailscale.com/tsnet` with automatic Let's Encrypt HTTPS certificates (`ListenTLS(":443")`), zero root privileges, and no `NET_ADMIN` or `/dev/net/tun` required in Docker.
+- **Dedicated server-level Tailscale node (`tsnet`).** Tailscale is required for remote access and runs directly inside the `cloudedits` server via a pre-approved auth token — **not** system-wide on the host. Exposes your library at its Tailscale MagicDNS URL (`https://library.<tailnet>.ts.net`) and Tailscale IP (`100.x.y.z`) with automatic Let's Encrypt HTTPS certificates (`ListenTLS(":443")`), zero root privileges, and no `NET_ADMIN` or `/dev/net/tun` required in Docker.
 - **Fail-closed routing & compile-time dev isolation.** Every HTTP route declares its `AuthPolicy`, `Permission`, `ResourceScope`, and latency budget. Test harness routes under `/__dev/*` are compiled out of release binaries via `//go:build dev_apis`.
 
 ## Quick Start

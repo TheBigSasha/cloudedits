@@ -2,6 +2,8 @@
 
 `cloudedits` ships as a single executable supporting three workflows: Desktop Setup GUI, Headless CLI, and Docker/NAS.
 
+**Tailscale networking model:** Tailscale is required for remote access and runs **at the library server level** via embedded `tailscale.com/tsnet` using a pre-approved auth token — **not** system-wide on the host machine. Once enrolled, your library is reachable from your tailnet at its **Tailscale MagicDNS URL (`https://library.<tailnet>.ts.net`)** and **Tailscale IP (`100.x.y.z`)**.
+
 ## Mode 1: Desktop Setup GUI
 
 ```bash
@@ -10,7 +12,7 @@ cloudedits gui
 
 Opens a loopback setup wizard in your default browser:
 1. Choose one or more photo folders (source files are strictly read-only; edits save under `.hdrtoys/`).
-2. Choose your Tailscale hostname (default `library` -> `https://library.<tailnet>.ts.net`) and paste a one-time auth key from `https://login.tailscale.com/admin/settings/keys`.
+2. Choose your Tailscale hostname (default `library` -> MagicDNS `https://library.<tailnet>.ts.net` and Tailscale IP `100.x.y.z`) and paste a pre-approved one-time auth token from `https://login.tailscale.com/admin/settings/keys`.
 3. Verify MagicDNS + HTTPS readiness (if disabled, enable both at `https://login.tailscale.com/admin/dns`).
 4. Scan the QR code from your phone or click **Open in hdr.toys**.
 

@@ -158,6 +158,7 @@ func cmdSetup(args []string) int {
 	}
 
 	var fqdn string
+	var tailscaleIP string
 	var actionRequired string
 	if authKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -169,6 +170,7 @@ func cmdSetup(args []string) int {
 		})
 		if node != nil {
 			fqdn = node.FQDN()
+			tailscaleIP = node.TailscaleIP()
 			_ = node.Close()
 		}
 		if errors.Is(err, tsnetnode.ErrHTTPSNotEnabled) {
@@ -179,6 +181,7 @@ func cmdSetup(args []string) int {
 				"actionRequired": actionRequired,
 				"hostname":       cfg.Hostname,
 				"fqdn":           fqdn,
+				"tailscaleIp":    tailscaleIP,
 				"folders":        cfg.Folders,
 			}
 			emitOutput(*jsonOut, out, "ACTION REQUIRED: "+actionRequired)
@@ -195,6 +198,7 @@ func cmdSetup(args []string) int {
 		"libraryName":    cfg.LibraryName,
 		"hostname":       cfg.Hostname,
 		"fqdn":           fqdn,
+		"tailscaleIp":    tailscaleIP,
 		"dataDir":        cfg.DataDir,
 		"sidecarDir":     cfg.SidecarDir,
 		"folders":        cfg.Folders,
@@ -357,7 +361,11 @@ func cmdServe(args []string) int {
 	}()
 
 	cnt, _ := idx.Count(ctx, index.Filter{})
-	fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (%d assets, %d folders)\n", version, pubURL, cnt, len(cfg.Folders))
+	if tsNode != nil && tsNode.TailscaleIP() != "" {
+		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (Tailscale IP %s, %d assets, %d folders)\n", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
+	} else {
+		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (%d assets, %d folders)\n", version, pubURL, cnt, len(cfg.Folders))
+	}
 	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "serve error: %v\n", err)
 		return exitStorage

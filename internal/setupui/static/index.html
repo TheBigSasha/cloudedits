@@ -112,16 +112,18 @@
     </section>
 
     <section class="card">
-      <h2>2. Tailscale Node</h2>
+      <h2>2. Tailscale Library Node (Required — Server-Level)</h2>
+      <div class="badge">Runs embedded inside cloudedits via a pre-approved auth token — not system-wide</div>
       <div class="row" style="margin-bottom: 10px;">
         <input id="hostname" type="text" placeholder="library" />
         <button id="saveHostBtn">Save hostname</button>
       </div>
       <div class="row">
-        <a class="btn" href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">Get one-time key from Tailscale</a>
+        <a class="btn" href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">Get pre-approved auth token from Tailscale</a>
         <a class="btn" href="https://login.tailscale.com/admin/dns" target="_blank" rel="noopener noreferrer">Enable MagicDNS &amp; HTTPS</a>
       </div>
       <p class="muted" style="margin-top: 10px;">
+        Your library joins your tailnet directly at its MagicDNS URL (<code>https://library.&lt;tailnet&gt;.ts.net</code>) and Tailscale IP (<code>100.x.y.z</code>) without installing system-wide Tailscale on the host.
         Run <code>cloudedits setup --hostname library --tailscale-auth-key-stdin</code> or start with <code>TS_AUTHKEY=... cloudedits serve --tsnet</code>.
       </p>
     </section>

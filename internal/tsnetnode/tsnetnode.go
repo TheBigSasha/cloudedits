@@ -30,12 +30,13 @@ type Options struct {
 
 // Node manages a running embedded tsnet.Server.
 type Node struct {
-	srv        *tsnet.Server
-	lc         *tailscale.LocalClient
-	mu         sync.RWMutex
-	fqdn       string
-	ownerLogin string
-	authURL    string
+	srv         *tsnet.Server
+	lc          *tailscale.LocalClient
+	mu          sync.RWMutex
+	fqdn        string
+	tailscaleIP string
+	ownerLogin  string
+	authURL     string
 }
 
 // Start brings up the embedded tsnet node and checks CertDomains preflight.
@@ -75,6 +76,15 @@ func Start(ctx context.Context, opts Options) (*Node, error) {
 
 	if status != nil {
 		n.authURL = status.AuthURL
+		for _, ip := range status.TailscaleIPs {
+			if ip.Is4() {
+				n.tailscaleIP = ip.String()
+				break
+			}
+		}
+		if n.tailscaleIP == "" && len(status.TailscaleIPs) > 0 {
+			n.tailscaleIP = status.TailscaleIPs[0].String()
+		}
 		if status.Self != nil {
 			if status.Self.DNSName != "" {
 				n.fqdn = strings.TrimSuffix(status.Self.DNSName, ".")
@@ -111,6 +121,16 @@ func (n *Node) FQDN() string {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.fqdn
+}
+
+// TailscaleIP returns the node's Tailscale IP address (e.g. 100.x.y.z).
+func (n *Node) TailscaleIP() string {
+	if n == nil {
+		return ""
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.tailscaleIP
 }
 
 // AuthURL returns an interactive Tailscale login URL when no auth key was supplied.
