@@ -1,0 +1,29 @@
+{
+  "hdrt": 2,
+  "asset": {
+    "cameraSerial": "SN-991",
+    "file": "FUTURE_V2.DNG"
+  },
+  "document": {
+    "generator": "future-v2",
+    "role": "truth"
+  },
+  "fields": {
+    "customFutureField": {
+      "hlc": "019a2f0012ab-0001-devA",
+      "meta": true,
+      "v": "keep-me"
+    },
+    "rating": {
+      "hlc": "019a2f0012ab-0002-devA",
+      "v": 4
+    }
+  },
+  "futureTopLevel": {
+    "nested": [
+      1,
+      2,
+      3
+    ]
+  }
+}

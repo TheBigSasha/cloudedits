@@ -1,0 +1,51 @@
+{
+  "hdrt": 1,
+  "asset": {
+    "bytes": 51042816,
+    "file": "IMG_0001.ARW",
+    "hash": "xxh3:0123456789abcdef"
+  },
+  "document": {
+    "role": "truth"
+  },
+  "fields": {
+    "colorLabel": {
+      "hlc": "019a2f0012ab-0001-devA",
+      "v": "red"
+    },
+    "flag": {
+      "hlc": "019a2f0012ab-0002-devA",
+      "v": "pick"
+    },
+    "keywords": {
+      "hlc": "019a2f0012ab-0003-devA",
+      "v": [
+        "tokyo",
+        "night"
+      ]
+    },
+    "rating": {
+      "hlc": "019a2f0012ab-0004-devA",
+      "v": 5
+    }
+  },
+  "recipe": {
+    "hlc": "019a2f0019ff-0001-devA",
+    "v": {
+      "exposure": 0.4,
+      "version": 1
+    }
+  },
+  "variants": [
+    {
+      "hlc": "019a2f0019ff-0002-devA",
+      "id": "v1",
+      "name": "Warm Night",
+      "recipe": {
+        "exposure": 0.4,
+        "version": 1
+      },
+      "snapshotKind": "manual"
+    }
+  ]
+}

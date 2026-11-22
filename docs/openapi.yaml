@@ -1,0 +1,477 @@
+openapi: 3.1.0
+info:
+  title: hdr.toys Remote Library HTTP API
+  version: 1.0.0
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    Remote photo library API implemented by cloudedits with the `chrome-local-parity/1` profile.
+    Source photo files are strictly read-only; mutations commit atomically to `.hdrtoys/<rel>.edits`.
+servers:
+  - url: https://library.example.ts.net
+    description: Dedicated Tailscale tsnet node
+  - url: http://127.0.0.1:8787
+    description: Local loopback server
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    CapabilitiesResponse:
+      type: object
+      required: [version, profiles, caps, permissions, limits, library]
+      properties:
+        version:
+          type: integer
+        profiles:
+          type: array
+          items:
+            type: string
+        caps:
+          type: object
+          additionalProperties: true
+        permissions:
+          type: array
+          items:
+            type: string
+        limits:
+          type: object
+          additionalProperties: true
+        library:
+          type: object
+          required: [id, name]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            scratch:
+              type: string
+    AssetSummary:
+      type: object
+      required: [id, name, relPath, folderId, kind, sizeBytes, sourceRevision]
+      properties:
+        id:
+          type: string
+        folderId:
+          type: string
+        relPath:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+        mtimeMs:
+          type: integer
+        sourceRevision:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        orientation:
+          type: integer
+        hasGainMap:
+          type: boolean
+        capturedAt:
+          type: string
+        importedAt:
+          type: string
+        editedAt:
+          type: string
+        rating:
+          type: integer
+        flag:
+          type: [string, "null"]
+        colorLabel:
+          type: [string, "null"]
+        keywords:
+          type: array
+          items:
+            type: string
+        editedByHdrtoys:
+          type: boolean
+    TruthOp:
+      type: object
+      required: [hlc, device, assetKey, field]
+      properties:
+        hlc:
+          type: string
+        device:
+          type: string
+        assetKey:
+          type: string
+        file:
+          type: string
+        field:
+          type: string
+          enum: [rating, flag, colorLabel, keywords, orientation, recipe, stack, variant, import]
+        value: {}
+        undoGroup:
+          type: string
+    OpReceipt:
+      type: object
+      required: [device, hlc, status]
+      properties:
+        device:
+          type: string
+        hlc:
+          type: string
+        status:
+          type: string
+          enum: [applied, duplicate, stale]
+        originalStatus:
+          type: string
+    OpsRequest:
+      type: object
+      required: [ops]
+      properties:
+        ops:
+          type: array
+          items:
+            $ref: "#/components/schemas/TruthOp"
+    OpsResponse:
+      type: object
+      required: [durable, receipts]
+      properties:
+        durable:
+          type: boolean
+        receipts:
+          type: array
+          items:
+            $ref: "#/components/schemas/OpReceipt"
+    HandoffPayload:
+      type: object
+      required: [v, assetId]
+      properties:
+        v:
+          type: integer
+        assetId:
+          type: string
+        recipeHlc:
+          type: string
+        ui:
+          type: object
+          additionalProperties: true
+paths:
+  /:
+    get:
+      summary: Redirect browser to hdr.toys connected to this library (or return JSON info)
+      responses:
+        "302":
+          description: Redirect to https://hdr.toys/?gallery_api_url=...
+        "200":
+          description: JSON info when Accept includes application/json
+  /open:
+    get:
+      summary: Redirect browser to hdr.toys deep-linked to an asset
+      parameters:
+        - name: a
+          in: query
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to https://hdr.toys/?gallery_api_url=...&image_id=...
+  /h/{id}:
+    get:
+      summary: Redirect browser to hdr.toys with a short-lived handoff token
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to https://hdr.toys/?gallery_api_url=...&handoff=...
+  /capabilities:
+    get:
+      summary: Discover server capabilities, profile, permissions, and limits
+      responses:
+        "200":
+          description: Capabilities document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapabilitiesResponse"
+  /auth/session:
+    post:
+      summary: Exchange Tailnet peer identity or bearer token for a short-lived session token
+      responses:
+        "200":
+          description: Issued session token and expiry
+        "401":
+          description: Unauthorized
+  /assets/count:
+    get:
+      summary: Count matching assets
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Asset count
+  /assets/range:
+    get:
+      summary: Fetch an offset/limit slice of assets
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 500
+        - name: fields
+          in: query
+          schema:
+            type: string
+            enum: [grid, full]
+      responses:
+        "200":
+          description: Range slice
+  /assets:
+    get:
+      summary: Cursor-paginated asset listing
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 200
+      responses:
+        "200":
+          description: Asset page
+  /assets/{id}:
+    get:
+      summary: Full asset metadata
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Asset details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetSummary"
+        "404":
+          description: Asset not found
+  /assets/{id}/blob:
+    get:
+      summary: Stream original file or serve thumbnail/preview tier
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tier
+          in: query
+          schema:
+            type: string
+            enum: [original, t0, t1, t2, thumb, preview]
+        - name: bt
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Full media bytes
+        "206":
+          description: Partial original bytes
+        "304":
+          description: Cached thumbnail unchanged
+  /assets/{id}/file:
+    get:
+      summary: Alias for /assets/{id}/blob
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Full media bytes
+        "206":
+          description: Partial original bytes
+  /assets/{id}/recipe:
+    get:
+      summary: Fetch canonical working recipe envelope
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Working recipe JSON and HLC
+  /assets/{id}/variants:
+    get:
+      summary: Fetch immutable creative variants and tombstones
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Variants list
+  /assets/{id}/variants/{variantId}:
+    delete:
+      summary: Tombstone a variant
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: variantId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tombstone committed
+  /assets/{id}/edit-thumbnail:
+    put:
+      summary: Upload edited preview JPEG (<= 4 MiB)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thumbnail saved
+  /assets/{id}/renders:
+    get:
+      summary: List uploaded rendered exports
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Render entries
+    post:
+      summary: Idempotently upload a rendered export
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Render persisted
+  /ops:
+    post:
+      summary: Commit a batch of HLC-stamped truth operations
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpsRequest"
+      responses:
+        "200":
+          description: Durable receipts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpsResponse"
+  /changes:
+    get:
+      summary: Poll monotonic change feed
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Operations and affected assets since cursor
+  /handoff:
+    post:
+      summary: Store an ephemeral 5-minute handoff state for QR pickup
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandoffPayload"
+      responses:
+        "200":
+          description: Handoff ID and short URL
+  /handoff/{id}:
+    get:
+      summary: Retrieve an ephemeral handoff payload
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Stored handoff state
+        "404":
+          description: Handoff expired or missing

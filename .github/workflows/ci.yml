@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Public boundary check
+        run: ./scripts/check-public-boundary.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Go vet (release and dev_apis)
+        run: |
+          go vet ./...
+          go vet -tags dev_apis ./...
+
+      - name: Go test with race detector (release)
+        run: go test -race -count=1 ./...
+
+      - name: Go test with race detector (dev_apis)
+        run: go test -race -count=1 -tags dev_apis ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.15.0
+
+      - name: Verify release binary strips all dev_apis symbols
+        run: |
+          go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-release ./cmd/cloudedits
+          if go tool nm /tmp/cloudedits-release 2>/dev/null | grep -E 'devapi|registerDevRoutesImpl|handleDev(Reset|Fault|Stats)'; then
+            echo "ERROR: dev_apis symbol leaked into release binary" >&2
+            exit 1
+          fi
+          ls -lh /tmp/cloudedits-release
+          rm -f /tmp/cloudedits-release

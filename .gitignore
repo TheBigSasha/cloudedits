@@ -1,0 +1,19 @@
+# Binaries and build outputs
+/cloudedits
+/dist/
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Local runtime state
+/data/
+.DS_Store
+._*
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / IDE
+.idea/
+.vscode/

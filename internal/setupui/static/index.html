@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cloudedits setup</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #171a21;
+      --border: #2a303c;
+      --text: #eceff4;
+      --muted: #9aa4b2;
+      --accent: #e5a93c;
+      --accent-ink: #111318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px 16px 48px;
+    }
+    main { max-width: 720px; margin: 0 auto; display: grid; gap: 16px; }
+    header h1 { margin: 0 0 4px; font-size: 1.5rem; }
+    header p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+    }
+    .card h2 { margin: 0 0 8px; font-size: 1.05rem; }
+    .badge {
+      display: inline-block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 10px;
+      margin-bottom: 10px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input[type="text"] {
+      flex: 1 1 240px;
+      background: #0d1016;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+      font-size: 0.92rem;
+    }
+    button, a.btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 9px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #232834;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    button.primary, a.btn.primary {
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); }
+    .qr-wrap { width: 180px; height: 180px; background: #fff; padding: 8px; border-radius: 10px; }
+    .qr-wrap svg { width: 100%; height: 100%; display: block; }
+    code {
+      background: #0d1016;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px 6px;
+      font-size: 0.85rem;
+    }
+    pre {
+      background: #0d1016;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      font-size: 0.82rem;
+      margin: 8px 0 0;
+    }
+    .muted { color: var(--muted); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>cloudedits</h1>
+      <p>Serve your local photo folders privately over Tailscale for hdr.toys.</p>
+    </header>
+
+    <section class="card">
+      <h2>1. Photo Folders</h2>
+      <div class="badge">Source files are strictly read-only. Edits save to .hdrtoys/</div>
+      <div class="row">
+        <input id="folderPath" type="text" placeholder="/Users/you/Pictures" />
+        <button id="addFolderBtn" class="primary">Add folder</button>
+      </div>
+      <ul id="folderList"></ul>
+    </section>
+
+    <section class="card">
+      <h2>2. Tailscale Node</h2>
+      <div class="row" style="margin-bottom: 10px;">
+        <input id="hostname" type="text" placeholder="library" />
+        <button id="saveHostBtn">Save hostname</button>
+      </div>
+      <div class="row">
+        <a class="btn" href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">Get one-time key from Tailscale</a>
+        <a class="btn" href="https://login.tailscale.com/admin/dns" target="_blank" rel="noopener noreferrer">Enable MagicDNS &amp; HTTPS</a>
+      </div>
+      <p class="muted" style="margin-top: 10px;">
+        Run <code>cloudedits setup --hostname library --tailscale-auth-key-stdin</code> or start with <code>TS_AUTHKEY=... cloudedits serve --tsnet</code>.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>3. Connect from Phone or Desktop</h2>
+      <div class="row" style="align-items: flex-start; gap: 18px;">
+        <div class="qr-wrap" id="qrBox"></div>
+        <div style="flex: 1 1 260px;">
+          <p style="margin-top: 0;">Library URL: <code id="pubUrl">loading...</code></p>
+          <p class="muted">Indexed photos: <strong id="indexedCount">0</strong></p>
+          <a id="openHdrToys" class="btn primary" href="https://hdr.toys" target="_blank" rel="noopener noreferrer">Open in hdr.toys</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>4. Next Steps — Use with AI Agents</h2>
+      <p class="muted" style="margin: 0 0 8px;">
+        Connect interactive browser agents or headless CLI workflows to this library. See
+        <a href="https://hdr.toys/agents" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">https://hdr.toys/agents</a>.
+      </p>
+      <pre id="agentSnippet">cloudedits status --json</pre>
+    </section>
+  </main>
+
+  <script>
+    async function refresh() {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      document.getElementById('hostname').value = data.hostname || 'library';
+      document.getElementById('indexedCount').textContent = String(data.indexedCount || 0);
+      const pubUrl = data.publicUrl || ('http://127.0.0.1:8787');
+      document.getElementById('pubUrl').textContent = pubUrl;
+      document.getElementById('openHdrToys').href =
+        'https://hdr.toys/?gallery_api_url=' + encodeURIComponent(pubUrl) +
+        '&gallery_name=' + encodeURIComponent(data.libraryName || 'Cloud Library');
+      document.getElementById('qrBox').innerHTML = data.qrSvg || '';
+      document.getElementById('agentSnippet').textContent =
+        'cloudedits doctor --json\ncloudedits qr';
+
+      const list = document.getElementById('folderList');
+      list.innerHTML = '';
+      for (const f of (data.folders || [])) {
+        const li = document.createElement('li');
+        li.textContent = f.label + ' — ' + f.path;
+        list.appendChild(li);
+      }
+    }
+
+    document.getElementById('addFolderBtn').addEventListener('click', async () => {
+      const path = document.getElementById('folderPath').value.trim();
+      if (!path) return;
+      const res = await fetch('/api/folders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path })
+      });
+      if (res.ok) {
+        document.getElementById('folderPath').value = '';
+        await refresh();
+      } else {
+        const err = await res.json();
+        alert(err.error || 'Failed to add folder');
+      }
+    });
+
+    document.getElementById('saveHostBtn').addEventListener('click', async () => {
+      const hostname = document.getElementById('hostname').value.trim();
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hostname })
+      });
+      await refresh();
+    });
+
+    refresh();
+  </script>
+</body>
+</html>

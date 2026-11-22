@@ -1,0 +1,15 @@
+{
+  "hdrt": 1,
+  "asset": {
+    "file": "HLC_ORDER.JPG"
+  },
+  "document": {
+    "role": "truth"
+  },
+  "fields": {
+    "rating": {
+      "hlc": "100-0000-devA",
+      "v": 5
+    }
+  }
+}

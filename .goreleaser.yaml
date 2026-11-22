@@ -1,0 +1,48 @@
+version: 2
+
+project_name: cloudedits
+
+before:
+  hooks:
+    - go mod tidy
+    - ./scripts/check-public-boundary.sh
+
+builds:
+  - id: cloudedits
+    main: ./cmd/cloudedits
+    binary: cloudedits
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: cloudedits-archive
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

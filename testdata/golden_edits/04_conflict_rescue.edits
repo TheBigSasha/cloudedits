@@ -1,0 +1,29 @@
+{
+  "hdrt": 1,
+  "asset": {
+    "file": "CONFLICT.ARW"
+  },
+  "document": {
+    "role": "truth"
+  },
+  "fields": {},
+  "recipe": {
+    "hlc": "019a2f002000-0001-devB",
+    "v": {
+      "exposure": 1.2,
+      "version": 1
+    }
+  },
+  "variants": [
+    {
+      "hlc": "019a2f001900-0001-devA",
+      "id": "conflict-019a2f001900-0001-devA-065caba0",
+      "name": "Merged edit",
+      "recipe": {
+        "exposure": -0.5,
+        "version": 1
+      },
+      "snapshotKind": "manual"
+    }
+  ]
+}
