@@ -770,7 +770,11 @@ func openBrowser(rawURL string) error {
 		return nil
 	}
 	cmd := exec.Command(name, args...)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func emitOutput(asJSON bool, payload any, human string) {

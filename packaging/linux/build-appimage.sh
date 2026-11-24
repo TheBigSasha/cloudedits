@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "ERROR: build-appimage.sh must run on Linux." >&2
-  exit 1
-fi
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION="${VERSION:-dev}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
@@ -40,20 +35,30 @@ trap 'rm -rf "$WORK"' EXIT
 
 cd "$ROOT_DIR"
 
+HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
-if [[ "$HOST_ARCH" != "x86_64" && "$HOST_ARCH" != "aarch64" ]]; then
-  echo "ERROR: unsupported Linux build host arch: $HOST_ARCH" >&2
-  exit 1
-fi
 
-APPIMAGETOOL="$WORK/appimagetool.AppImage"
-if command -v appimagetool >/dev/null 2>&1; then
-  APPIMAGETOOL_CMD=(appimagetool)
+USE_APPIMAGETOOL=0
+if [[ "$HOST_OS" == "Linux" ]]; then
+  if [[ "$HOST_ARCH" != "x86_64" && "$HOST_ARCH" != "aarch64" ]]; then
+    echo "ERROR: unsupported Linux build host arch: $HOST_ARCH" >&2
+    exit 1
+  fi
+  USE_APPIMAGETOOL=1
+  APPIMAGETOOL="$WORK/appimagetool.AppImage"
+  if command -v appimagetool >/dev/null 2>&1; then
+    APPIMAGETOOL_CMD=(appimagetool)
+  else
+    echo "==> Downloading appimagetool (${HOST_ARCH})"
+    curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${HOST_ARCH}.AppImage" -o "$APPIMAGETOOL"
+    chmod +x "$APPIMAGETOOL"
+    APPIMAGETOOL_CMD=("$APPIMAGETOOL" --appimage-extract-and-run)
+  fi
 else
-  echo "==> Downloading appimagetool (${HOST_ARCH})"
-  curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${HOST_ARCH}.AppImage" -o "$APPIMAGETOOL"
-  chmod +x "$APPIMAGETOOL"
-  APPIMAGETOOL_CMD=("$APPIMAGETOOL" --appimage-extract-and-run)
+  if ! command -v mksquashfs >/dev/null 2>&1; then
+    echo "ERROR: mksquashfs is required for cross-building Type 2 AppImages on ${HOST_OS} (install squashfs-tools / brew install squashfs)." >&2
+    exit 1
+  fi
 fi
 
 build_one() {
@@ -90,13 +95,22 @@ build_one() {
   fi
 
   rm -f "$out_path"
-  echo "==> Packaging $out_name (ARCH=${app_arch})"
-  ARCH="$app_arch" APPIMAGE_EXTRACT_AND_RUN=1 \
-    "${APPIMAGETOOL_CMD[@]}" \
-    --no-appstream \
-    --runtime-file "$runtime_file" \
-    "$appdir" \
-    "$out_path"
+  if [[ "$USE_APPIMAGETOOL" -eq 1 ]]; then
+    echo "==> Packaging $out_name with appimagetool (ARCH=${app_arch})"
+    ARCH="$app_arch" APPIMAGE_EXTRACT_AND_RUN=1 \
+      "${APPIMAGETOOL_CMD[@]}" \
+      --no-appstream \
+      --runtime-file "$runtime_file" \
+      "$appdir" \
+      "$out_path"
+  else
+    echo "==> Packaging $out_name with type2-runtime + mksquashfs (ARCH=${app_arch})"
+    local sqfs="$WORK/appdir-${goarch}.squashfs"
+    rm -f "$sqfs"
+    mksquashfs "$appdir" "$sqfs" -root-owned -noappend -no-xattrs -comp gzip >/dev/null
+    cat "$runtime_file" "$sqfs" > "$out_path"
+  fi
+
   chmod 755 "$out_path"
   ls -lh "$out_path"
 }
@@ -107,19 +121,24 @@ build_one arm64 aarch64
 if [[ "$SMOKE_TEST" -eq 1 ]]; then
   echo "==> Smoke-testing Linux AppImages"
 
-  # 1. Verify amd64 AppImage via --appimage-extract and live execution on x86_64 host.
   AMD64_IMG="$OUT_DIR/cloudedits-linux-amd64.AppImage"
   ARM64_IMG="$OUT_DIR/cloudedits-linux-arm64.AppImage"
 
-  echo "file(amd64): $(file "$AMD64_IMG")"
-  echo "file(arm64): $(file "$ARM64_IMG")"
+  AMD64_FILE="$(file "$AMD64_IMG")"
+  ARM64_FILE="$(file "$ARM64_IMG")"
+  echo "file(amd64): $AMD64_FILE"
+  echo "file(arm64): $ARM64_FILE"
 
-  if [[ "$(file "$ARM64_IMG")" != *"aarch64"* && "$(file "$ARM64_IMG")" != *"ARM aarch64"* ]]; then
+  if [[ "$AMD64_FILE" != *"x86-64"* && "$AMD64_FILE" != *"x86_64"* ]]; then
+    echo "ERROR: expected x86-64 AppImage runtime for $AMD64_IMG" >&2
+    exit 1
+  fi
+  if [[ "$ARM64_FILE" != *"aarch64"* && "$ARM64_FILE" != *"ARM aarch64"* ]]; then
     echo "ERROR: expected aarch64 AppImage runtime for $ARM64_IMG" >&2
     exit 1
   fi
 
-  if [[ "$HOST_ARCH" == "x86_64" ]]; then
+  if [[ "$HOST_OS" == "Linux" && "$HOST_ARCH" == "x86_64" ]]; then
     EXTRACT_DIR="$WORK/extract-amd64"
     mkdir -p "$EXTRACT_DIR"
     (
@@ -140,28 +159,46 @@ if [[ "$SMOKE_TEST" -eq 1 ]]; then
     )
   fi
 
-  # 2. Verify arm64 AppImage squashfs payload contains aarch64 ELF binary and executable AppRun.
   if command -v unsquashfs >/dev/null 2>&1; then
-    OFFSET="$(python3 -c '
-import sys
+    for pair in "amd64:x86-64" "arm64:aarch64"; do
+      arch="${pair%%:*}"
+      want="${pair##*:}"
+      img="$OUT_DIR/cloudedits-linux-${arch}.AppImage"
+      offset="$(python3 -c '
+import struct, sys
 data = open(sys.argv[1], "rb").read()
-idx = data.find(b"hsqs")
-if idx < 0:
-    sys.exit(1)
-print(idx)
-' "$ARM64_IMG")"
-    ARM64_EXTRACT="$WORK/extract-arm64"
-    unsquashfs -o "$OFFSET" -d "$ARM64_EXTRACT" "$ARM64_IMG" >/dev/null
-    ARM64_BIN_FILE="$(file "$ARM64_EXTRACT/usr/bin/cloudedits")"
-    echo "arm64 extracted binary: $ARM64_BIN_FILE"
-    if [[ "$ARM64_BIN_FILE" != *"aarch64"* && "$ARM64_BIN_FILE" != *"ARM aarch64"* ]]; then
-      echo "ERROR: expected aarch64 binary inside arm64 AppImage: $ARM64_BIN_FILE" >&2
-      exit 1
-    fi
-    if [[ ! -x "$ARM64_EXTRACT/AppRun" ]]; then
-      echo "ERROR: AppRun is not executable inside arm64 AppImage" >&2
-      exit 1
-    fi
+# Verify ELF64 header size matches squashfs offset cleanly.
+e_shoff = struct.unpack_from("<Q", data, 40)[0]
+e_shentsize = struct.unpack_from("<H", data, 58)[0]
+e_shnum = struct.unpack_from("<H", data, 60)[0]
+elf_end = e_shoff + e_shentsize * e_shnum
+if data[elf_end:elf_end+4] != b"hsqs":
+    idx = data.find(b"hsqs")
+    if idx < 0:
+        sys.exit(1)
+    print(idx)
+else:
+    print(elf_end)
+' "$img")"
+      extract="$WORK/unsquash-${arch}"
+      rm -rf "$extract"
+      unsquashfs -o "$offset" -d "$extract" "$img" >/dev/null
+      bin_file="$(file "$extract/usr/bin/cloudedits")"
+      echo "${arch} extracted binary (offset=${offset}): $bin_file"
+      if [[ "$bin_file" != *"$want"* ]]; then
+        echo "ERROR: expected ${want} binary inside ${img}: $bin_file" >&2
+        exit 1
+      fi
+      if [[ ! -x "$extract/AppRun" ]]; then
+        echo "ERROR: AppRun is not executable inside ${img}" >&2
+        exit 1
+      fi
+      if [[ ! -f "$extract/cloudedits.desktop" || ! -f "$extract/cloudedits.png" ]]; then
+        echo "ERROR: missing desktop entry or icon inside ${img}" >&2
+        exit 1
+      fi
+      "$ROOT_DIR/packaging/scripts/check-release-symbols.sh" "$extract/usr/bin/cloudedits"
+    done
   fi
 
   echo "OK: Linux AppImage smoke test passed."
