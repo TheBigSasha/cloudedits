@@ -1,0 +1,260 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          if [[ -z "$VERSION" ]]; then
+            echo "ERROR: empty release version" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: ${VERSION}"
+
+      - name: Public boundary check
+        run: ./scripts/check-public-boundary.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Go vet (release and dev_apis)
+        run: |
+          go vet ./...
+          go vet -tags dev_apis ./...
+
+      - name: Go test with race detector (release)
+        run: go test -race -count=1 ./...
+
+      - name: Go test with race detector (dev_apis)
+        run: go test -race -count=1 -tags dev_apis ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.15.0
+
+      - name: Verify release binary strips all dev_apis symbols
+        run: |
+          go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-release ./cmd/cloudedits
+          ./packaging/scripts/check-release-symbols.sh /tmp/cloudedits-release
+          rm -f /tmp/cloudedits-release
+
+  archives:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Build cross-platform archives
+        run: |
+          ./packaging/scripts/build-archives.sh \
+            --version "${{ needs.verify.outputs.version }}" \
+            --out-dir dist-archives
+          rm -f dist-archives/checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archives
+          path: dist-archives/*
+          if-no-files-found: error
+
+  macos-dmg:
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Build and smoke-test macOS universal DMG
+        run: |
+          ./packaging/macos/build-dmg.sh \
+            --version "${{ needs.verify.outputs.version }}" \
+            --out-dir dist-macos \
+            --smoke-test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-dmg
+          path: dist-macos/cloudedits-macos-universal.dmg
+          if-no-files-found: error
+
+  windows-msi:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Install WiX v5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix --version
+
+      - name: Build and smoke-test Windows amd64 & arm64 MSIs
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-msi.ps1 `
+            -Version "${{ needs.verify.outputs.version }}" `
+            -OutDir dist-windows `
+            -SmokeTest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-msi
+          path: dist-windows/cloudedits-windows-*.msi
+          if-no-files-found: error
+
+  linux-appimage:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Install squashfs-tools and file
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools file
+
+      - name: Build and smoke-test Linux amd64 & arm64 AppImages
+        run: |
+          ./packaging/linux/build-appimage.sh \
+            --version "${{ needs.verify.outputs.version }}" \
+            --out-dir dist-linux \
+            --smoke-test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-appimage
+          path: dist-linux/cloudedits-linux-*.AppImage
+          if-no-files-found: error
+
+  docker:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        id: ghcr-login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch Docker image
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.ghcr-login.outcome == 'success' }}
+          build-args: VERSION=${{ needs.verify.outputs.version }}
+          tags: |
+            ghcr.io/thebigsasha/cloudedits:${{ needs.verify.outputs.version }}
+            ghcr.io/thebigsasha/cloudedits:latest
+
+  publish-release:
+    needs: [verify, archives, macos-dmg, windows-msi, linux-appimage]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          merge-multiple: true
+
+      - name: Verify all 11 binary/installer assets and compute unified checksums.txt
+        run: |
+          cd dist-all
+          EXPECTED=(
+            cloudedits-macos-universal.dmg
+            cloudedits-windows-amd64.msi
+            cloudedits-windows-arm64.msi
+            cloudedits-linux-amd64.AppImage
+            cloudedits-linux-arm64.AppImage
+            cloudedits_darwin_arm64.tar.gz
+            cloudedits_darwin_amd64.tar.gz
+            cloudedits_linux_amd64.tar.gz
+            cloudedits_linux_arm64.tar.gz
+            cloudedits_windows_amd64.zip
+            cloudedits_windows_arm64.zip
+          )
+          for f in "${EXPECTED[@]}"; do
+            if [[ ! -s "$f" ]]; then
+              echo "ERROR: missing or empty release asset: $f" >&2
+              exit 1
+            fi
+          done
+          IFS=$'\n' SORTED=($(printf '%s\n' "${EXPECTED[@]}" | LC_ALL=C sort))
+          unset IFS
+          sha256sum "${SORTED[@]}" > checksums.txt
+          ls -lh "${SORTED[@]}" checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist-all/* --clobber
+          else
+            gh release create "$VERSION" dist-all/* \
+              --title "cloudedits ${VERSION}" \
+              --generate-notes
+          fi

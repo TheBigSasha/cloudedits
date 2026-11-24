@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+BIN="$APPDIR/usr/bin/cloudedits"
+
+if [ "$#" -gt 0 ]; then
+  exec "$BIN" "$@"
+fi
+
+exec "$BIN" gui

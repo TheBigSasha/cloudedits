@@ -14,8 +14,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -82,8 +84,7 @@ func run(args []string) int {
 	case "gui":
 		return cmdGUI(rest)
 	case "version", "--version", "-v":
-		fmt.Printf("cloudedits %s\n", version)
-		return exitOK
+		return cmdVersion(rest)
 	case "help", "--help", "-h":
 		printUsage()
 		return exitOK
@@ -108,8 +109,29 @@ Commands:
   folders      Manage configured photo folders: list | add <dir> | remove <dir|id>
   qr           Print terminal UTF-8 QR code for library or asset (--asset <id>)
   docker-init  Generate docker-compose.yml and .env.example for NAS/Docker
-  gui          Launch loopback browser setup wizard
-  version      Print version`)
+  gui          Launch loopback browser setup wizard (--no-browser supported)
+  version      Print version (--json supported)`)
+}
+
+type versionInfo struct {
+	Version string `json:"version"`
+	OS      string `json:"os"`
+	Arch    string `json:"arch"`
+}
+
+func cmdVersion(args []string) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	info := versionInfo{
+		Version: version,
+		OS:      runtime.GOOS,
+		Arch:    runtime.GOARCH,
+	}
+	emitOutput(*jsonOut, info, fmt.Sprintf("cloudedits %s", version))
+	return exitOK
 }
 
 func cmdSetup(args []string) int {
@@ -664,6 +686,7 @@ func cmdGUI(args []string) int {
 	fs := flag.NewFlagSet("gui", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:0", "loopback listen address for setup wizard")
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "data directory")
+	noBrowser := fs.Bool("no-browser", false, "do not automatically open the default browser")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -673,14 +696,28 @@ func cmdGUI(args []string) int {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return exitStorage
 	}
+	indexed := 0
+	idxPath := filepath.Join(cfg.DataDir, "index.db")
+	if _, statErr := os.Stat(idxPath); statErr == nil {
+		if idx, oerr := index.Open(idxPath, cfg.SidecarDir, cfg.Folders, sidecar.NewStore()); oerr == nil {
+			indexed, _ = idx.Count(context.Background(), index.Filter{})
+			_ = idx.Close()
+		}
+	}
+	listenAddr := cfg.ListenAddr
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8787"
+	}
+
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "listen %s: %v\n", *listen, err)
 		return exitStorage
 	}
 	state := &guiState{
-		cfg:    cfg,
-		pubURL: "http://" + cfg.ListenAddr,
+		cfg:     cfg,
+		pubURL:  "http://" + listenAddr,
+		indexed: indexed,
 	}
 	srv := &http.Server{
 		Handler:           setupui.Handler(state),
@@ -696,12 +733,44 @@ func cmdGUI(args []string) int {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	fmt.Printf("Setup wizard listening at http://%s/setup\n", ln.Addr().String())
+	setupURL := fmt.Sprintf("http://%s/setup", ln.Addr().String())
+	fmt.Printf("Setup wizard listening at %s\n", setupURL)
+	if !*noBrowser {
+		go func() {
+			if err := openBrowser(setupURL); err != nil {
+				fmt.Fprintf(os.Stderr, "note: could not open browser automatically (%v); open %s manually\n", err, setupURL)
+			}
+		}()
+	}
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "gui serve error: %v\n", err)
 		return exitStorage
 	}
 	return exitOK
+}
+
+func openBrowserCommand(goos, rawURL string, hasDisplay bool) (string, []string, bool) {
+	switch goos {
+	case "darwin":
+		return "open", []string{rawURL}, true
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", rawURL}, true
+	default:
+		if !hasDisplay {
+			return "", nil, false
+		}
+		return "xdg-open", []string{rawURL}, true
+	}
+}
+
+func openBrowser(rawURL string) error {
+	hasDisplay := os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
+	name, args, ok := openBrowserCommand(runtime.GOOS, rawURL, hasDisplay)
+	if !ok {
+		return nil
+	}
+	cmd := exec.Command(name, args...)
+	return cmd.Start()
 }
 
 func emitOutput(asJSON bool, payload any, human string) {

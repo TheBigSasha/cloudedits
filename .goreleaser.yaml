@@ -27,6 +27,7 @@ builds:
 
 archives:
   - id: cloudedits-archive
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
     format_overrides:
       - goos: windows

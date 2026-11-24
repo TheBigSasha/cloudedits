@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=cloudedits
+Comment=Private remote photo library server for hdr.toys
+Exec=cloudedits gui
+Icon=cloudedits
+Terminal=false
+Categories=Graphics;Photography;Network;
+StartupNotify=false
