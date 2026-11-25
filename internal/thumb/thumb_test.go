@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -271,5 +272,51 @@ func TestDecodeJPEGScale8MatchesStdlib(t *testing.T) {
 	meanDiff := float64(totalDiff) / float64(samples)
 	if meanDiff > 4.0 {
 		t.Fatalf("1/8-scale DC decode color drift too high: mean channel diff = %.2f (want <= 4.0)", meanDiff)
+	}
+}
+
+func TestDecodeJPEGScale8RejectsOversubscribedDHTAndZeroDims(t *testing.T) {
+	// Malformed JPEG with over-subscribed DHT (bits[0] = 3 -> 3 codes of length 1).
+	var overSub bytes.Buffer
+	overSub.Write([]byte{0xFF, 0xD8}) // SOI
+	// DHT segment: length = 2 + 1 + 16 + 3 = 22
+	overSub.Write([]byte{0xFF, 0xC4, 0x00, 22, 0x00})
+	overSub.Write([]byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	overSub.Write([]byte{0x00, 0x01, 0x02})
+	// Pad to >= 64 bytes so decodeJPEGScale8Bytes parses DHT.
+	overSub.Write(make([]byte, 48))
+	overSub.Write([]byte{0xFF, 0xD9})
+
+	if _, err := decodeJPEGScale8Bytes(overSub.Bytes(), 0); !errors.Is(err, errUnsupportedFastJPEG) {
+		t.Fatalf("expected errUnsupportedFastJPEG for over-subscribed DHT, got %v", err)
+	}
+
+	// Malformed JPEG with SOF0 dimensions = 0x0.
+	var zeroDims bytes.Buffer
+	zeroDims.Write([]byte{0xFF, 0xD8})
+	// SOF0 segment: length = 2 + 6 + 3 = 11 (1 component, height=0, width=0)
+	zeroDims.Write([]byte{0xFF, 0xC0, 0x00, 11, 8, 0, 0, 0, 0, 1, 1, 0x11, 0})
+	zeroDims.Write(make([]byte, 64))
+	zeroDims.Write([]byte{0xFF, 0xD9})
+
+	if _, err := decodeJPEGScale8Bytes(zeroDims.Bytes(), 0); !errors.Is(err, errUnsupportedFastJPEG) {
+		t.Fatalf("expected errUnsupportedFastJPEG for 0x0 SOF0, got %v", err)
+	}
+
+	// End-to-end Service.Resolve must return an error cleanly without crashing or leaking inFlight.
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "corrupt_dht.jpg")
+	if err := os.WriteFile(badPath, overSub.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(filepath.Join(dir, "cache"), 2)
+	if _, err := svc.Resolve(context.Background(), badPath, "rev-corrupt-dht", "", "t1"); err == nil {
+		t.Fatalf("expected Resolve to fail cleanly on corrupt DHT JPEG")
+	}
+	svc.sfMu.Lock()
+	remaining := len(svc.inFlight)
+	svc.sfMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected inFlight map to be empty after failed Resolve, got %d", remaining)
 	}
 }

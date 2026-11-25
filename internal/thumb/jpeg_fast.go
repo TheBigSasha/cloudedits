@@ -48,6 +48,9 @@ func (h *huffTable) build(bits []byte, vals []byte) error {
 			h.minCode[length] = 0
 			h.valIndex[length] = 0
 		} else {
+			if code+count > (int32(1) << length) {
+				return errUnsupportedFastJPEG
+			}
 			h.minCode[length] = code
 			h.valIndex[length] = idx
 			h.maxCode[length] = code + count - 1
@@ -58,6 +61,9 @@ func (h *huffTable) build(bits []byte, vals []byte) error {
 					entry := (uint16(length) << 8) | sym
 					base := int((code + j) << shift)
 					span := 1 << shift
+					if base < 0 || base+span > len(h.lut) {
+						return errUnsupportedFastJPEG
+					}
 					for k := 0; k < span; k++ {
 						h.lut[base+k] = entry
 					}
@@ -349,6 +355,9 @@ func decodeJPEGScale8Bytes(data []byte, minResultLongEdge int) (image.Image, err
 			}
 			height = int(binary.BigEndian.Uint16(seg[1:3]))
 			width = int(binary.BigEndian.Uint16(seg[3:5]))
+			if width <= 0 || height <= 0 {
+				return nil, errUnsupportedFastJPEG
+			}
 			nComp = int(seg[5])
 			if (nComp != 1 && nComp != 3) || len(seg) != 6+3*nComp {
 				return nil, errUnsupportedFastJPEG

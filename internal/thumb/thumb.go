@@ -141,13 +141,17 @@ func (s *Service) Resolve(
 	s.sfMu.Unlock()
 
 	go func() {
-		res, err := s.generateAndCache(sourcePath, sourceRevision, normTier, cachePath, metaPath)
-		call.res = res
-		call.err = err
-		s.sfMu.Lock()
-		delete(s.inFlight, sfKey)
-		s.sfMu.Unlock()
-		close(call.done)
+		defer func() {
+			if r := recover(); r != nil {
+				call.res = nil
+				call.err = fmt.Errorf("thumbnail panic: %v", r)
+			}
+			s.sfMu.Lock()
+			delete(s.inFlight, sfKey)
+			s.sfMu.Unlock()
+			close(call.done)
+		}()
+		call.res, call.err = s.generateAndCache(sourcePath, sourceRevision, normTier, cachePath, metaPath)
 	}()
 
 	select {
