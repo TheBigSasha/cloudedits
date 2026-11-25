@@ -15,19 +15,24 @@ import (
 	"time"
 )
 
+type assetLock struct {
+	mu  sync.Mutex
+	gen uint64
+}
+
 // Store manages atomic, per-asset mutex-serialized .edits sidecars, edited
 // thumbnails, and rendered exports. Source folders are strictly read-only;
 // writes happen exclusively under sidecarRoot (default: <folderRoot>/.hdrtoys).
 type Store struct {
 	mu         sync.Mutex
-	assetLocks map[string]*sync.Mutex
+	assetLocks map[string]*assetLock
 	writeCount atomic.Int64
 }
 
 // NewStore returns a new Store.
 func NewStore() *Store {
 	return &Store{
-		assetLocks: map[string]*sync.Mutex{},
+		assetLocks: map[string]*assetLock{},
 	}
 }
 
@@ -36,12 +41,12 @@ func (s *Store) WriteCount() int64 {
 	return s.writeCount.Load()
 }
 
-func (s *Store) lockFor(key string) *sync.Mutex {
+func (s *Store) lockFor(key string) *assetLock {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.assetLocks[key]
 	if !ok {
-		m = &sync.Mutex{}
+		m = &assetLock{}
 		s.assetLocks[key] = m
 	}
 	return m
@@ -148,21 +153,53 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 	return &ReadResult{}, nil
 }
 
-// WriteAtomic writes data atomically using <sidecarRoot>/.tmp/<uuid> -> fsync
-// -> close -> rename, creating parent directories as needed.
+var (
+	strictFsync = strings.TrimSpace(os.Getenv("CLOUDEDITS_FSYNC")) == "1"
+	ensuredDirs sync.Map
+)
+
+func ensureDir(dir string) error {
+	if _, ok := ensuredDirs.Load(dir); ok {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	ensuredDirs.Store(dir, struct{}{})
+	return nil
+}
+
+// WriteAtomic writes data atomically using <sidecarRoot>/.tmp/<uuid> -> write
+// -> close -> rename, creating parent directories as needed. Matches SQLite's
+// PRAGMA synchronous=NORMAL durability tier by default (100% atomic against
+// concurrent readers and process crashes); set CLOUDEDITS_FSYNC=1 to force a
+// per-write hardware fsync barrier before rename.
 func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 	tmpDir := filepath.Join(sidecarRoot, ".tmp")
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+	if err := ensureDir(tmpDir); err != nil {
 		return fmt.Errorf("create .tmp dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+	targetDir := filepath.Dir(targetPath)
+	if err := ensureDir(targetDir); err != nil {
 		return fmt.Errorf("create target dir: %w", err)
 	}
 
 	tmpPath := filepath.Join(tmpDir, randomHex(16)+".tmp")
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("create staging file: %w", err)
+		// Directory may have been removed externally; retry MkdirAll once.
+		ensuredDirs.Delete(tmpDir)
+		ensuredDirs.Delete(targetDir)
+		if mkErr := os.MkdirAll(tmpDir, 0o755); mkErr != nil {
+			return fmt.Errorf("create .tmp dir: %w", mkErr)
+		}
+		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr != nil {
+			return fmt.Errorf("create target dir: %w", mkErr)
+		}
+		f, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("create staging file: %w", err)
+		}
 	}
 
 	cleanup := true
@@ -176,24 +213,28 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 		_ = f.Close()
 		return fmt.Errorf("write staging file: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("fsync staging file: %w", err)
+	if strictFsync {
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("fsync staging file: %w", err)
+		}
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close staging file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
+		// Target parent directory may have been removed externally; ensure and retry once.
+		ensuredDirs.Delete(targetDir)
+		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr == nil {
+			if err2 := os.Rename(tmpPath, targetPath); err2 == nil {
+				cleanup = false
+				return nil
+			}
+		}
 		return fmt.Errorf("atomic rename: %w", err)
 	}
 	cleanup = false
-
-	// Best-effort directory fsync for crash durability.
-	if dir, err := os.Open(filepath.Dir(targetPath)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
 	return nil
 }
 
@@ -205,18 +246,32 @@ func (s *Store) Update(
 	contentHash string,
 	mutate func(sc *Sidecar) (changed bool, err error),
 ) (*Sidecar, bool, error) {
+	sc, changed, _, err := s.UpdateWithGen(folderRoot, sidecarRoot, relPosix, sizeBytes, contentHash, mutate)
+	return sc, changed, err
+}
+
+// UpdateWithGen is like Update and additionally returns a per-asset monotonic
+// generation counter assigned under the asset's mutex, allowing downstream
+// index projections to avoid overwriting newer state with older snapshots when
+// unrelated writers commit concurrently.
+func (s *Store) UpdateWithGen(
+	folderRoot, sidecarRoot, relPosix string,
+	sizeBytes *int64,
+	contentHash string,
+	mutate func(sc *Sidecar) (changed bool, err error),
+) (*Sidecar, bool, uint64, error) {
 	canonical, err := CanonicalEditsPath(sidecarRoot, relPosix)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	lk := s.lockFor(canonical)
-	lk.Lock()
-	defer lk.Unlock()
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
 
 	res, err := s.Read(folderRoot, sidecarRoot, relPosix)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	sc := res.Sidecar
 	if sc == nil {
@@ -242,21 +297,22 @@ func (s *Store) Update(
 
 	changed, err := mutate(sc)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	if !changed {
-		return sc, false, nil
+		return sc, false, lk.gen, nil
 	}
 
 	payload, err := Serialize(sc)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	if err := WriteAtomic(sidecarRoot, canonical, payload); err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
+	lk.gen++
 	s.writeCount.Add(1)
-	return sc, true, nil
+	return sc, true, lk.gen, nil
 }
 
 // WriteEditThumbnail atomically writes an edited preview JPEG to
@@ -267,8 +323,8 @@ func (s *Store) WriteEditThumbnail(sidecarRoot, relPosix string, jpegBytes []byt
 		return "", err
 	}
 	lk := s.lockFor(target)
-	lk.Lock()
-	defer lk.Unlock()
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
 
 	if err := WriteAtomic(sidecarRoot, target, jpegBytes); err != nil {
 		return "", err
@@ -310,8 +366,8 @@ func (s *Store) SaveRender(sidecarRoot, relPosix, renderID, variantID, mimeType 
 		return nil, false, err
 	}
 	lk := s.lockFor(target)
-	lk.Lock()
-	defer lk.Unlock()
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
 
 	if info, err := os.Stat(target); err == nil {
 		return &RenderEntry{

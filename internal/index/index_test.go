@@ -3,11 +3,13 @@ package index
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/thebigsasha/cloudedits/internal/config"
@@ -120,5 +122,96 @@ func TestScanOpsIdempotencyFilterAndLosslessRebuild(t *testing.T) {
 	}
 	if a2.Rating != 5 || a2.Flag == nil || *a2.Flag != "pick" || !a2.EditedByHdrToys || len(a2.Keywords) != 2 {
 		t.Fatalf("lossless rebuild lost metadata: %+v", a2)
+	}
+}
+
+func TestConcurrentApplyOpsBatchRaceAndCoalescing(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	dataDir := t.TempDir()
+
+	const numAssets = 8
+	assetIDs := make([]string, numAssets)
+	for i := 0; i < numAssets; i++ {
+		rel := fmt.Sprintf("IMG_%02d.JPG", i)
+		writeTestJPEG(t, filepath.Join(photoDir, rel))
+		assetIDs[i] = MakeAssetID("photos", rel)
+	}
+
+	folders := []config.FolderConfig{{ID: "photos", Path: photoDir, Label: "Photos"}}
+	idx, err := Open(filepath.Join(dataDir, "index.db"), "", folders, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+
+	const writers = 8
+	const batchesPerWriter = 10
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers*batchesPerWriter)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			dev := fmt.Sprintf("dev%d", worker)
+			for b := 0; b < batchesPerWriter; b++ {
+				target := assetIDs[(worker+b)%numAssets]
+				baseMs := 0x019a2f001000 + b*100 + worker
+				ops := []sidecar.TruthOp{
+					{HLC: fmt.Sprintf("%012x-0001-%s", baseMs, dev), Device: dev, AssetKey: target, Field: "rating", Value: (b % 5) + 1},
+					{HLC: fmt.Sprintf("%012x-0002-%s", baseMs, dev), Device: dev, AssetKey: target, Field: "flag", Value: "pick"},
+					{HLC: fmt.Sprintf("%012x-0003-%s", baseMs, dev), Device: dev, AssetKey: target, Field: "colorLabel", Value: "blue"},
+					{HLC: fmt.Sprintf("%012x-0004-%s", baseMs, dev), Device: dev, AssetKey: target, Field: "keywords", Value: []any{fmt.Sprintf("w%d", worker), fmt.Sprintf("b%d", b)}},
+				}
+				receipts, aerr := idx.ApplyOpsBatch(ctx, ops)
+				if aerr != nil {
+					errCh <- fmt.Errorf("worker %d batch %d: %w", worker, b, aerr)
+					return
+				}
+				if len(receipts) != len(ops) {
+					errCh <- fmt.Errorf("worker %d batch %d: got %d receipts, want %d", worker, b, len(receipts), len(ops))
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Verify SQLite state matches disk sidecar verdicts for every asset.
+	for i, aid := range assetIDs {
+		a, err := idx.GetAsset(ctx, aid)
+		if err != nil {
+			t.Fatalf("GetAsset(%s): %v", aid, err)
+		}
+		res, err := idx.Sidecars().Read(a.FolderRoot, a.SidecarRoot, a.RelPath)
+		if err != nil || res.Sidecar == nil {
+			t.Fatalf("Read sidecar %d: res=%+v err=%v", i, res, err)
+		}
+		rating, flag, label, _, _ := sidecar.ExtractVerdicts(res.Sidecar)
+		if a.Rating != rating {
+			t.Fatalf("asset %d SQLite rating=%d != sidecar rating=%d", i, a.Rating, rating)
+		}
+		gotFlag := ""
+		if a.Flag != nil {
+			gotFlag = *a.Flag
+		}
+		if gotFlag != flag {
+			t.Fatalf("asset %d SQLite flag=%q != sidecar flag=%q", i, gotFlag, flag)
+		}
+		gotLabel := ""
+		if a.ColorLabel != nil {
+			gotLabel = *a.ColorLabel
+		}
+		if gotLabel != label {
+			t.Fatalf("asset %d SQLite label=%q != sidecar label=%q", i, gotLabel, label)
+		}
 	}
 }

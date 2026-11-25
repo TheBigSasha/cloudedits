@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -250,6 +251,13 @@ func cmdServe(args []string) int {
 	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+
+	// Enforce a 192 MiB soft memory limit by default so thumbnail bursts stay
+	// well under the 256 MiB Peak RSS SLO (and safe in 512 MiB Docker limits)
+	// unless the operator explicitly overrides GOMEMLIMIT.
+	if strings.TrimSpace(os.Getenv("GOMEMLIMIT")) == "" {
+		debug.SetMemoryLimit(192 << 20)
 	}
 
 	cfg, err := config.Load(*dataDir)

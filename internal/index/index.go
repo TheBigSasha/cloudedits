@@ -157,9 +157,10 @@ type Index struct {
 	sidecars   *sidecar.Store
 	sidecarDir string
 
-	writeMu sync.Mutex
-	mu      sync.RWMutex
-	folders map[string]config.FolderConfig
+	writeMu    sync.Mutex
+	appliedGen map[string]uint64
+	mu         sync.RWMutex
+	folders    map[string]config.FolderConfig
 }
 
 // MakeAssetID constructs the opaque URL-safe asset ID for a (folderID, relPosix) pair.
@@ -206,6 +207,7 @@ func Open(dbPath, customSidecarDir string, folders []config.FolderConfig, sideca
 		db:         db,
 		sidecars:   sidecars,
 		sidecarDir: customSidecarDir,
+		appliedGen: map[string]uint64{},
 		folders:    map[string]config.FolderConfig{},
 	}
 	if err := idx.SetFolders(context.Background(), folders); err != nil {
@@ -656,13 +658,14 @@ func (idx *Index) attachPaths(a *Asset) {
 }
 
 // ApplyOpsBatch validates and commits a batch of HLC-stamped TruthOps with
-// strict (device, hlc) idempotency, atomic .hdrtoys/<rel>.edits writes, and
-// immediate SQLite projection updates.
+// strict (device, hlc) idempotency, atomic per-asset .hdrtoys/<rel>.edits
+// writes (without holding the global SQLite write lock across disk I/O), and
+// coalesced single-transaction SQLite WAL projection updates.
 func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]OpReceipt, error) {
 	if len(ops) == 0 {
 		return []OpReceipt{}, nil
 	}
-	// Pre-validate every op in the batch before mutating anything.
+	// 1. Pre-validate every op in the batch before mutating anything.
 	for i, op := range ops {
 		if strings.TrimSpace(op.Device) == "" {
 			return nil, fmt.Errorf("ops[%d]: missing device", i)
@@ -678,97 +681,265 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		}
 	}
 
-	idx.writeMu.Lock()
-	defer idx.writeMu.Unlock()
+	type opKey struct {
+		device string
+		hlc    string
+	}
+	type opPlan struct {
+		op          sidecar.TruthOp
+		asset       *Asset
+		assetID     string
+		outcome     string
+		origStatus  string
+		isDuplicate bool
+		isImport    bool
+	}
+	type assetGroup struct {
+		asset     *Asset
+		opIndices []int
+		sc        *sidecar.Sidecar
+		changed   bool
+		gen       uint64
+	}
 
-	receipts := make([]OpReceipt, 0, len(ops))
+	plans := make([]opPlan, len(ops))
+	groups := make(map[string]*assetGroup)
+	resolvedCache := make(map[string]*Asset)
+	batchSeen := make(map[opKey]int, len(ops))
 
-	for _, op := range ops {
-		// 1. Check (device, hlc) idempotency in ops_log.
+	// 2. Read-only duplicate pre-check & asset resolution (no global writeMu held).
+	for i, op := range ops {
+		plans[i].op = op
+		key := opKey{device: op.Device, hlc: op.HLC}
+		if prevIdx, seen := batchSeen[key]; seen {
+			plans[i].isDuplicate = true
+			plans[i].origStatus = plans[prevIdx].outcome
+			continue
+		}
+
 		var existingOutcome string
 		err := idx.db.QueryRowContext(ctx,
 			`SELECT outcome FROM ops_log WHERE device = ? AND hlc = ?`,
 			op.Device, op.HLC,
 		).Scan(&existingOutcome)
 		if err == nil {
-			receipts = append(receipts, OpReceipt{
-				Device:         op.Device,
-				HLC:            op.HLC,
-				Status:         "duplicate",
-				OriginalStatus: existingOutcome,
-			})
+			plans[i].isDuplicate = true
+			plans[i].origStatus = existingOutcome
 			continue
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
 
-		// Library-scope import marker: journal in ops_log only.
+		batchSeen[key] = i
+
 		if op.Field == "import" {
-			if err := idx.recordOpLog(ctx, op, "@library", "applied"); err != nil {
-				return nil, err
-			}
-			receipts = append(receipts, OpReceipt{Device: op.Device, HLC: op.HLC, Status: "applied"})
+			plans[i].isImport = true
+			plans[i].assetID = "@library"
+			plans[i].outcome = "applied"
 			continue
 		}
 
-		asset, err := idx.ResolveAsset(ctx, op.AssetKey, op.File)
-		if err != nil {
-			return nil, fmt.Errorf("resolve asset %q: %w", op.AssetKey, err)
+		cacheKey := op.AssetKey + "\x00" + op.File
+		asset, ok := resolvedCache[cacheKey]
+		if !ok {
+			asset, err = idx.ResolveAsset(ctx, op.AssetKey, op.File)
+			if err != nil {
+				return nil, fmt.Errorf("resolve asset %q: %w", op.AssetKey, err)
+			}
+			resolvedCache[cacheKey] = asset
 		}
+		plans[i].asset = asset
+		plans[i].assetID = asset.ID
 
-		sizeCopy := asset.SizeBytes
-		sc, changed, err := idx.sidecars.Update(
-			asset.FolderRoot,
-			asset.SidecarRoot,
-			asset.RelPath,
+		g, exists := groups[asset.ID]
+		if !exists {
+			g = &assetGroup{asset: asset}
+			groups[asset.ID] = g
+		}
+		g.opIndices = append(g.opIndices, i)
+	}
+
+	// 3. Apply per-asset sidecar updates in deterministic asset-ID order WITHOUT
+	// holding idx.writeMu, so unrelated assets execute disk I/O in parallel and
+	// multiple ops targeting the same asset coalesce into one atomic write.
+	sortedAssetIDs := make([]string, 0, len(groups))
+	for aid := range groups {
+		sortedAssetIDs = append(sortedAssetIDs, aid)
+	}
+	sort.Strings(sortedAssetIDs)
+
+	applyGroup := func(aid string) error {
+		g := groups[aid]
+		sizeCopy := g.asset.SizeBytes
+		sc, changed, gen, err := idx.sidecars.UpdateWithGen(
+			g.asset.FolderRoot,
+			g.asset.SidecarRoot,
+			g.asset.RelPath,
 			&sizeCopy,
-			asset.ContentHash,
+			g.asset.ContentHash,
 			func(cur *sidecar.Sidecar) (bool, error) {
-				return sidecar.ApplyOp(cur, op)
+				anyChanged := false
+				for _, idxPos := range g.opIndices {
+					opChanged, applyErr := sidecar.ApplyOp(cur, plans[idxPos].op)
+					if applyErr != nil {
+						return false, applyErr
+					}
+					if opChanged {
+						plans[idxPos].outcome = "applied"
+						anyChanged = true
+					} else {
+						plans[idxPos].outcome = "stale"
+					}
+				}
+				return anyChanged, nil
 			},
 		)
 		if err != nil {
-			return nil, fmt.Errorf("update sidecar for %s: %w", asset.ID, err)
+			return fmt.Errorf("update sidecar for %s: %w", aid, err)
 		}
+		g.sc = sc
+		g.changed = changed
+		g.gen = gen
+		return nil
+	}
 
-		outcome := "stale"
-		if changed {
-			outcome = "applied"
-			if err := idx.syncAssetFromSidecarLocked(ctx, asset.ID, sc); err != nil {
-				return nil, err
+	if len(sortedAssetIDs) == 1 {
+		if err := applyGroup(sortedAssetIDs[0]); err != nil {
+			return nil, err
+		}
+	} else if len(sortedAssetIDs) > 1 {
+		// Distinct assets hold distinct per-asset mutexes, so executing their
+		// atomic writes concurrently overlaps filesystem fsync barriers cleanly.
+		var (
+			wg       sync.WaitGroup
+			errMu    sync.Mutex
+			firstErr error
+		)
+		for _, aid := range sortedAssetIDs {
+			wg.Add(1)
+			go func(assetID string) {
+				defer wg.Done()
+				if err := applyGroup(assetID); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
+			}(aid)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+	}
+
+	// Fill in originalStatus for any intra-batch duplicates now that first outcomes are known.
+	for i := range plans {
+		if plans[i].isDuplicate && plans[i].origStatus == "" {
+			if firstIdx, ok := batchSeen[opKey{device: plans[i].op.Device, hlc: plans[i].op.HLC}]; ok {
+				plans[i].origStatus = plans[firstIdx].outcome
 			}
 		}
+	}
 
-		if err := idx.recordOpLog(ctx, op, asset.ID, outcome); err != nil {
+	// 4. Commit all SQLite projection updates + ops_log rows in ONE short WAL transaction.
+	receipts := make([]OpReceipt, len(ops))
+
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	pendingGen := make(map[string]uint64, len(sortedAssetIDs))
+	for _, aid := range sortedAssetIDs {
+		g := groups[aid]
+		if !g.changed || g.sc == nil {
+			continue
+		}
+		// Only apply SQLite projection if this sidecar generation is newer than
+		// the last committed generation for this asset.
+		if g.gen > idx.appliedGen[aid] {
+			if err := syncAssetFromSidecarTx(ctx, tx, aid, g.sc); err != nil {
+				return nil, err
+			}
+			pendingGen[aid] = g.gen
+		}
+	}
+
+	for i := range plans {
+		p := &plans[i]
+		if p.isDuplicate {
+			receipts[i] = OpReceipt{
+				Device:         p.op.Device,
+				HLC:            p.op.HLC,
+				Status:         "duplicate",
+				OriginalStatus: p.origStatus,
+			}
+			continue
+		}
+
+		// Re-check ops_log inside the transaction to handle concurrent identical (device, hlc).
+		var existingOutcome string
+		err := tx.QueryRowContext(ctx,
+			`SELECT outcome FROM ops_log WHERE device = ? AND hlc = ?`,
+			p.op.Device, p.op.HLC,
+		).Scan(&existingOutcome)
+		if err == nil {
+			receipts[i] = OpReceipt{
+				Device:         p.op.Device,
+				HLC:            p.op.HLC,
+				Status:         "duplicate",
+				OriginalStatus: existingOutcome,
+			}
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
 
-		receipts = append(receipts, OpReceipt{
-			Device: op.Device,
-			HLC:    op.HLC,
-			Status: outcome,
-		})
+		if err := recordOpLogTx(ctx, tx, p.op, p.assetID, p.outcome); err != nil {
+			return nil, err
+		}
+		receipts[i] = OpReceipt{
+			Device: p.op.Device,
+			HLC:    p.op.HLC,
+			Status: p.outcome,
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	for aid, gen := range pendingGen {
+		if gen > idx.appliedGen[aid] {
+			idx.appliedGen[aid] = gen
+		}
 	}
 
 	return receipts, nil
 }
 
-func (idx *Index) recordOpLog(ctx context.Context, op sidecar.TruthOp, assetID, outcome string) error {
+func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) error {
 	raw, err := json.Marshal(op)
 	if err != nil {
 		return err
 	}
 	sum := sha256.Sum256(raw)
 	hash := hex.EncodeToString(sum[:8])
-	_, err = idx.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO ops_log(device, hlc, asset_id, field, payload_hash, outcome, op_json) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		op.Device, op.HLC, assetID, op.Field, hash, outcome, string(raw),
 	)
 	return err
 }
 
-func (idx *Index) syncAssetFromSidecarLocked(ctx context.Context, assetID string, sc *sidecar.Sidecar) error {
+func syncAssetFromSidecarTx(ctx context.Context, tx *sql.Tx, assetID string, sc *sidecar.Sidecar) error {
 	rating, flag, label, keywords, edited := sidecar.ExtractVerdicts(sc)
 	editedInt := 0
 	editedAt := ""
@@ -780,12 +951,6 @@ func (idx *Index) syncAssetFromSidecarLocked(ctx context.Context, assetID string
 			editedAt = time.UnixMilli(int64(p.Millis)).UTC().Format(time.RFC3339Nano)
 		}
 	}
-
-	tx, err := idx.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE assets
@@ -807,7 +972,7 @@ func (idx *Index) syncAssetFromSidecarLocked(ctx context.Context, assetID string
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ChangesSince returns all applied journaled ops after sinceCursor and the
@@ -956,6 +1121,7 @@ func (idx *Index) ResetIndex(ctx context.Context) error {
 		idx.writeMu.Unlock()
 		return err
 	}
+	clear(idx.appliedGen)
 	idx.writeMu.Unlock()
 
 	return idx.ScanAll(ctx)

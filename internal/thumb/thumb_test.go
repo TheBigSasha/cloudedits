@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -105,6 +106,170 @@ func TestExtractEmbeddedJPEGFromRAWSynthetics(t *testing.T) {
 		t.Fatalf("ExtractEmbeddedJPEG(RAF): %v", err)
 	}
 	if !bytes.Equal(gotRAF, preview) {
-		t.Fatalf("extracted RAF preview mismatch")
+		t.Fatalf("extracted RAF preview mismatch: got %d bytes want %d", len(gotRAF), len(preview))
+	}
+}
+
+func TestExtractEmbeddedJPEGForTargetPicksSmallestAdequate(t *testing.T) {
+	dir := t.TempDir()
+	tiny := makeSampleJPEG(t, 160, 120, color.RGBA{10, 20, 30, 255})
+	medium := makeSampleJPEG(t, 800, 600, color.RGBA{40, 120, 200, 255})
+	huge := makeSampleJPEG(t, 2400, 1600, color.RGBA{220, 80, 40, 255})
+
+	var raw bytes.Buffer
+	raw.Write([]byte{'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00})
+	raw.Write(tiny)
+	raw.Write([]byte{0x00, 0x11, 0x22, 0x33})
+	raw.Write(medium)
+	raw.Write([]byte{0x44, 0x55, 0x66, 0x77})
+	raw.Write(huge)
+
+	arwPath := filepath.Join(dir, "MULTI.ARW")
+	if err := os.WriteFile(arwPath, raw.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gotT1, err := ExtractEmbeddedJPEGForTarget(arwPath, 480)
+	if err != nil {
+		t.Fatalf("ExtractEmbeddedJPEGForTarget(480): %v", err)
+	}
+	if !bytes.Equal(gotT1, medium) {
+		t.Fatalf("expected 800x600 medium preview (%d B), got %d B", len(medium), len(gotT1))
+	}
+
+	gotT2, err := ExtractEmbeddedJPEGForTarget(arwPath, 1280)
+	if err != nil {
+		t.Fatalf("ExtractEmbeddedJPEGForTarget(1280): %v", err)
+	}
+	if !bytes.Equal(gotT2, huge) {
+		t.Fatalf("expected 2400x1600 huge preview (%d B), got %d B", len(huge), len(gotT2))
+	}
+
+	gotLargest, err := ExtractEmbeddedJPEG(arwPath)
+	if err != nil {
+		t.Fatalf("ExtractEmbeddedJPEG: %v", err)
+	}
+	if !bytes.Equal(gotLargest, huge) {
+		t.Fatalf("expected largest preview (%d B), got %d B", len(huge), len(gotLargest))
+	}
+}
+
+func TestFastRejectEmptyAndEXR(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(filepath.Join(dir, "cache"), 2)
+
+	emptyDNG := filepath.Join(dir, "empty.dng")
+	if err := os.WriteFile(emptyDNG, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Resolve(context.Background(), emptyDNG, "rev-empty", "", "t1"); err == nil {
+		t.Fatalf("expected error on 0-byte DNG")
+	}
+
+	exrPath := filepath.Join(dir, "scene.exr")
+	if err := os.WriteFile(exrPath, []byte{0x76, 0x2F, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Resolve(context.Background(), exrPath, "rev-exr", "", "t1"); err == nil {
+		t.Fatalf("expected error on OpenEXR")
+	}
+}
+
+func TestSingleFlightDedupConcurrentResolve(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "burst.jpg")
+	if err := os.WriteFile(srcPath, makeSampleJPEG(t, 1280, 854, color.RGBA{90, 140, 210, 255}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService(filepath.Join(dir, "cache"), 2)
+	const n = 12
+	results := make([]*Result, n)
+	errs := make([]error, n)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx], errs[idx] = svc.Resolve(context.Background(), srcPath, "rev-burst", "", "t1")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d failed: %v", i, errs[i])
+		}
+		if results[i] == nil || len(results[i].Data) == 0 {
+			t.Fatalf("goroutine %d empty result", i)
+		}
+		if !bytes.Equal(results[i].Data, results[0].Data) {
+			t.Fatalf("goroutine %d bytes differed from goroutine 0", i)
+		}
+	}
+}
+
+func TestDecodeJPEGScale8MatchesStdlib(t *testing.T) {
+	// Gradient RGBA image (1600x1200 -> 1/8 scale = 200x150) verifying color
+	// fidelity of the pure-Go SOF0 1/8-scale DC decoder against stdlib jpeg.Decode.
+	const w, h = 1600, 1200
+	src := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			src.SetRGBA(x, y, color.RGBA{
+				R: uint8((x * 255) / w),
+				G: uint8((y * 255) / h),
+				B: uint8(((w - x) * 200) / w),
+				A: 255,
+			})
+		}
+	}
+	var jpgBuf bytes.Buffer
+	if err := jpeg.Encode(&jpgBuf, src, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatalf("encode gradient jpeg: %v", err)
+	}
+
+	fastImg, err := decodeJPEGScale8Bytes(jpgBuf.Bytes(), 150)
+	if err != nil {
+		t.Fatalf("decodeJPEGScale8Bytes failed: %v", err)
+	}
+	if fastImg.Bounds().Dx() != w/8 || fastImg.Bounds().Dy() != h/8 {
+		t.Fatalf("expected %dx%d, got %dx%d", w/8, h/8, fastImg.Bounds().Dx(), fastImg.Bounds().Dy())
+	}
+
+	refImg, err := jpeg.Decode(bytes.NewReader(jpgBuf.Bytes()))
+	if err != nil {
+		t.Fatalf("stdlib jpeg.Decode: %v", err)
+	}
+
+	var totalDiff int64
+	var samples int64
+	for by := 2; by < h/8-2; by += 5 {
+		for bx := 2; bx < w/8-2; bx += 5 {
+			r1, g1, b1, _ := fastImg.At(bx, by).RGBA()
+			r2, g2, b2, _ := refImg.At(bx*8+4, by*8+4).RGBA()
+			dr := int(r1>>8) - int(r2>>8)
+			dg := int(g1>>8) - int(g2>>8)
+			db := int(b1>>8) - int(b2>>8)
+			if dr < 0 {
+				dr = -dr
+			}
+			if dg < 0 {
+				dg = -dg
+			}
+			if db < 0 {
+				db = -db
+			}
+			totalDiff += int64(dr + dg + db)
+			samples += 3
+		}
+	}
+	meanDiff := float64(totalDiff) / float64(samples)
+	if meanDiff > 4.0 {
+		t.Fatalf("1/8-scale DC decode color drift too high: mean channel diff = %.2f (want <= 4.0)", meanDiff)
 	}
 }
