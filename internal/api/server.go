@@ -253,8 +253,52 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 		}
 
 		tw := &timingResponseWriter{ResponseWriter: w, start: start}
+		if hasInvalidTraversalPath(r) {
+			writeAPIError(tw, http.StatusBadRequest, "invalid-path", "invalid request path")
+			return
+		}
 		next.ServeHTTP(tw, r)
 	})
+}
+
+func hasInvalidTraversalPath(r *http.Request) bool {
+	candidates := [3]string{r.URL.Path, r.URL.RawPath, ""}
+	if reqURI := r.RequestURI; reqURI != "" {
+		if q := strings.IndexByte(reqURI, '?'); q >= 0 {
+			reqURI = reqURI[:q]
+		}
+		candidates[2] = reqURI
+	}
+	for _, raw := range candidates {
+		if raw == "" {
+			continue
+		}
+		if strings.ContainsAny(raw, "\\\x00") {
+			return true
+		}
+		lower := strings.ToLower(raw)
+		if strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
+			return true
+		}
+		for _, seg := range strings.Split(raw, "/") {
+			if seg == ".." {
+				return true
+			}
+			if unesc, err := url.PathUnescape(seg); err == nil {
+				if unesc == ".." || strings.ContainsAny(unesc, "\\\x00") {
+					return true
+				}
+				if strings.Contains(unesc, "/") {
+					for _, sub := range strings.Split(unesc, "/") {
+						if sub == ".." {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 type timingResponseWriter struct {

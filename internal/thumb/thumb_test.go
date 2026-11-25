@@ -319,4 +319,27 @@ func TestDecodeJPEGScale8RejectsOversubscribedDHTAndZeroDims(t *testing.T) {
 	if remaining != 0 {
 		t.Fatalf("expected inFlight map to be empty after failed Resolve, got %d", remaining)
 	}
+
+	// Large (>2 MiB) 4096x4096 malformed over-subscribed DHT JPEG must also fail cleanly
+	// instead of falling back to serving raw corrupt source bytes.
+	var largeCorrupt bytes.Buffer
+	largeCorrupt.Write([]byte{0xFF, 0xD8})
+	// SOF0: 4096x4096, 1 component, 8-bit
+	largeCorrupt.Write([]byte{0xFF, 0xC0, 0x00, 11, 8, 0x10, 0x00, 0x10, 0x00, 1, 1, 0x11, 0})
+	// Over-subscribed DHT (bits[0] = 3)
+	largeCorrupt.Write([]byte{0xFF, 0xC4, 0x00, 22, 0x00})
+	largeCorrupt.Write([]byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	largeCorrupt.Write([]byte{0x00, 0x01, 0x02})
+	// SOS + >2 MiB payload + EOI
+	largeCorrupt.Write([]byte{0xFF, 0xDA, 0x00, 8, 1, 1, 0x00, 0, 63, 0})
+	largeCorrupt.Write(bytes.Repeat([]byte{0x55}, 2*1024*1024+1024))
+	largeCorrupt.Write([]byte{0xFF, 0xD9})
+
+	largePath := filepath.Join(dir, "large_corrupt_dht.jpg")
+	if err := os.WriteFile(largePath, largeCorrupt.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := svc.Resolve(context.Background(), largePath, "rev-large-corrupt", "", "t1"); err == nil {
+		t.Fatalf("expected error for >2 MiB corrupt DHT JPEG, got HTTP-200-equivalent result (%d bytes, src=%s)", len(res.Data), res.TierSource)
+	}
 }

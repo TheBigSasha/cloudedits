@@ -206,25 +206,36 @@ func (s *Service) generateAndCache(
 		// serving compact adequate camera previews (e.g. 570-1620px <= 512 KiB)
 		// verbatim with zero decode/re-encode overhead.
 		if normTier == "t0" || len(thumbBytes) > 512*1024 {
-			if resized, rerr := downscaleJPEGBytes(thumbBytes, maxDim); rerr == nil {
-				thumbBytes = resized
+			resized, rerr := downscaleJPEGBytes(thumbBytes, maxDim)
+			if rerr != nil {
+				return nil, fmt.Errorf("decode RAW embedded preview: %w", rerr)
 			}
+			thumbBytes = resized
 		}
 	} else {
 		// For raster images: downscale into bounded JPEG q82.
 		thumbBytes, err = downscaleRasterFile(sourcePath, maxDim)
 		if err != nil {
-			// Fallback: try embedded JPEG scan for container formats (e.g. HEIC/TIFF with preview).
-			if embedded, eerr := ExtractEmbeddedJPEGForTarget(sourcePath, tierMinAdequateRAWDim(normTier)); eerr == nil {
-				thumbBytes = embedded
-				tierSource = "embedded"
-				if normTier == "t0" || len(thumbBytes) > 512*1024 {
-					if resized, rerr := downscaleJPEGBytes(thumbBytes, maxDim); rerr == nil {
-						thumbBytes = resized
-					}
-				}
-			} else {
+			// Only attempt embedded JPEG extraction for non-JPEG container
+			// formats (e.g. HEIC/TIFF with preview). If the source file itself
+			// has a JPEG header and failed decode, it is corrupt and must fail
+			// with an explicit error (HTTP 422) rather than serving raw bytes.
+			if isJPEGFileHeader(sourcePath) {
+				return nil, fmt.Errorf("decode JPEG thumbnail: %w", err)
+			}
+			embedded, eerr := ExtractEmbeddedJPEGForTarget(sourcePath, tierMinAdequateRAWDim(normTier))
+			if eerr != nil {
 				return nil, fmt.Errorf("generate raster thumbnail: %w", err)
+			}
+			tierSource = "embedded"
+			if normTier == "t0" || len(embedded) > 512*1024 {
+				resized, rerr := downscaleJPEGBytes(embedded, maxDim)
+				if rerr != nil {
+					return nil, fmt.Errorf("decode embedded preview: %w", rerr)
+				}
+				thumbBytes = resized
+			} else {
+				thumbBytes = embedded
 			}
 		} else {
 			tierSource = "generated"
@@ -256,6 +267,17 @@ func (s *Service) ClearCache() error {
 		return nil
 	}
 	return os.RemoveAll(s.cacheDir)
+}
+
+func isJPEGFileHeader(filePath string) bool {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	var hdr [3]byte
+	n, _ := io.ReadFull(f, hdr[:])
+	return n >= 3 && formats.IsJPEGMagic(hdr[:n])
 }
 
 func fastRejectUnsupported(filePath string) error {

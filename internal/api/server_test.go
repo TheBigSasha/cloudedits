@@ -7,6 +7,8 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -423,5 +425,77 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 	_ = sesResp.Body.Close()
 	if sesBody.Token == "" || sesBody.BlobToken == "" {
 		t.Fatalf("expected session token and blobToken, got %+v", sesBody)
+	}
+}
+
+func TestCorruptLargeDHTJPEGReturns422AndPathTraversalRejected(t *testing.T) {
+	srv, photoDir, _ := newTestServer(t, "")
+
+	// Write a >2 MiB 4096x4096 malformed over-subscribed DHT JPEG into the library.
+	var bad bytes.Buffer
+	bad.Write([]byte{0xFF, 0xD8})
+	bad.Write([]byte{0xFF, 0xC0, 0x00, 11, 8, 0x10, 0x00, 0x10, 0x00, 1, 1, 0x11, 0})
+	bad.Write([]byte{0xFF, 0xC4, 0x00, 22, 0x00})
+	bad.Write([]byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	bad.Write([]byte{0x00, 0x01, 0x02})
+	bad.Write([]byte{0xFF, 0xDA, 0x00, 8, 1, 1, 0x00, 0, 63, 0})
+	bad.Write(bytes.Repeat([]byte{0x55}, 2*1024*1024+1024))
+	bad.Write([]byte{0xFF, 0xD9})
+	if err := os.WriteFile(filepath.Join(photoDir, "corrupt_4096_dht.jpg"), bad.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.idx.ScanAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	corruptID := index.MakeAssetID("main", "corrupt_4096_dht.jpg")
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// 1. Corrupt >2 MiB JPEG must return HTTP 422 (never HTTP 200 raw bytes).
+	resp, err := http.Get(ts.URL + "/assets/" + corruptID + "/blob?tier=t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected HTTP 422 for corrupt >2 MiB DHT JPEG, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Fatalf("missing CORP header on 422 error response")
+	}
+
+	// 2. Raw uncleaned path traversal must return HTTP 400 (never 501 or 301 redirect).
+	for _, rawPath := range []string{
+		"/assets/../../../etc/passwd",
+		"/assets/%2e%2e/%2e%2e/etc/passwd",
+		"/assets/..%2f..%2fetc/passwd",
+		"/assets/..\\..\\etc\\passwd",
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+rawPath, nil)
+		req.RequestURI = rawPath
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("path %q: expected HTTP 400, got %d body=%s", rawPath, rec.Code, rec.Body.String())
+		}
+		if rec.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+			t.Fatalf("path %q: missing CORP header on 400 response", rawPath)
+		}
+	}
+
+	// 3. Verify raw TCP HTTP/1.1 wire request GET /assets/../../../etc/passwd returns 400 (not 301/501).
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET /assets/../../../etc/passwd HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+	rawResp, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(rawResp), "HTTP/1.1 400 ") {
+		t.Fatalf("expected raw wire HTTP/1.1 400 for /assets/../../../etc/passwd, got:\n%s", string(rawResp))
 	}
 }
