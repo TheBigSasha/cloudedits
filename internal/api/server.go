@@ -497,7 +497,6 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, exp := s.sessions.Issue(p)
-	bt := s.sessions.SignBlobToken(p.Subject, "*", 15*time.Minute)
 	perms := make([]string, 0, len(p.Scopes))
 	for perm, ok := range p.Scopes {
 		if ok {
@@ -506,7 +505,6 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":       token,
-		"blobToken":   bt,
 		"subject":     p.Subject,
 		"expiresAt":   exp.Format(time.RFC3339),
 		"permissions": perms,

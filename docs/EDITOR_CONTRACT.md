@@ -63,12 +63,12 @@ Auxiliary channels store disposable, pre-transform derived image buffers alongsi
 | `GET` | `/open` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&image_id=<a>` |
 | `GET` | `/h/{id}` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&handoff=<id>` |
 | `GET` | `/capabilities` | Public | — | Advertise `protocol` (`hdrtoys-lp` v2), `profiles`, `caps`, `permissions`, `limits`, and `library` |
-| `POST` | `/auth/session` | Public | — | Exchange Tailnet WhoIs identity or bearer token for a short-lived session token and blob signing key scope |
+| `POST` | `/auth/session` | Public | — | Exchange Tailnet WhoIs identity or bearer token for a short-lived session bearer token |
 | `GET` | `/assets/count` | Authenticated | `library:read` | Count matching assets (`{ total, count, exact }`) |
 | `GET` | `/assets/range` | Authenticated | `library:read` | Offset/limit slice (`{ total, exact, offset, limit, assets[] }`, `limit <= 500`, `fields=grid|full`) |
 | `GET` | `/assets` | Authenticated | `library:read` | Cursor-paginated list (`{ assets[], nextCursor, total }`, `limit <= 200`) |
 | `GET` | `/assets/{id}` | Authenticated | `asset:read` | Full asset metadata (including `thumbnailUrl`, `rawUrl`, `recipeUrl`, `editedByHdrToys`, full `exif`) |
-| `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`, supports `&bt=<signed>`) |
+| `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`) |
 | `GET` | `/assets/{id}/file` | Authenticated | `asset:read` | Alias for `/assets/{id}/blob` |
 | `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ assetId, recipe, hlc }` (`404` `not-found` when unedited) |
 | `POST` | `/assets/{id}/rating` | Authenticated | `edits:write` | Write asset rating (`0`–`5`) durably as an HLC op |
