@@ -33,7 +33,7 @@ const (
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	// MaxAuxChannelBytes caps uploaded auxiliary channel sidecars (16 MiB).
-	MaxAuxChannelBytes   = 16 * 1024 * 1024
+	MaxAuxChannelBytes   = sidecar.MaxAuxChannelBytes
 	maxRenderBytes       = 64 * 1024 * 1024
 	maxHandoffBytes      = 64 * 1024
 	maxSmallJSONBytes    = 64 * 1024

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/thebigsasha/cloudedits/internal/formats"
+	"github.com/thebigsasha/cloudedits/internal/safefile"
 )
 
 type assetLock struct {
@@ -113,6 +114,19 @@ func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
 // unrecognized auxiliary channel name.
 var ErrInvalidAuxChannel = errors.New("invalid auxiliary channel")
 
+// ErrSidecarTooLarge indicates a write that would grow a .edits document past
+// MaxSidecarBytes.
+var ErrSidecarTooLarge = errors.New("sidecar exceeds size limit")
+
+const (
+	// MaxSidecarBytes bounds a .edits document, on read and on write. Real
+	// documents are kilobytes; the bound keeps a hostile or runaway file from
+	// being parsed into memory (the JSON tree is several times its size).
+	MaxSidecarBytes = 16 * 1024 * 1024
+	// MaxAuxChannelBytes bounds an auxiliary channel PNG, on upload and on read.
+	MaxAuxChannelBytes = 16 * 1024 * 1024
+)
+
 var auxChannelNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 
 // ValidateAuxChannel validates channel against the safe channel name syntax
@@ -172,7 +186,7 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 		return nil, err
 	}
 	var inFolder *Sidecar
-	if data, err := os.ReadFile(canonical); err == nil {
+	if data, _, err := safefile.ReadRegular(canonical, MaxSidecarBytes); err == nil {
 		sc, parseErr := Parse(data)
 		if parseErr != nil {
 			qPath, qErr := quarantineFile(sidecarRoot, relPosix, canonical)
@@ -223,7 +237,7 @@ func besidePhotoCandidates(folderRoot, relPosix string) []string {
 // edit file that happens to sit there) is not folder truth and is skipped.
 func readBesidePhoto(folderRoot, relPosix string) (*Sidecar, string) {
 	for _, p := range besidePhotoCandidates(folderRoot, relPosix) {
-		data, err := os.ReadFile(p)
+		data, _, err := safefile.ReadRegular(p, MaxSidecarBytes)
 		if err != nil {
 			continue
 		}
@@ -502,6 +516,11 @@ func (s *Store) UpdateWithGen(
 	if err != nil {
 		return nil, false, 0, err
 	}
+	if len(payload) > MaxSidecarBytes {
+		// Never write a document Read would refuse: that would strand the
+		// asset's edits on disk where no later op could reach them.
+		return nil, false, 0, fmt.Errorf("%w: %s would be %d bytes (limit %d)", ErrSidecarTooLarge, canonical, len(payload), MaxSidecarBytes)
+	}
 	if err := WriteAtomic(sidecarRoot, canonical, payload); err != nil {
 		return nil, false, 0, err
 	}
@@ -546,7 +565,7 @@ func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if data, err := os.ReadFile(canonical); err == nil {
+	if data, err := readAuxChannelFile(canonical); err == nil {
 		return data, canonical, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
@@ -554,7 +573,7 @@ func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string
 
 	if folderRoot != "" {
 		if beside, err := SafeJoinRel(folderRoot, relPosix+suffix); err == nil {
-			if data, err := os.ReadFile(beside); err == nil {
+			if data, err := readAuxChannelFile(beside); err == nil {
 				return data, beside, nil
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, "", err
@@ -564,6 +583,25 @@ func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string
 	return nil, "", os.ErrNotExist
 }
 
+// readAuxChannelFile returns an auxiliary channel file only if it is something
+// the server would itself have stored: a regular file within the upload limit
+// that begins with the PNG signature. Anything else found at that name (a
+// symbolic link, a device, an oversized or non-PNG file) is reported as absent
+// rather than followed, read into memory, or served as an image.
+func readAuxChannelFile(path string) ([]byte, error) {
+	data, _, err := safefile.ReadRegular(path, MaxAuxChannelBytes)
+	if errors.Is(err, safefile.ErrNotRegular) || errors.Is(err, safefile.ErrTooLarge) {
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !formats.IsPNGMagic(data) {
+		return nil, os.ErrNotExist
+	}
+	return data, nil
+}
+
 // WriteAuxChannel atomically commits an auxiliary channel sidecar to
 // <sidecarRoot>/<relPosix>.<channel>.png via <sidecarRoot>/.tmp/<uuid> ->
 // Sync() -> Close() -> os.Rename(). Source photo folders are never modified.
@@ -571,6 +609,9 @@ func (s *Store) WriteAuxChannel(sidecarRoot, relPosix, channel string, data []by
 	target, err := AuxChannelPath(sidecarRoot, relPosix, channel)
 	if err != nil {
 		return "", err
+	}
+	if len(data) > MaxAuxChannelBytes || !formats.IsPNGMagic(data) {
+		return "", fmt.Errorf("auxiliary channel must be a PNG of at most %d bytes", MaxAuxChannelBytes)
 	}
 	lk := s.lockFor(target)
 	lk.mu.Lock()
