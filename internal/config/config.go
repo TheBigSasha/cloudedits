@@ -128,7 +128,9 @@ func Save(cfg *Config) error {
 	if cfg.DataDir == "" {
 		cfg.DataDir = DefaultDataDir()
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	// The data directory holds the index (file names, ratings, keywords),
+	// the thumbnail cache and credentials: keep it private to this user.
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")

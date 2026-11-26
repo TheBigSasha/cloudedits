@@ -301,11 +301,11 @@ func (s *Service) generateAndCache(
 
 	// Best-effort persist into app-data disk cache (never inside photo folders).
 	if s.cacheDir != "" {
-		if mkErr := os.MkdirAll(s.cacheDir, 0o755); mkErr == nil {
+		if mkErr := os.MkdirAll(s.cacheDir, 0o700); mkErr == nil {
 			tmp := cachePath + ".tmp"
-			if wErr := os.WriteFile(tmp, thumbBytes, 0o644); wErr == nil {
+			if wErr := os.WriteFile(tmp, thumbBytes, 0o600); wErr == nil {
 				_ = os.Rename(tmp, cachePath)
-				_ = os.WriteFile(metaPath, []byte(tierSource), 0o644)
+				_ = os.WriteFile(metaPath, []byte(tierSource), 0o600)
 			}
 		}
 	}
