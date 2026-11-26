@@ -76,6 +76,7 @@ components:
             type: string
         caps:
           type: object
+          description: Feature flags advertised by this server (including `auxiliaryChannels: true`).
           additionalProperties: true
         permissions:
           type: array
@@ -83,6 +84,7 @@ components:
             type: string
         limits:
           type: object
+          description: Request and payload limits advertised by this server (including `maxAuxChannelBytes: 16777216`).
           additionalProperties: true
         library:
           type: object
@@ -307,6 +309,34 @@ components:
         ui:
           type: object
           additionalProperties: true
+    AuxChannelUploadResponse:
+      type: object
+      required: [ok, assetId, channel, bytes, contentType, etag]
+      properties:
+        ok:
+          type: boolean
+        assetId:
+          type: string
+        channel:
+          type: string
+        bytes:
+          type: integer
+        contentType:
+          type: string
+        etag:
+          type: string
+    AuxChannelDeleteResponse:
+      type: object
+      required: [ok, assetId, channel, deleted]
+      properties:
+        ok:
+          type: boolean
+        assetId:
+          type: string
+        channel:
+          type: string
+        deleted:
+          type: boolean
 paths:
   /:
     get:
@@ -609,6 +639,134 @@ paths:
       responses:
         "200":
           description: Thumbnail saved
+  /assets/{id}/aux/{channel}:
+    get:
+      summary: Fetch an auxiliary channel PNG sidecar (e.g. depth)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [depth]
+      responses:
+        "200":
+          description: Raw auxiliary channel PNG bytes with strong ETag and X-HDRT-Aux-Channel
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: Cached auxiliary channel unchanged (If-None-Match matched ETag)
+        "400":
+          description: Invalid or unsupported auxiliary channel name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Asset or auxiliary channel not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: Upload an auxiliary channel PNG sidecar (<= 16 MiB)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [depth]
+      requestBody:
+        required: true
+        content:
+          image/png:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Auxiliary channel saved atomically
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuxChannelUploadResponse"
+        "400":
+          description: Invalid or unsupported auxiliary channel name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Payload exceeds limits.maxAuxChannelBytes (16 MiB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: Payload does not start with a valid PNG signature
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Remove a disposable auxiliary channel sidecar (never touches original media)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [depth]
+      responses:
+        "200":
+          description: Deletion completed (`{ ok, assetId, channel, deleted }`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuxChannelDeleteResponse"
+        "400":
+          description: Invalid or unsupported auxiliary channel name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /assets/{id}/renders:
     get:
       summary: List uploaded rendered exports

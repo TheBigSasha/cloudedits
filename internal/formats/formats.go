@@ -3,6 +3,7 @@
 package formats
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 )
@@ -79,11 +80,41 @@ func IsEditThumbnailName(name string) bool {
 	return len(base) > len(EditThumbnailSuffix) && strings.EqualFold(base[len(base)-len(EditThumbnailSuffix):], EditThumbnailSuffix)
 }
 
+// auxChannelSuffixes maps recognized auxiliary channel names to their canonical
+// compound filename suffixes appended to a photo filename
+// (e.g. "<photo filename>.depth.png").
+var auxChannelSuffixes = map[string]string{
+	"depth": ".depth.png",
+}
+
+// AuxChannelSuffix returns the canonical filename suffix (such as ".depth.png")
+// for a recognized auxiliary channel name.
+func AuxChannelSuffix(channel string) (string, bool) {
+	suffix, ok := auxChannelSuffixes[channel]
+	return suffix, ok
+}
+
+// IsAuxChannelName reports whether name is a recognized auxiliary channel
+// sidecar artifact (for example "<photo filename>.depth.png"). An editor that
+// keeps artifacts beside the photos writes these into the photo folder itself,
+// where they carry a .png extension but are derived channels of another asset,
+// never standalone photos. The suffix match is case-insensitive and requires a
+// source filename in front of it.
+func IsAuxChannelName(name string) bool {
+	base := filepath.Base(name)
+	for _, suffix := range auxChannelSuffixes {
+		if len(base) > len(suffix) && strings.EqualFold(base[len(base)-len(suffix):], suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsSupportedFile returns true if filename has a supported image or RAW
-// extension and is not an excluded AppleDouble/hidden file or an
-// edited-preview artifact.
+// extension and is not an excluded AppleDouble/hidden file, an edited-preview
+// artifact, or an auxiliary channel sidecar.
 func IsSupportedFile(name string) bool {
-	if ShouldSkipName(name) || IsEditThumbnailName(name) {
+	if ShouldSkipName(name) || IsEditThumbnailName(name) || IsAuxChannelName(name) {
 		return false
 	}
 	ext := strings.ToLower(filepath.Ext(name))
@@ -128,6 +159,14 @@ func MIME(name string) string {
 // IsJPEGMagic reports whether data starts with the JPEG SOI marker (FF D8 FF).
 func IsJPEGMagic(data []byte) bool {
 	return len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
+}
+
+var pngMagic = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}
+
+// IsPNGMagic reports whether data starts with the 8-byte PNG signature
+// (\x89PNG\r\n\x1a\n).
+func IsPNGMagic(data []byte) bool {
+	return bytes.HasPrefix(data, pngMagic)
 }
 
 // SupportedExtensions returns a copy of all supported extensions (lowercased).

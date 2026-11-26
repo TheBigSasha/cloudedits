@@ -12,7 +12,8 @@
 └── .hdrtoys/                                # Only writable directory inside photo folder
     ├── DCIM/
     │   ├── IMG_0001.ARW.edits               # Canonical truth sidecar (hdrt: 1)
-    │   └── IMG_0001.ARW.edit_thumbnail.jpg  # Disposable edited preview JPEG (UltraHDR when HDR)
+    │   ├── IMG_0001.ARW.edit_thumbnail.jpg  # Disposable edited preview JPEG (UltraHDR when HDR)
+    │   └── IMG_0001.ARW.depth.png           # Auxiliary channel PNG sidecar (e.g. depth buffer)
     ├── renders/                             # Optional uploaded rendered exports
     ├── .tmp/                                # Same-filesystem atomic rename staging
     └── .quarantine/                         # Corrupt .edits files moved here instead of silently dropped
@@ -135,3 +136,11 @@ A folder can therefore hold a copy in each layout. Every read joins the two with
 - Writes **always** commit the joined state atomically to `<sidecarRoot>/<rel>.edits` via temp file in `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> `fsync` of the target directory. Only then is a write acknowledged as durable. Setting `CLOUDEDITS_FSYNC=0` skips both flushes: writes stay atomic against a crash of the server process, but an OS crash or power loss can lose or truncate an acknowledged edit. Staging files orphaned by a killed process are swept from `.tmp/` once they are 15 minutes old.
 
 If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by the other copy.
+
+## Auxiliary Channels (`<rel>.<channel>.png`)
+
+Disposable auxiliary channel PNGs (starting with `depth`) live next to `.edits` inside `.hdrtoys/`:
+
+- **Canonical path:** `<sidecarRoot>/<rel-posix-path>.<channel>.png` (for example `.hdrtoys/DCIM/IMG_0001.ARW.depth.png`).
+- **Colocated read fallback:** If the canonical file is absent, readers fall back to a read-only colocated `<photoFolder>/<rel-posix-path>.<channel>.png`. Colocated auxiliary files are excluded from library scanning and are never indexed as standalone photos.
+- **Writes and deletes:** Writes always commit atomically into `<sidecarRoot>` via `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> directory `fsync`. Deletes remove only `<sidecarRoot>/<rel-posix-path>.<channel>.png`; source photo folders remain strictly read-only.

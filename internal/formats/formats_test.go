@@ -64,6 +64,21 @@ func TestJPEGMagic(t *testing.T) {
 	}
 }
 
+func TestPNGMagic(t *testing.T) {
+	if !IsPNGMagic([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0x00}) {
+		t.Fatal("expected valid PNG magic")
+	}
+	if IsPNGMagic([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F'}) {
+		t.Fatal("JPEG must not match PNG magic")
+	}
+	if IsPNGMagic([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A}) {
+		t.Fatal("truncated PNG signature must not match")
+	}
+	if IsPNGMagic(nil) {
+		t.Fatal("empty slice must not match PNG magic")
+	}
+}
+
 // An editor that keeps its artifacts beside the photos writes the edited
 // preview as "<photo>.edit_thumbnail.jpg". It is a derived preview of another
 // asset, never a photo of its own.
@@ -79,5 +94,43 @@ func TestEditThumbnailBesidePhotoIsNotAnAsset(t *testing.T) {
 		if got, want := IsSupportedFile(name), name != ".edit_thumbnail.jpg.png"; got != want {
 			t.Errorf("IsSupportedFile(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// Auxiliary channel sidecars (such as "<photo>.depth.png") may sit beside
+// photos in read-only colocated layouts; they carry a .png extension but are
+// derived channels of another asset, never standalone photos.
+func TestAuxChannelBesidePhotoIsNotAnAsset(t *testing.T) {
+	if suffix, ok := AuxChannelSuffix("depth"); !ok || suffix != ".depth.png" {
+		t.Fatalf("AuxChannelSuffix(depth) = (%q, %v), want (.depth.png, true)", suffix, ok)
+	}
+	if suffix, ok := AuxChannelSuffix("unknown"); ok || suffix != "" {
+		t.Fatalf("AuxChannelSuffix(unknown) = (%q, %v), want (\"\", false)", suffix, ok)
+	}
+
+	for _, name := range []string{
+		"IMG_0001.JPG.depth.png",
+		"IMG_0001.ARW.DEPTH.PNG",
+		"DCIM/a.jpg.depth.png",
+		"scene.depth.png",
+	} {
+		if !IsAuxChannelName(name) {
+			t.Errorf("IsAuxChannelName(%q) = false, want true", name)
+		}
+		if IsSupportedFile(name) {
+			t.Errorf("%q is an auxiliary channel sidecar but was accepted as a photo", name)
+		}
+	}
+
+	for _, name := range []string{"depth.png", "photo.png", "my.photo.png", "IMG_0001.JPG"} {
+		if IsAuxChannelName(name) {
+			t.Errorf("IsAuxChannelName(%q) = true, want false", name)
+		}
+		if !IsSupportedFile(name) {
+			t.Errorf("IsSupportedFile(%q) = false, want true", name)
+		}
+	}
+	if IsSupportedFile(".depth.png") {
+		t.Errorf("IsSupportedFile(.depth.png) = true, want false")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/thebigsasha/cloudedits/internal/formats"
 )
 
 type assetLock struct {
@@ -104,6 +107,37 @@ func CanonicalEditsPath(sidecarRoot, relPosix string) (string, error) {
 // EditThumbnailPath returns <sidecarRoot>/<relPosix>.edit_thumbnail.jpg.
 func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
 	return SafeJoinRel(sidecarRoot, relPosix+".edit_thumbnail.jpg")
+}
+
+// ErrInvalidAuxChannel indicates an empty, syntactically invalid, or
+// unrecognized auxiliary channel name.
+var ErrInvalidAuxChannel = errors.New("invalid auxiliary channel")
+
+var auxChannelNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
+// ValidateAuxChannel validates channel against the safe channel name syntax
+// (^[a-z][a-z0-9_-]{0,31}$) and the explicit recognized channel -> suffix
+// mapping, returning the canonical filename suffix (e.g. ".depth.png") or
+// ErrInvalidAuxChannel.
+func ValidateAuxChannel(channel string) (string, error) {
+	if !auxChannelNamePattern.MatchString(channel) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidAuxChannel, channel)
+	}
+	suffix, ok := formats.AuxChannelSuffix(channel)
+	if !ok {
+		return "", fmt.Errorf("%w: unsupported channel %q", ErrInvalidAuxChannel, channel)
+	}
+	return suffix, nil
+}
+
+// AuxChannelPath returns <sidecarRoot>/<relPosix>.<channel>.png for a valid
+// auxiliary channel.
+func AuxChannelPath(sidecarRoot, relPosix, channel string) (string, error) {
+	suffix, err := ValidateAuxChannel(channel)
+	if err != nil {
+		return "", err
+	}
+	return SafeJoinRel(sidecarRoot, relPosix+suffix)
 }
 
 // ReadResult describes a sidecar read outcome.
@@ -492,6 +526,86 @@ func (s *Store) WriteEditThumbnail(sidecarRoot, relPosix string, jpegBytes []byt
 		return "", err
 	}
 	return target, nil
+}
+
+// ReadAuxChannel loads an auxiliary channel sidecar for an asset, checking the
+// canonical path (<sidecarRoot>/<relPosix>.<channel>.png) first and falling
+// back to a read-only colocated copy beside the photo
+// (<folderRoot>/<relPosix>.<channel>.png). Returns os.ErrNotExist when neither
+// exists, or ErrInvalidAuxChannel when channel is not allowed.
+func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string) ([]byte, string, error) {
+	suffix, err := ValidateAuxChannel(channel)
+	if err != nil {
+		return nil, "", err
+	}
+	canonical, err := SafeJoinRel(sidecarRoot, relPosix+suffix)
+	if err != nil {
+		return nil, "", err
+	}
+	lk := s.lockFor(canonical)
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
+
+	if data, err := os.ReadFile(canonical); err == nil {
+		return data, canonical, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, "", err
+	}
+
+	if folderRoot != "" {
+		if beside, err := SafeJoinRel(folderRoot, relPosix+suffix); err == nil {
+			if data, err := os.ReadFile(beside); err == nil {
+				return data, beside, nil
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, "", err
+			}
+		}
+	}
+	return nil, "", os.ErrNotExist
+}
+
+// WriteAuxChannel atomically commits an auxiliary channel sidecar to
+// <sidecarRoot>/<relPosix>.<channel>.png via <sidecarRoot>/.tmp/<uuid> ->
+// Sync() -> Close() -> os.Rename(). Source photo folders are never modified.
+func (s *Store) WriteAuxChannel(sidecarRoot, relPosix, channel string, data []byte) (string, error) {
+	target, err := AuxChannelPath(sidecarRoot, relPosix, channel)
+	if err != nil {
+		return "", err
+	}
+	lk := s.lockFor(target)
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
+
+	if err := WriteAtomic(sidecarRoot, target, data); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+// DeleteAuxChannel removes the disposable auxiliary channel sidecar under
+// <sidecarRoot>/<relPosix>.<channel>.png. It never touches files in the source
+// photo folder. Reports whether a file was removed.
+func (s *Store) DeleteAuxChannel(sidecarRoot, relPosix, channel string) (bool, error) {
+	target, err := AuxChannelPath(sidecarRoot, relPosix, channel)
+	if err != nil {
+		return false, err
+	}
+	lk := s.lockFor(target)
+	lk.mu.Lock()
+	defer lk.mu.Unlock()
+
+	if err := os.Remove(target); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if durableWrites {
+		if err := syncDir(filepath.Dir(target)); err != nil {
+			return true, fmt.Errorf("fsync target directory after delete: %w", err)
+		}
+	}
+	return true, nil
 }
 
 // RenderEntry describes a stored rendered export for an asset.
