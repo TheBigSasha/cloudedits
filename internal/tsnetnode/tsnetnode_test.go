@@ -19,11 +19,14 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 )
 
 const goodKey = "tskey-auth-kTESTKEYCNTRL-0123456789abcdef"
@@ -98,6 +101,9 @@ func TestEnrolRejectsBadKeyThenEnrolsAndRestartsWithoutKey(t *testing.T) {
 	}
 	if n.FQDN() != "library.tail-scale.ts.net" || !strings.HasPrefix(n.TailscaleIP(), "100.") {
 		t.Fatalf("fqdn=%q ip=%q", n.FQDN(), n.TailscaleIP())
+	}
+	if n.OwnerUserID().IsZero() || n.IsTagged() {
+		t.Fatalf("expected user-owned enrolment with non-zero OwnerUserID, got id=%d tagged=%v", n.OwnerUserID(), n.IsTagged())
 	}
 	if err := n.CheckMagicDNS(ctx); err != nil {
 		t.Fatalf("MagicDNS self-check: %v", err)
@@ -208,4 +214,132 @@ func testCert(t *testing.T, host string) (tls.Certificate, *x509.CertPool, []byt
 	pool.AddCert(ca)
 	chainPEM := append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
 	return tls.Certificate{Certificate: [][]byte{leafDER, caDER}, PrivateKey: leafKey}, pool, chainPEM
+}
+
+func TestWhoIsFailsClosedByUserID(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name      string
+		ownerID   tailcfg.UserID
+		ownerName string
+		resp      *apitype.WhoIsResponse
+		wantLogin string
+		wantOwner bool
+		wantErr   bool
+	}{
+		{
+			name:      "matching UserID is owner even when LoginName differs",
+			ownerID:   42,
+			ownerName: "old@example.com",
+			resp: &apitype.WhoIsResponse{
+				Node:        &tailcfg.Node{User: 42},
+				UserProfile: &tailcfg.UserProfile{ID: 42, LoginName: "New@Example.com"},
+			},
+			wantLogin: "new@example.com",
+			wantOwner: true,
+		},
+		{
+			name:      "same LoginName with different UserID is denied",
+			ownerID:   42,
+			ownerName: "alice@example.com",
+			resp: &apitype.WhoIsResponse{
+				Node:        &tailcfg.Node{User: 99},
+				UserProfile: &tailcfg.UserProfile{ID: 99, LoginName: "alice@example.com"},
+			},
+			wantLogin: "alice@example.com",
+			wantOwner: false,
+		},
+		{
+			name:      "unconfigured ownerUserID fails closed (never fail-open)",
+			ownerID:   0,
+			ownerName: "",
+			resp: &apitype.WhoIsResponse{
+				Node:        &tailcfg.Node{User: 42},
+				UserProfile: &tailcfg.UserProfile{ID: 42, LoginName: "alice@example.com"},
+			},
+			wantLogin: "alice@example.com",
+			wantOwner: false,
+		},
+		{
+			name:      "tagged peer is denied even with matching UserID",
+			ownerID:   42,
+			ownerName: "alice@example.com",
+			resp: &apitype.WhoIsResponse{
+				Node:        &tailcfg.Node{User: 42, Tags: []string{"tag:server"}},
+				UserProfile: &tailcfg.UserProfile{ID: 42, LoginName: "alice@example.com"},
+			},
+			wantLogin: "alice@example.com",
+			wantOwner: false,
+		},
+		{
+			name:      "tagged-devices pseudo-user is denied",
+			ownerID:   777,
+			ownerName: "tagged-devices",
+			resp: &apitype.WhoIsResponse{
+				Node:        &tailcfg.Node{User: 777},
+				UserProfile: &tailcfg.UserProfile{ID: 777, LoginName: "tagged-devices"},
+			},
+			wantLogin: "tagged-devices",
+			wantOwner: false,
+		},
+		{
+			name:    "zero peer UserID returns error",
+			ownerID: 42,
+			resp: &apitype.WhoIsResponse{
+				UserProfile: &tailcfg.UserProfile{ID: 0, LoginName: "alice@example.com"},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "missing UserProfile returns error",
+			ownerID: 42,
+			resp:    &apitype.WhoIsResponse{},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &Node{
+				ownerUserID: tc.ownerID,
+				ownerLogin:  tc.ownerName,
+				whoIs: func(context.Context, string) (*apitype.WhoIsResponse, error) {
+					return tc.resp, nil
+				},
+			}
+			login, isOwner, err := n.WhoIs(ctx, "100.64.0.2:12345")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if isOwner {
+					t.Fatal("error case returned isOwner=true")
+				}
+				return
+			}
+			if login != tc.wantLogin || isOwner != tc.wantOwner {
+				t.Fatalf("got (login=%q, isOwner=%v), want (%q, %v)", login, isOwner, tc.wantLogin, tc.wantOwner)
+			}
+		})
+	}
+}
+
+func TestIsTaggedSelfDetection(t *testing.T) {
+	tags := views.SliceOf([]string{"tag:cloudedits"})
+	if !isTaggedSelf(nil, tailcfg.UserProfile{}, false) {
+		t.Error("nil self must be treated as tagged/unowned")
+	}
+	if !isTaggedSelf(&ipnstate.PeerStatus{UserID: 0}, tailcfg.UserProfile{ID: 0, LoginName: "alice@example.com"}, true) {
+		t.Error("zero UserID must be treated as tagged/unowned")
+	}
+	if !isTaggedSelf(&ipnstate.PeerStatus{UserID: 10, Tags: &tags}, tailcfg.UserProfile{ID: 10, LoginName: "alice@example.com"}, true) {
+		t.Error("node with ACL tags must be detected as tagged")
+	}
+	if !isTaggedSelf(&ipnstate.PeerStatus{UserID: 10}, tailcfg.UserProfile{ID: 10, LoginName: "tagged-devices"}, true) {
+		t.Error("tagged-devices login must be detected as tagged")
+	}
+	if isTaggedSelf(&ipnstate.PeerStatus{UserID: 10}, tailcfg.UserProfile{ID: 10, LoginName: "alice@example.com"}, true) {
+		t.Error("normal user-owned node reported as tagged")
+	}
 }

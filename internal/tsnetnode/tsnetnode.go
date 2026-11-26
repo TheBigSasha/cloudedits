@@ -18,9 +18,16 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 )
+
+// taggedDevicesLogin is the shared pseudo-user login Tailscale assigns to
+// ACL-tagged nodes. It is never a human owner account.
+const taggedDevicesLogin = "tagged-devices"
 
 // ErrHTTPSNotEnabled indicates MagicDNS or HTTPS Certificates are not yet
 // enabled in the Tailscale admin console.
@@ -33,6 +40,11 @@ type Options struct {
 	// AuthKey is used only to enrol a node that has no state yet. It is
 	// handed to tsnet in memory and never written anywhere by this package.
 	AuthKey string
+	// OwnerUserID explicitly pins the Tailscale UserID authorized as the
+	// library owner. Required when enrolling with a tagged auth key (tagged
+	// nodes have no human owner and fail closed otherwise). When zero on a
+	// user-owned node, Start derives the owner from status.Self.UserID.
+	OwnerUserID tailcfg.UserID
 
 	// ControlURL, Logf and CertPair exist for tests that run a node against
 	// an in-process coordination server, which cannot issue certificates.
@@ -56,10 +68,26 @@ type Node struct {
 	mu          sync.RWMutex
 	fqdn        string
 	tailscaleIP string
+	ownerUserID tailcfg.UserID
 	ownerLogin  string
+	isTagged    bool
 	authURL     string
-	// certPair replaces the LocalAPI certificate fetch in tests.
+	// certPair and whoIs replace LocalAPI calls in unit tests.
 	certPair func(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error)
+	whoIs    func(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error)
+}
+
+func isTaggedSelf(self *ipnstate.PeerStatus, profile tailcfg.UserProfile, hasProfile bool) bool {
+	if self == nil || self.UserID.IsZero() {
+		return true
+	}
+	if self.Tags != nil && self.Tags.Len() > 0 {
+		return true
+	}
+	if hasProfile && strings.EqualFold(strings.TrimSpace(profile.LoginName), taggedDevicesLogin) {
+		return true
+	}
+	return false
 }
 
 // Start brings up the embedded tsnet node and checks CertDomains preflight.
@@ -120,10 +148,25 @@ func Start(ctx context.Context, opts Options) (*Node, error) {
 			if name := strings.TrimSuffix(status.Self.DNSName, "."); strings.Contains(name, ".") {
 				n.fqdn = name
 			}
-			if u, ok := status.User[status.Self.UserID]; ok {
-				n.ownerLogin = strings.ToLower(strings.TrimSpace(u.LoginName))
+			selfUser, hasSelfUser := status.User[status.Self.UserID]
+			n.isTagged = isTaggedSelf(status.Self, selfUser, hasSelfUser)
+			switch {
+			case !opts.OwnerUserID.IsZero():
+				n.ownerUserID = opts.OwnerUserID
+				if u, ok := status.User[opts.OwnerUserID]; ok {
+					n.ownerLogin = strings.ToLower(strings.TrimSpace(u.LoginName))
+				}
+			case !n.isTagged:
+				n.ownerUserID = status.Self.UserID
+				if hasSelfUser {
+					n.ownerLogin = strings.ToLower(strings.TrimSpace(selfUser.LoginName))
+				}
 			}
+		} else if !opts.OwnerUserID.IsZero() {
+			n.ownerUserID = opts.OwnerUserID
 		}
+	} else if !opts.OwnerUserID.IsZero() {
+		n.ownerUserID = opts.OwnerUserID
 	}
 
 	domains := srv.CertDomains()
@@ -182,13 +225,57 @@ func (n *Node) CertDomains() []string {
 	return n.srv.CertDomains()
 }
 
-// WhoIs resolves the Tailnet peer login for remoteAddr and checks whether it
-// belongs to the same tailnet owner account.
+// OwnerUserID returns the pinned Tailscale UserID authorized as the library
+// owner, or 0 when no human owner is established (e.g. a tagged node without
+// an explicit OwnerUserID configured).
+func (n *Node) OwnerUserID() tailcfg.UserID {
+	if n == nil {
+		return 0
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.ownerUserID
+}
+
+// OwnerLogin returns the display login name associated with OwnerUserID, when
+// known. It is informational only and never used for authorization decisions.
+func (n *Node) OwnerLogin() string {
+	if n == nil {
+		return ""
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.ownerLogin
+}
+
+// IsTagged reports whether this node is enrolled as an ACL-tagged device (or
+// lacks a human owner identity).
+func (n *Node) IsTagged() bool {
+	if n == nil {
+		return false
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.isTagged
+}
+
+// WhoIs resolves the Tailnet peer identity for remoteAddr and checks whether
+// it belongs to the pinned owner UserID. Authorization fails closed:
+//   - if no owner UserID is pinned (ownerUserID == 0), every peer is denied;
+//   - tagged peers and the shared "tagged-devices" pseudo-user are always denied;
+//   - comparison is strictly on tailcfg.UserID, never on LoginName strings.
 func (n *Node) WhoIs(ctx context.Context, remoteAddr string) (login string, isOwner bool, err error) {
-	if n == nil || n.lc == nil {
+	if n == nil {
 		return "", false, errors.New("tsnet local client unavailable")
 	}
-	who, err := n.lc.WhoIs(ctx, remoteAddr)
+	lookup := n.whoIs
+	if lookup == nil {
+		if n.lc == nil {
+			return "", false, errors.New("tsnet local client unavailable")
+		}
+		lookup = n.lc.WhoIs
+	}
+	who, err := lookup(ctx, remoteAddr)
 	if err != nil {
 		return "", false, err
 	}
@@ -199,17 +286,22 @@ func (n *Node) WhoIs(ctx context.Context, remoteAddr string) (login string, isOw
 	if login == "" {
 		return "", false, errors.New("empty tailscale login name")
 	}
+	peerUserID := who.UserProfile.ID
+	if peerUserID.IsZero() {
+		return "", false, errors.New("missing tailscale user id")
+	}
+	if (who.Node != nil && who.Node.IsTagged()) || login == taggedDevicesLogin {
+		return login, false, nil
+	}
 
 	n.mu.RLock()
-	owner := n.ownerLogin
+	ownerID := n.ownerUserID
 	n.mu.RUnlock()
 
-	// If owner login was resolved, require exact same owner account (rejects external shared peers by default).
-	// For tagged nodes where ownerLogin is empty, allow same-tailnet verified peers.
-	if owner == "" {
-		return login, true, nil
+	if ownerID.IsZero() {
+		return login, false, nil
 	}
-	return login, login == owner, nil
+	return login, peerUserID == ownerID, nil
 }
 
 // CheckMagicDNS asks the node's own tailnet resolver, the one other tailnet

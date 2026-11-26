@@ -149,6 +149,7 @@ func cmdSetup(args []string) int {
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "rebuildable index/cache/state directory")
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory for :ro mounts")
 	authKeyStdin := fs.Bool("tailscale-auth-key-stdin", false, "read one-time Tailscale auth key from stdin")
+	ownerUserID := fs.Int64("owner-user-id", 0, "pin the Tailscale numeric UserID authorized as owner (required for tagged auth keys; also CLOUDEDITS_OWNER_USER_ID)")
 	installSvc := fs.Bool("install-service", false, "install and start a per-user service (launchd, systemd --user or a Task Scheduler logon task) that runs serve with this config")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
@@ -167,6 +168,12 @@ func cmdSetup(args []string) int {
 	}
 	if strings.TrimSpace(*sidecarDir) != "" {
 		cfg.SidecarDir = strings.TrimSpace(*sidecarDir)
+	}
+	if *ownerUserID < 0 {
+		return failOut(*jsonOut, exitUsage, "--owner-user-id must be a positive Tailscale UserID", nil)
+	}
+	if *ownerUserID > 0 {
+		cfg.OwnerUserID = *ownerUserID
 	}
 	for _, f := range folders {
 		if _, err := cfg.AddFolder(f, ""); err != nil {
@@ -209,9 +216,16 @@ func cmdSetup(args []string) int {
 			return failOut(*jsonOut, exitActionRequired, "Tailscale registration failed", err)
 		}
 		res["fqdn"], res["tailscaleIp"] = enrolled.FQDN, enrolled.TailscaleIP
+		if enrolled.OwnerUserID > 0 {
+			res["ownerUserId"] = enrolled.OwnerUserID
+		}
 		if enrolled.FQDN != "" {
 			res["url"] = "https://" + enrolled.FQDN
 			human = append(human, "Joined the tailnet as https://"+enrolled.FQDN)
+		}
+		if enrolled.Tagged && enrolled.OwnerUserID == 0 {
+			res["warning"] = "enrolled as a tagged Tailscale node with no owner UserID; tailnet peer auth fails closed until --owner-user-id (or CLOUDEDITS_OWNER_USER_ID / --require-token) is configured"
+			human = append(human, "WARNING: tagged Tailscale node has no owner UserID; tailnet peer auth fails closed until --owner-user-id (or --require-token) is set")
 		}
 		if !enrolled.HTTPSEnabled {
 			res["ok"] = false
@@ -281,8 +295,13 @@ func cmdServe(args []string) int {
 	var allowOrigins stringSliceFlag
 	fs.Var(&allowOrigins, "allow-origin", "additional browser origin allowed to call the API, e.g. https://preview.example or https://*.example.com (repeatable; the hdr.toys editor and this server's own URL are always allowed)")
 	allowDevNetwork := fs.Bool("allow-dev-apis-on-network", false, "permit a dev_apis test build to listen beyond loopback")
+	ownerUserID := fs.Int64("owner-user-id", 0, "pin the Tailscale numeric UserID authorized as owner (required for tagged nodes; also CLOUDEDITS_OWNER_USER_ID)")
 	logFile := fs.String("log-file", "", "append server output to this file instead of the terminal")
 	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *ownerUserID < 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: --owner-user-id must be a positive Tailscale UserID")
 		return exitUsage
 	}
 	if *logFile != "" {
@@ -316,6 +335,9 @@ func cmdServe(args []string) int {
 	}
 	if strings.TrimSpace(*sidecarDir) != "" {
 		cfg.SidecarDir = strings.TrimSpace(*sidecarDir)
+	}
+	if *ownerUserID > 0 {
+		cfg.OwnerUserID = *ownerUserID
 	}
 	for _, f := range folders {
 		if _, err := cfg.AddFolder(f, ""); err != nil {
@@ -388,6 +410,12 @@ func cmdServe(args []string) int {
 		if recErr := recordNodeIdentity(cfg.DataDir, tsNode.FQDN(), tsNode.TailscaleIP()); recErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not record node address: %v\n", recErr)
 		}
+		if recErr := recordNodeOwner(cfg.DataDir, int64(tsNode.OwnerUserID()), tsNode.OwnerLogin()); recErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record owner user id: %v\n", recErr)
+		}
+		if tsNode.OwnerUserID() == 0 && !mustUseToken {
+			fmt.Fprintln(os.Stderr, "WARNING: this tsnet node is tagged or has no owner UserID; Tailscale WhoIs auth fails closed until --owner-user-id (or CLOUDEDITS_OWNER_USER_ID / --require-token) is configured")
+		}
 		if pubURL == "" && tsNode.FQDN() != "" {
 			pubURL = "https://" + tsNode.FQDN()
 		}
@@ -433,6 +461,7 @@ func cmdServe(args []string) int {
 	}
 
 	logf := func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	warnUnwritableSidecars(cfg, logf)
 	cnt, _ := idx.Count(ctx, index.Filter{})
 	status.update(func(st *runstate.Status) {
 		st.State, st.URL, st.ListenAddr, st.IndexedAssets = runstate.StateServing, pubURL, ln.Addr().String(), cnt
@@ -892,6 +921,41 @@ func recordNodeIdentity(dataDir, fqdn, tailscaleIP string) error {
 	}
 	stored.PublicURL, stored.TailscaleIP = url, tailscaleIP
 	return config.Save(stored)
+}
+
+// recordNodeOwner persists the library owner's Tailscale UserID (and display
+// login) on first enrolment without overwriting an explicit ownerUserId or any
+// other persisted setting.
+func recordNodeOwner(dataDir string, ownerUserID int64, ownerLogin string) error {
+	if ownerUserID <= 0 {
+		return nil
+	}
+	stored, err := config.Load(dataDir)
+	if err != nil {
+		return err
+	}
+	if stored.OwnerUserID > 0 {
+		if stored.OwnerUserID == ownerUserID && ownerLogin != "" && stored.OwnerLogin == "" {
+			stored.OwnerLogin = ownerLogin
+			return config.Save(stored)
+		}
+		return nil
+	}
+	stored.OwnerUserID = ownerUserID
+	stored.OwnerLogin = ownerLogin
+	return config.Save(stored)
+}
+
+// warnUnwritableSidecars checks each configured folder's sidecar directory at
+// startup and logs an actionable hint if writes will fail (for example in
+// Docker when host folder UID/GID differs from the container user).
+func warnUnwritableSidecars(cfg *config.Config, logf func(string, ...any)) {
+	for _, f := range cfg.Folders {
+		sRoot := sidecar.SidecarRoot(f.Path, f.ID, cfg.SidecarDir)
+		if err := checkSidecarRootWritable(sRoot); err != nil {
+			logf("WARNING: sidecar directory %s for folder %q is not writable (%v); edits will fail until permissions match this user (in Docker, set PUID/PGID to the photo folder owner) or --sidecar-dir / CLOUDEDITS_SIDECAR_DIR is set to a writable path", sRoot, f.ID, err)
+		}
+	}
 }
 
 // parseInterspersed parses flags that may appear before, between or after

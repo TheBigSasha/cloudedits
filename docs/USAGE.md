@@ -12,9 +12,8 @@ cloudedits gui
 
 Opens a loopback setup wizard in your default browser:
 1. Add one or more photo folders by path (source files are strictly read-only; edits save under `.hdrtoys/`).
-2. Choose your Tailscale hostname (default `library` -> MagicDNS `https://library.<tailnet>.ts.net` and Tailscale IP `100.x.y.z`). The wizard links to `https://login.tailscale.com/admin/settings/keys` for a pre-approved one-time auth key and to `https://login.tailscale.com/admin/dns` for MagicDNS + HTTPS; the key itself is entered in a terminal with the `cloudedits setup --tailscale-auth-key-stdin` command the wizard shows.
-3. Once the node is enrolled the wizard shows the library's tailnet URL, its QR code, and **Open in hdr.toys**; until then it shows none of them, because no other device can reach the library yet.
-4. Start the server with `cloudedits serve --tsnet`. The wizard configures the library; it does not run it.
+2. Choose your Tailscale hostname (default `library` -> MagicDNS `https://library.<tailnet>.ts.net` and Tailscale IP `100.x.y.z`). The wizard links to `https://login.tailscale.com/admin/settings/keys` for a pre-approved one-time auth key and to `https://login.tailscale.com/admin/dns` for MagicDNS + HTTPS, then enrols the node directly and installs the per-user background service.
+3. Once the node is enrolled and serving, the wizard shows the library's tailnet URL, its QR code, MagicDNS/HTTPS self-check status, and **Open in hdr.toys**; until then it shows none of them, because no other device can reach the library yet.
 
 ## Mode 2: Headless CLI (Automation & Agents)
 
@@ -27,15 +26,25 @@ Every CLI subcommand supports `--json` and deterministic exit codes:
 ### Commands
 
 ```bash
-# Configure folders and Tailscale hostname (reads auth key from stdin)
+# Configure folders, enrol on Tailscale (reads auth key from stdin), and install the login service
 echo "$TS_AUTHKEY" | cloudedits setup \
   --folder ~/Pictures \
   --hostname library \
   --tailscale-auth-key-stdin \
+  --install-service \
   --json
+
+# Manage the per-user background service (launchd / systemd --user / Task Scheduler)
+cloudedits service install --json
+cloudedits service status --json
+cloudedits service uninstall --json
 
 # Run foreground server on Tailscale HTTPS (:443)
 cloudedits serve --tsnet
+
+# If enrolling with a tagged Tailscale auth key, pin your numeric Tailscale UserID
+# (tagged nodes fail closed unless --owner-user-id / CLOUDEDITS_OWNER_USER_ID or --require-token is set)
+cloudedits serve --tsnet --owner-user-id 1234567890
 
 # Run foreground server on local HTTP (loopback/LAN)
 cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures
@@ -72,6 +81,7 @@ services:
   cloudedits:
     image: ghcr.io/thebigsasha/cloudedits:latest
     restart: unless-stopped
+    user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       CLOUDEDITS_HOSTNAME: library
       TS_AUTHKEY: ${TS_AUTHKEY}
@@ -83,9 +93,9 @@ volumes:
   cloudedits_data:
 ```
 
-The image's default command is `serve --tsnet --folder /library/photos`, so the mount above needs no `command:`. The container runs as UID `10001`: that user must be able to create `/library/photos/.hdrtoys/`, or sidecar writes fail.
+The image's default command is `serve --tsnet --folder /library/photos`, so the mount above needs no `command:`. Set `PUID` and `PGID` to the owner of `/volume1/photos` so the container can create `/library/photos/.hdrtoys/` without changing host permissions (`/data` and `/data/sidecars` are writable by any mapped non-root UID/GID).
 
-If `/library/photos` must be mounted `:ro`, or UID `10001` cannot write to it, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`).
+If `/library/photos` must be mounted `:ro`, or cannot be written by the container user, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`). If `TS_AUTHKEY` creates a tagged Tailscale node, also set `CLOUDEDITS_OWNER_USER_ID` (tagged nodes fail closed by default).
 
 ## Tailscale Troubleshooting & Security Posture
 

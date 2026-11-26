@@ -156,3 +156,42 @@ func TestGUIStateTracksTheConfigOnDisk(t *testing.T) {
 		t.Errorf("PublicURL after a wizard save = %q, want it kept", got)
 	}
 }
+
+func TestRecordNodeOwnerPinsOnceAndEnvLoads(t *testing.T) {
+	isolateDefaultDataDir(t)
+	dataDir := t.TempDir()
+	writeConfigJSON(t, dataDir, `{"libraryId":"lib-1","hostname":"photos","folders":[]}`)
+
+	if err := recordNodeOwner(dataDir, 12345, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OwnerUserID != 12345 || cfg.OwnerLogin != "alice@example.com" {
+		t.Fatalf("got owner=(%d, %q), want (12345, alice@example.com)", cfg.OwnerUserID, cfg.OwnerLogin)
+	}
+
+	// Subsequent automatic recording must not overwrite an already-pinned ownerUserId.
+	if err := recordNodeOwner(dataDir, 99999, "mallory@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OwnerUserID != 12345 || cfg.OwnerLogin != "alice@example.com" {
+		t.Fatalf("owner overwritten: got (%d, %q)", cfg.OwnerUserID, cfg.OwnerLogin)
+	}
+
+	// CLOUDEDITS_OWNER_USER_ID supplies default OwnerUserID when config.json does not set one.
+	t.Setenv("CLOUDEDITS_OWNER_USER_ID", "77777")
+	freshCfg, err := config.Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshCfg.OwnerUserID != 77777 {
+		t.Fatalf("env OwnerUserID = %d, want 77777", freshCfg.OwnerUserID)
+	}
+}

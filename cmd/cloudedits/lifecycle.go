@@ -17,6 +17,7 @@ import (
 	"github.com/thebigsasha/cloudedits/internal/runstate"
 	"github.com/thebigsasha/cloudedits/internal/service"
 	"github.com/thebigsasha/cloudedits/internal/tsnetnode"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
 
@@ -31,12 +32,13 @@ var tsnetTestHooks struct {
 
 func tsnetOptions(cfg *config.Config, authKey string) tsnetnode.Options {
 	return tsnetnode.Options{
-		Hostname:   cfg.Hostname,
-		StateDir:   tsnetnode.StateDir(cfg.DataDir),
-		AuthKey:    authKey,
-		ControlURL: tsnetTestHooks.ControlURL,
-		Logf:       tsnetTestHooks.Logf,
-		CertPair:   tsnetTestHooks.CertPair,
+		Hostname:    cfg.Hostname,
+		StateDir:    tsnetnode.StateDir(cfg.DataDir),
+		AuthKey:     authKey,
+		OwnerUserID: tailcfg.UserID(cfg.OwnerUserID),
+		ControlURL:  tsnetTestHooks.ControlURL,
+		Logf:        tsnetTestHooks.Logf,
+		CertPair:    tsnetTestHooks.CertPair,
 	}
 }
 
@@ -44,6 +46,9 @@ func tsnetOptions(cfg *config.Config, authKey string) tsnetnode.Options {
 type enrollResult struct {
 	FQDN        string
 	TailscaleIP string
+	OwnerUserID int64
+	OwnerLogin  string
+	Tagged      bool
 	// HTTPSEnabled is false when the tailnet has MagicDNS or HTTPS
 	// certificates turned off; the node is enrolled either way.
 	HTTPSEnabled bool
@@ -72,6 +77,7 @@ func enrollNode(ctx context.Context, cfg *config.Config, authKey string) (enroll
 	var res enrollResult
 	if node != nil {
 		res.FQDN, res.TailscaleIP = node.FQDN(), node.TailscaleIP()
+		res.OwnerUserID, res.OwnerLogin, res.Tagged = int64(node.OwnerUserID()), node.OwnerLogin(), node.IsTagged()
 		_ = node.Close()
 	}
 	httpsOff := errors.Is(err, tsnetnode.ErrHTTPSNotEnabled)
@@ -81,6 +87,9 @@ func enrollNode(ctx context.Context, cfg *config.Config, authKey string) (enroll
 	res.HTTPSEnabled = !httpsOff
 	if recErr := recordNodeIdentity(cfg.DataDir, res.FQDN, res.TailscaleIP); recErr != nil {
 		return res, fmt.Errorf("save node address: %w", recErr)
+	}
+	if recErr := recordNodeOwner(cfg.DataDir, res.OwnerUserID, res.OwnerLogin); recErr != nil {
+		return res, fmt.Errorf("save owner user id: %w", recErr)
 	}
 	return res, nil
 }
