@@ -31,6 +31,7 @@ const (
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	maxRenderBytes        = 64 * 1024 * 1024
 	maxHandoffBytes       = 64 * 1024
+	maxSmallJSONBytes     = 64 * 1024
 	maxConcurrentStreams  = 16
 )
 
@@ -772,6 +773,7 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Rating *int `json:"rating"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSmallJSONBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == nil {
 		writeError(w, http.StatusBadRequest, "invalid rating payload")
 		return

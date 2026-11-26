@@ -178,6 +178,7 @@ func (s *Server) handleDevReset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDevFault(w http.ResponseWriter, r *http.Request) {
 	var cfg devFaultConfig
 	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxSmallJSONBytes)
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, "invalid fault JSON")
 			return
