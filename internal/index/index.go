@@ -609,6 +609,26 @@ func (idx *Index) GetAsset(ctx context.Context, id string) (*Asset, error) {
 	return &list[0], nil
 }
 
+// assetsByIDs loads the given assets in one query, ordered by ID. IDs that no
+// longer exist in the index are skipped.
+func (idx *Index) assetsByIDs(ctx context.Context, ids []string) ([]Asset, error) {
+	if len(ids) == 0 {
+		return []Asset{}, nil
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	rows, err := idx.db.QueryContext(ctx,
+		`SELECT `+assetColumns+` FROM assets a WHERE a.id IN (`+placeholders+`) ORDER BY a.id ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return idx.scanAssets(ctx, rows)
+}
+
 // ResolveAsset locates an asset by opaque ID, content_hash, or relative path / filename hint.
 func (idx *Index) ResolveAsset(ctx context.Context, assetKey, fileHint string) (*Asset, error) {
 	if assetKey != "" {
@@ -1117,13 +1137,14 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 		}
 	}
 
-	assets := make([]Asset, 0, len(assetIDs))
+	ids := make([]string, 0, len(assetIDs))
 	for aid := range assetIDs {
-		if a, err := idx.GetAsset(ctx, aid); err == nil {
-			assets = append(assets, *a)
-		}
+		ids = append(ids, aid)
 	}
-	sort.Slice(assets, func(i, j int) bool { return assets[i].ID < assets[j].ID })
+	assets, err := idx.assetsByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load changed assets: %w", err)
+	}
 
 	return &ChangesFeed{
 		Ops:              ops,
