@@ -144,9 +144,13 @@ components:
           type: string
         status:
           type: string
-          enum: [applied, duplicate, stale]
+          enum: [applied, duplicate, stale, rejected]
         originalStatus:
           type: string
+        reason:
+          type: string
+          enum: [asset-not-found, invalid-op]
+          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will.
     OpsRequest:
       type: object
       required: [ops]

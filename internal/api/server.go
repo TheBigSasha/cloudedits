@@ -811,6 +811,10 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if status, message, rejected := singleOpRejection(receipts); rejected {
+		writeError(w, status, message)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"assetId":  assetID,
@@ -926,10 +930,27 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if status, message, rejected := singleOpRejection(receipts); rejected {
+		writeError(w, status, message)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"durable":  true,
 		"receipts": receipts,
 	})
+}
+
+// singleOpRejection maps the receipt of a one-op endpoint onto an HTTP error:
+// those endpoints address exactly one asset, so a rejected op is the request's
+// own failure rather than one receipt among many.
+func singleOpRejection(receipts []index.OpReceipt) (status int, message string, rejected bool) {
+	if len(receipts) != 1 || receipts[0].Status != "rejected" {
+		return 0, "", false
+	}
+	if receipts[0].Reason == index.ReasonAssetNotFound {
+		return http.StatusNotFound, "asset not found", true
+	}
+	return http.StatusBadRequest, "invalid operation", true
 }
 
 func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
@@ -994,7 +1015,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	applied, duplicates, stale := 0, 0, 0
+	applied, duplicates, stale, rejected := 0, 0, 0, 0
 	for _, rc := range receipts {
 		switch rc.Status {
 		case "applied":
@@ -1003,6 +1024,8 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 			duplicates++
 		case "stale":
 			stale++
+		case "rejected":
+			rejected++
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1010,6 +1033,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		"applied":    applied,
 		"duplicates": duplicates,
 		"stale":      stale,
+		"rejected":   rejected,
 		"receipts":   receipts,
 	})
 }

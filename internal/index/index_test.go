@@ -257,3 +257,63 @@ func TestRescanPicksUpEditsWrittenBesideThePhoto(t *testing.T) {
 		t.Fatalf("index shows rating=%d flag=%v; the folder's joined truth is rating=5 flag=pick", asset.Rating, asset.Flag)
 	}
 }
+
+// One bad op must not hold every other op in its batch hostage. A client
+// replays its whole outbox in one POST; when a single op named a photo that
+// was removed, or carried a malformed value, the batch failed as a unit and
+// the client's valid edits were never acknowledged, on every retry.
+func TestApplyOpsBatchRejectsBadOpsWithoutFailingTheBatch(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "A.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "B.JPG"))
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aidA, aidB := MakeAssetID("photos", "A.JPG"), MakeAssetID("photos", "B.JPG")
+	aidLater := MakeAssetID("photos", "LATER.JPG")
+
+	ops := []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: aidA, Field: "rating", Value: 4},
+		{HLC: "019a2f001000-0002-dev1", Device: "dev1", AssetKey: aidLater, Field: "rating", Value: 3},
+		{HLC: "019a2f001000-0003-dev1", Device: "dev1", AssetKey: aidB, Field: "variant", Value: "not-a-record"},
+		{HLC: "not-an-hlc", Device: "dev1", AssetKey: aidB, Field: "rating", Value: 1},
+		{HLC: "019a2f001000-0005-dev1", Device: "dev1", AssetKey: aidB, Field: "flag", Value: "pick"},
+	}
+	receipts, err := idx.ApplyOpsBatch(ctx, ops)
+	if err != nil {
+		t.Fatalf("ApplyOpsBatch failed the whole batch: %v", err)
+	}
+	want := []struct{ status, reason string }{
+		{"applied", ""}, {"rejected", "asset-not-found"}, {"rejected", "invalid-op"}, {"rejected", "invalid-op"}, {"applied", ""},
+	}
+	if len(receipts) != len(want) {
+		t.Fatalf("got %d receipts, want %d: %+v", len(receipts), len(want), receipts)
+	}
+	for i, w := range want {
+		if receipts[i].Status != w.status || receipts[i].Reason != w.reason || receipts[i].HLC != ops[i].HLC || receipts[i].Device != ops[i].Device {
+			t.Errorf("receipt %d = %+v, want status=%q reason=%q", i, receipts[i], w.status, w.reason)
+		}
+	}
+	if a, err := idx.GetAsset(ctx, aidA); err != nil || a.Rating != 4 {
+		t.Fatalf("valid op for A was not applied: %+v err=%v", a, err)
+	}
+	if b, err := idx.GetAsset(ctx, aidB); err != nil || b.Flag == nil || *b.Flag != "pick" {
+		t.Fatalf("valid op for B was not applied: %+v err=%v", b, err)
+	}
+
+	// A rejected op is not journaled: once the photo exists, the same op applies.
+	writeTestJPEG(t, filepath.Join(photoDir, "LATER.JPG"))
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := idx.ApplyOpsBatch(ctx, ops[1:2])
+	if err != nil || len(retry) != 1 || retry[0].Status != "applied" {
+		t.Fatalf("retry of a previously rejected op: %+v err=%v", retry, err)
+	}
+}

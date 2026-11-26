@@ -126,9 +126,21 @@ type Filter struct {
 type OpReceipt struct {
 	Device         string `json:"device"`
 	HLC            string `json:"hlc"`
-	Status         string `json:"status"` // "applied" | "duplicate" | "stale"
+	Status         string `json:"status"` // "applied" | "duplicate" | "stale" | "rejected"
 	OriginalStatus string `json:"originalStatus,omitempty"`
+	// Reason says why an op was rejected: ReasonAssetNotFound or ReasonInvalidOp.
+	Reason string `json:"reason,omitempty"`
 }
+
+// Rejection reasons carried by an OpReceipt whose Status is "rejected".
+const (
+	// ReasonAssetNotFound: the op's assetKey (and file hint) resolve to no
+	// indexed asset. A retry can succeed after a rescan.
+	ReasonAssetNotFound = "asset-not-found"
+	// ReasonInvalidOp: the op is malformed (missing device/field/assetKey,
+	// malformed HLC, or a value its field cannot hold). A retry cannot succeed.
+	ReasonInvalidOp = "invalid-op"
+)
 
 // ChangeOp represents one journaled op returned by GET /changes.
 type ChangeOp struct {
@@ -665,22 +677,6 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	if len(ops) == 0 {
 		return []OpReceipt{}, nil
 	}
-	// 1. Pre-validate every op in the batch before mutating anything.
-	for i, op := range ops {
-		if strings.TrimSpace(op.Device) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing device", i)
-		}
-		if _, err := hlc.Parse(op.HLC); err != nil {
-			return nil, fmt.Errorf("ops[%d]: %w", i, err)
-		}
-		if strings.TrimSpace(op.Field) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing field", i)
-		}
-		if op.Field != "import" && strings.TrimSpace(op.AssetKey) == "" && strings.TrimSpace(op.File) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing assetKey", i)
-		}
-	}
-
 	type opKey struct {
 		device string
 		hlc    string
@@ -691,6 +687,7 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		assetID     string
 		outcome     string
 		origStatus  string
+		reason      string
 		isDuplicate bool
 		isImport    bool
 	}
@@ -710,6 +707,12 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	// 2. Read-only duplicate pre-check & asset resolution (no global writeMu held).
 	for i, op := range ops {
 		plans[i].op = op
+		// A malformed op is rejected on its own receipt; it never fails the
+		// ops around it and is never journaled.
+		if !opWellFormed(op) {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonInvalidOp
+			continue
+		}
 		key := opKey{device: op.Device, hlc: op.HLC}
 		if prevIdx, seen := batchSeen[key]; seen {
 			plans[i].isDuplicate = true
@@ -744,10 +747,14 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		asset, ok := resolvedCache[cacheKey]
 		if !ok {
 			asset, err = idx.ResolveAsset(ctx, op.AssetKey, op.File)
-			if err != nil {
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("resolve asset %q: %w", op.AssetKey, err)
 			}
 			resolvedCache[cacheKey] = asset
+		}
+		if asset == nil {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonAssetNotFound
+			continue
 		}
 		plans[i].asset = asset
 		plans[i].assetID = asset.ID
@@ -783,7 +790,10 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 				for _, idxPos := range g.opIndices {
 					opChanged, applyErr := sidecar.ApplyOp(cur, plans[idxPos].op)
 					if applyErr != nil {
-						return false, applyErr
+						// ApplyOp validates before it mutates, so the sidecar
+						// is untouched and the rest of the group proceeds.
+						plans[idxPos].outcome, plans[idxPos].reason = "rejected", ReasonInvalidOp
+						continue
 					}
 					if opChanged {
 						plans[idxPos].outcome = "applied"
@@ -884,6 +894,11 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 			continue
 		}
 
+		if p.outcome == "rejected" {
+			receipts[i] = OpReceipt{Device: p.op.Device, HLC: p.op.HLC, Status: "rejected", Reason: p.reason}
+			continue
+		}
+
 		// Re-check ops_log inside the transaction to handle concurrent identical (device, hlc).
 		var existingOutcome string
 		err := tx.QueryRowContext(ctx,
@@ -936,6 +951,18 @@ func (idx *Index) LastOpHLC(ctx context.Context, device string) (string, error) 
 		return "", nil
 	}
 	return last, err
+}
+
+// opWellFormed reports whether an op carries everything needed to identify and
+// route it.
+func opWellFormed(op sidecar.TruthOp) bool {
+	if strings.TrimSpace(op.Device) == "" || strings.TrimSpace(op.Field) == "" {
+		return false
+	}
+	if _, err := hlc.Parse(op.HLC); err != nil {
+		return false
+	}
+	return op.Field == "import" || strings.TrimSpace(op.AssetKey) != "" || strings.TrimSpace(op.File) != ""
 }
 
 func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) error {

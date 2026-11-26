@@ -107,7 +107,16 @@ Response body:
 }
 ```
 
+`POST /ops` answers `200` with exactly one receipt per op, in request order. Only a body that is not a JSON op list (or exceeds the batch limit) fails the request as a whole; an op that cannot be applied gets its own `rejected` receipt and never blocks the ops around it.
+
 Receipt `status` values:
 - `applied`: accepted and written atomically to `.hdrtoys/<rel>.edits`.
 - `duplicate`: `(device, hlc)` was already processed (`originalStatus` included).
-- `stale`: rejected because an equal or newer HLC already won on disk.
+- `stale`: an equal or newer HLC already won on disk. The op is journaled and will not apply on retry.
+- `rejected`: not applied and not journaled; `reason` says why.
+  - `asset-not-found`: `assetKey` (and the optional `file` hint) resolve to no indexed asset, or the hint matches more than one. The photo may have been removed, or a rescan may be in progress, so a later retry can succeed.
+  - `invalid-op`: missing `device`/`field`/`assetKey`, a malformed `hlc`, or a value the field cannot hold. Retrying the same op cannot succeed.
+
+`durable: true` covers every op reported `applied`.
+
+**A losing recipe is not snapshotted by `/ops`.** Op application is plain last-writer-wins, identical to the browser editor's: a `recipe` op that arrives `stale`, or that overwrites an older recipe, creates no "Merged edit" variant, because an op stream carries no signal that tells a concurrent edit from the next debounced save. Conflict rescue happens only when two *sidecar copies* of one asset are joined (see `docs/SIDECAR_FORMAT.md`). A client that receives `stale` for a recipe it wants to keep must save it as a variant itself.
