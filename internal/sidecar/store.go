@@ -107,7 +107,7 @@ func CanonicalEditsPath(sidecarRoot, relPosix string) (string, error) {
 
 // EditThumbnailPath returns <sidecarRoot>/<relPosix>.edit_thumbnail.jpg.
 func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
-	return SafeJoinRel(sidecarRoot, relPosix+".edit_thumbnail.jpg")
+	return SafeJoinRel(sidecarRoot, relPosix+formats.EditThumbnailSuffix)
 }
 
 // ErrInvalidAuxChannel indicates an empty, syntactically invalid, or
@@ -270,6 +270,67 @@ func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
 		}
 	}
 	return int64(stamp)
+}
+
+// EditThumbnailStamp identifies the current content of an asset's edited
+// preview by modification time and size, or 0 when there is none. It changes
+// whenever the preview is replaced.
+func EditThumbnailStamp(sidecarRoot, relPosix string) int64 {
+	target, err := EditThumbnailPath(sidecarRoot, relPosix)
+	if err != nil {
+		return 0
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return 0
+	}
+	return editThumbnailStampOf(info)
+}
+
+func editThumbnailStampOf(info os.FileInfo) int64 {
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return 0
+	}
+	// Odd-forced so an existing preview never stamps as 0.
+	return int64((uint64(info.ModTime().UTC().UnixNano()) ^ (uint64(info.Size()) * 0x9e3779b97f4a7c15)) | 1)
+}
+
+// EditThumbnailStamps returns the stamp of every edited preview stored under
+// sidecarRoot, keyed by the asset's POSIX relative path. It lists directories
+// and stats only the previews, so its cost follows the number of edited
+// photos, not the size of the library.
+func EditThumbnailStamps(sidecarRoot string) map[string]int64 {
+	out := map[string]int64{}
+	_ = filepath.WalkDir(sidecarRoot, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // an unreadable entry only hides its own previews
+		}
+		if d.IsDir() {
+			if p != sidecarRoot && filepath.Dir(p) == sidecarRoot {
+				switch d.Name() {
+				case ".tmp", ".quarantine", "renders":
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), formats.EditThumbnailSuffix) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil //nolint:nilerr // vanished between listing and stat
+		}
+		rel, err := filepath.Rel(sidecarRoot, p)
+		if err != nil {
+			return nil //nolint:nilerr // cannot happen for a path under the walked root
+		}
+		if stamp := editThumbnailStampOf(info); stamp != 0 {
+			out[strings.TrimSuffix(filepath.ToSlash(rel), formats.EditThumbnailSuffix)] = stamp
+		}
+		return nil
+	})
+	return out
 }
 
 // staleStagingAge is how old an orphaned staging file must be before it is

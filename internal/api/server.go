@@ -543,7 +543,10 @@ func parseFilter(r *http.Request) index.Filter {
 func (s *Server) populateAssetURLs(r *http.Request, a *index.Asset, includeFullEXIF bool) {
 	origin := s.selfOrigin(r)
 	esc := url.PathEscape(a.ID)
-	a.ThumbnailURL = origin + "/assets/" + esc + "/file?tier=thumb"
+	// The version makes the URL name exactly the bytes it returns, so a
+	// browser never shows a cached thumbnail after the photo or its edited
+	// preview was replaced.
+	a.ThumbnailURL = origin + "/assets/" + esc + "/file?tier=thumb&v=" + url.QueryEscape(a.ThumbnailVersion)
 	a.RawURL = origin + "/assets/" + esc + "/file?tier=original"
 	a.RecipeURL = origin + "/assets/" + esc + "/recipe"
 	if !includeFullEXIF {
@@ -1146,6 +1149,9 @@ func (s *Server) handlePutEditThumbnail(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The preview is stored; a journal that cannot be appended only delays
+	// other clients until the next folder scan notices the new file.
+	_ = s.idx.NoteEditThumbnail(r.Context(), asset)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"assetId":    asset.ID,

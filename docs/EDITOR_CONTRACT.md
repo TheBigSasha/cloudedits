@@ -104,9 +104,16 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 
 ## Change Feed (`GET /changes`)
 
-- `since` is the opaque `nextCursor` of the previous page; omit it to bootstrap from the start of the journal.
-- Each page carries the applied ops after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array with an unchanged `nextCursor` means the client is caught up.
-- `snapshotRequired: true` means the cursor is not a position in this server's journal — the rebuildable index was re-created after the cursor was issued. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- `since` is the opaque `nextCursor` of the previous page. Omit it to read from the oldest retained entry. Pass `since=head` to receive no entries and the current head as `nextCursor`: the starting point for a client that has just listed the assets and only needs what changes from now on.
+- Each page carries the journal entries after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array means the client is caught up.
+- An entry with `outcome: "applied"` is an op that `POST /ops` accepted. Apply it with the same last-writer-wins rule as a local edit.
+- An entry with `outcome: "observed"` is not an op. The server noticed the asset change outside the op stream, and `field` says what changed:
+  - `sidecar`: another program rewrote the asset's `.edits` state (a browser editor with direct access to the folder, a file sync, a hand edit, or a removed file). The entry's `hlc` is the newest HLC in the sidecar; fold it into the local clock so the next edit sorts after it. Take the asset's verdicts from `assets[]` and re-read its recipe and variants.
+  - `editThumbnail`: the asset's edited preview was replaced. The asset's `thumbnailUrl` in `assets[]` has changed; show that one.
+- `thumbnailUrl` carries a version (`v=`) that changes whenever the bytes it returns change, so a thumbnail may be cached for as long as its URL is in use.
+- `snapshotRequired: true` means the cursor is not a position in this server's retained journal: the rebuildable index was re-created after the cursor was issued, or the entries after it were already removed. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- The journal keeps its newest 20,000 entries. It is also what answers `duplicate` for a replayed `(device, hlc)`: an op replayed after its entry was removed is evaluated again and answered `stale` or `applied`.
+- Assets added to or removed from a folder are not journaled. A client learns of them by listing.
 
 ## Batch Operations (`POST /ops`)
 

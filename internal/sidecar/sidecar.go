@@ -6,6 +6,8 @@ package sidecar
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -726,6 +728,30 @@ func ApplyOp(s *Sidecar, op TruthOp) (bool, error) {
 	}
 }
 
+// HoldsOp reports whether s already carries exactly op: the cell op writes
+// has op's HLC. An HLC names one op of one device, so such an op needs no
+// applying, but it did not lose to anything either.
+func HoldsOp(s *Sidecar, op TruthOp) bool {
+	switch op.Field {
+	case "import":
+		return false
+	case "recipe":
+		return s.Recipe != nil && s.Recipe.HLC == op.HLC
+	case "variant":
+		m, _ := op.Value.(map[string]any)
+		id, _ := m["id"].(string)
+		for _, vr := range s.Variants {
+			if vr.ID == id {
+				return vr.HLC == op.HLC
+			}
+		}
+		return false
+	default:
+		cell, ok := s.Fields[op.Field]
+		return ok && cell.HLC == op.HLC
+	}
+}
+
 func variantFromOpValue(v any, opHLC string) (Variant, error) {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -1270,4 +1296,47 @@ func extractStringSlice(v any) []string {
 	default:
 		return nil
 	}
+}
+
+// EditDigest identifies the edit state a sidecar carries: every field cell,
+// the working recipe and every variant record, each with its HLC. Two sidecars
+// have the same digest exactly when they would project the same edits, however
+// their asset block or provenance differ. A sidecar with no edits at all (or a
+// missing one) has the empty digest.
+func EditDigest(s *Sidecar) string {
+	if s == nil || (len(s.Fields) == 0 && s.Recipe == nil && len(s.Variants) == 0 && len(s.Extra) == 0) {
+		return ""
+	}
+	doc := map[string]any{}
+	if len(s.Fields) > 0 {
+		fields := make(map[string]any, len(s.Fields))
+		for name, cell := range s.Fields {
+			fields[name] = fieldCellToMap(cell)
+		}
+		doc["fields"] = fields
+	}
+	if s.Recipe != nil {
+		doc["recipe"] = fieldCellToMap(*s.Recipe)
+	}
+	if len(s.Variants) > 0 {
+		ordered := make([]Variant, len(s.Variants))
+		copy(ordered, s.Variants)
+		sortVariantsByID(ordered)
+		variants := make([]any, len(ordered))
+		for i, vr := range ordered {
+			variants[i] = variantToMap(vr, true)
+		}
+		doc["variants"] = variants
+	}
+	if len(s.Extra) > 0 {
+		doc["other"] = s.Extra
+	}
+	text, err := CanonicalCompactJSON(doc)
+	if err != nil {
+		// A value that cannot be serialized cannot be written either; a
+		// digest no stored state can equal keeps it from passing as unchanged.
+		return "unserializable"
+	}
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:16])
 }
