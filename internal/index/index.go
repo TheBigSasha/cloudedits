@@ -516,6 +516,13 @@ func buildOrderBy(f Filter) string {
 	}
 }
 
+// assetColumns is the one column list every asset SELECT uses; scanAssets
+// reads rows in exactly this order.
+const assetColumns = `a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
+	a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
+	a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
+	a.color_label, a.edited_by_hdrtoys, a.exif_json`
+
 // Count returns the number of assets matching f.
 func (idx *Index) Count(ctx context.Context, f Filter) (int, error) {
 	where, args := buildWhere(f)
@@ -541,11 +548,7 @@ func (idx *Index) Range(ctx context.Context, f Filter, offset, limit int) ([]Ass
 	}
 	where, args := buildWhere(f)
 	order := buildOrderBy(f)
-	q := `SELECT a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
-	             a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
-	             a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
-	             a.color_label, a.edited_by_hdrtoys, a.exif_json
-	      FROM assets a` + where + order + ` LIMIT ? OFFSET ?`
+	q := `SELECT ` + assetColumns + ` FROM assets a` + where + order + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 
 	rows, err := idx.db.QueryContext(ctx, q, args...)
@@ -590,12 +593,7 @@ func (idx *Index) ListCursor(ctx context.Context, f Filter, cursor string, limit
 
 // GetAsset fetches one asset by its opaque ID.
 func (idx *Index) GetAsset(ctx context.Context, id string) (*Asset, error) {
-	rows, err := idx.db.QueryContext(ctx, `
-		SELECT a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
-		       a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
-		       a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
-		       a.color_label, a.edited_by_hdrtoys, a.exif_json
-		FROM assets a WHERE a.id = ? LIMIT 1`, id)
+	rows, err := idx.db.QueryContext(ctx, `SELECT `+assetColumns+` FROM assets a WHERE a.id = ? LIMIT 1`, id)
 	if err != nil {
 		return nil, err
 	}
