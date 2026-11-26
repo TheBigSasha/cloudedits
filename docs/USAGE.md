@@ -40,8 +40,11 @@ cloudedits serve --tsnet
 # Run foreground server on local HTTP (loopback/LAN)
 cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures
 
-# Require explicit bearer token
-cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures --require-token --token "$TOKEN"
+# Require explicit bearer token (read from the environment; flags are visible in the process list)
+CLOUDEDITS_TOKEN="$TOKEN" cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures --require-token
+
+# Allow an additional editor origin (repeatable; https://hdr.toys is always allowed)
+cloudedits serve --tsnet --allow-origin https://preview.example.com
 
 # Check status and run diagnostics
 cloudedits status --json
