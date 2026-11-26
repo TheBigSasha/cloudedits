@@ -2,6 +2,7 @@ package setupui
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,9 +32,20 @@ func TestSetupUIEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bodyBytes, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 on /setup, got %d", resp.StatusCode)
+	}
+	html := string(bodyBytes)
+	if !strings.Contains(html, "written using AI tools") {
+		t.Fatalf("expected embedded setup UI HTML to include candid AI tools security note")
+	}
+	if strings.Contains(strings.ToLower(html), "guarant") {
+		t.Fatalf("embedded setup UI HTML must not contain guarantee wording")
 	}
 
 	folder := t.TempDir()

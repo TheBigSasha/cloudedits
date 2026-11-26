@@ -2,7 +2,9 @@
 
 Single-binary remote photo library server for [hdr.toys](https://hdr.toys).
 
-Serve your local photo folders over your private Tailscale network (`https://library.<tailnet>.ts.net`) or loopback/LAN, keep source files strictly read-only, and persist all edits, ratings, flags, labels, keywords, variants, and edited thumbnails in portable `.hdrtoys/<rel-path>.edits` sidecars.
+Serve your local photo folders over your Tailscale network (`https://library.<tailnet>.ts.net`) or loopback/LAN, keep source files strictly read-only, and persist all edits, ratings, flags, labels, keywords, variants, and edited thumbnails in portable `.hdrtoys/<rel-path>.edits` sidecars.
+
+We try to keep cloudedits secure, but it is only as secure as your Tailscale setup and is written using AI tools, so use it with caution.
 
 ## Core Principles
 

@@ -85,4 +85,4 @@ If `/library/photos` must be mounted `:ro`, add `CLOUDEDITS_SIDECAR_DIR: /data/s
 ## Tailscale Troubleshooting & Security Posture
 
 - **Cannot reach `https://library.<tailnet>.ts.net`?** Confirm Tailscale is connected on both host and client devices, both belong to the same tailnet (or the node is explicitly shared), and MagicDNS + HTTPS Certificates are enabled at `https://login.tailscale.com/admin/dns`.
-- **How secure is this?** As secure as your Tailscale setup. Securing your tailnet, ACLs, and bearer tokens is your responsibility.
+- **How secure is this?** We try to keep it secure, but it's only as secure as your Tailscale setup and is written using AI tools, so use it with caution. Securing your tailnet, ACLs, and bearer tokens is your responsibility.

@@ -98,7 +98,7 @@
   <main>
     <header>
       <h1>cloudedits</h1>
-      <p>Serve your local photo folders privately over Tailscale for hdr.toys.</p>
+      <p>Serve your local photo folders over Tailscale for hdr.toys.</p>
     </header>
 
     <section class="card">
@@ -125,6 +125,9 @@
       <p class="muted" style="margin-top: 10px;">
         Your library joins your tailnet directly at its MagicDNS URL (<code>https://library.&lt;tailnet&gt;.ts.net</code>) and Tailscale IP (<code>100.x.y.z</code>) without installing system-wide Tailscale on the host.
         Run <code>cloudedits setup --hostname library --tailscale-auth-key-stdin</code> or start with <code>TS_AUTHKEY=... cloudedits serve --tsnet</code>.
+      </p>
+      <p class="muted" style="margin-top: 8px;">
+        We try to keep cloudedits secure, but it's only as secure as your Tailscale setup and is written using AI tools, so use it with caution.
       </p>
     </section>
 
