@@ -65,10 +65,10 @@ func newOriginPolicy(entries ...string) (*originPolicy, error) {
 	p := &originPolicy{exact: map[string]bool{}}
 	for _, entry := range entries {
 		entry = strings.TrimSpace(entry)
-		switch {
-		case entry == "":
+		switch entry {
+		case "":
 			continue
-		case entry == "*":
+		case "*":
 			p.any = true
 			continue
 		}
