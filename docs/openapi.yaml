@@ -18,6 +18,41 @@ components:
     BearerAuth:
       type: http
       scheme: bearer
+  parameters:
+    Sort:
+      name: sort
+      in: query
+      description: Sort field, optionally with a direction suffix (`name_asc`, `rating_desc`).
+      schema:
+        type: string
+        pattern: "^(captured|imported|edited|name|rating)(_asc|_desc)?$"
+    Dir:
+      name: dir
+      in: query
+      description: Sort direction; overrides a `sort` suffix.
+      schema:
+        type: string
+        enum: [asc, desc]
+    Flag:
+      name: flag
+      in: query
+      schema:
+        type: string
+        enum: [pick, reject, any, none]
+    Label:
+      name: label
+      in: query
+      description: A color label, `any` (any labeled) or `none`.
+      schema:
+        type: string
+    Kind:
+      name: kind
+      in: query
+      description: Repeatable or comma-separated, matched with OR. `raw`, `image`, `photo`, or a file extension.
+      schema:
+        type: array
+        items:
+          type: string
   schemas:
     CapabilitiesResponse:
       type: object
@@ -116,6 +151,96 @@ components:
         exif:
           type: object
           additionalProperties: true
+    GridAsset:
+      type: object
+      description: Compact projection returned by list endpoints when `fields=grid`.
+      required: [id, folderId, name, kind, mimeType, sourceRevision, width, height, hasGainMap, capturedAt, rating, flag, colorLabel, editedByHdrToys]
+      properties:
+        id:
+          type: string
+        folderId:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+        mimeType:
+          type: string
+        sourceRevision:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        hasGainMap:
+          type: boolean
+        capturedAt:
+          type: string
+        rating:
+          type: integer
+        flag:
+          type: [string, "null"]
+        colorLabel:
+          type: [string, "null"]
+        keywords:
+          type: array
+          items:
+            type: string
+        editedByHdrToys:
+          type: boolean
+        thumbnailUrl:
+          type: string
+    ErrorResponse:
+      type: object
+      description: Body of every non-2xx JSON response.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [bad-request, invalid-path, unauthorized, forbidden, not-found, payload-too-large, unsupported-media-type, unprocessable-entity, rate-limited, unsupported-capability, service-unavailable, internal-error]
+            message:
+              type: string
+    ChangeOp:
+      type: object
+      required: [seq, device, hlc, assetKey, assetId, field, outcome]
+      properties:
+        seq:
+          type: integer
+        device:
+          type: string
+        hlc:
+          type: string
+        assetKey:
+          type: string
+        assetId:
+          type: string
+        field:
+          type: string
+        value: {}
+        outcome:
+          type: string
+    ChangesResponse:
+      type: object
+      required: [ops, assets, nextCursor]
+      properties:
+        ops:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChangeOp"
+        assets:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssetSummary"
+        nextCursor:
+          type: string
+          description: Opaque cursor to pass as `since` on the next poll.
+        snapshotRequired:
+          type: boolean
+          description: True when `since` is not a position in this server's journal; re-run the initial sync and continue from `nextCursor`.
     TruthOp:
       type: object
       required: [hlc, device, assetKey, field]
@@ -261,9 +386,14 @@ paths:
           schema:
             type: string
             enum: [grid, full]
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Dir"
+        - $ref: "#/components/parameters/Flag"
+        - $ref: "#/components/parameters/Label"
+        - $ref: "#/components/parameters/Kind"
       responses:
         "200":
-          description: Range slice
+          description: Range slice (`{ total, exact, offset, limit, assets[] }`; items are GridAsset when `fields=grid`)
   /assets:
     get:
       summary: Cursor-paginated asset listing
@@ -279,9 +409,14 @@ paths:
           schema:
             type: integer
             maximum: 200
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Dir"
+        - $ref: "#/components/parameters/Flag"
+        - $ref: "#/components/parameters/Label"
+        - $ref: "#/components/parameters/Kind"
       responses:
         "200":
-          description: Asset page
+          description: Asset page (`{ assets[], nextCursor, total }`)
   /assets/{id}:
     get:
       summary: Full asset metadata
@@ -340,11 +475,18 @@ paths:
           required: true
           schema:
             type: string
+        - name: tier
+          in: query
+          schema:
+            type: string
+            enum: [original, t0, t1, t2, thumb, preview]
       responses:
         "200":
           description: Full media bytes
         "206":
           description: Partial original bytes
+        "304":
+          description: Cached thumbnail unchanged
   /assets/{id}/recipe:
     get:
       summary: Fetch canonical working recipe envelope
@@ -358,7 +500,68 @@ paths:
             type: string
       responses:
         "200":
-          description: Working recipe JSON and HLC
+          description: Working recipe envelope `{ assetId, recipe, hlc }`
+        "404":
+          description: Asset not found, or the asset has no working recipe yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /assets/{id}/rating:
+    post:
+      summary: Write an asset rating (0-5) durably as an HLC op
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating:
+                  type: integer
+                  minimum: 0
+                  maximum: 5
+      responses:
+        "200":
+          description: Rating committed (`{ ok, assetId, rating, durable, receipts }`)
+        "400":
+          description: Missing or out-of-range rating
+        "404":
+          description: Asset not found
+  /assets/{id}/variants/{variantId}/recipe:
+    get:
+      summary: Fetch one variant's recipe JSON
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: variantId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Variant recipe JSON
+        "404":
+          description: Asset or variant not found, or the variant is tombstoned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /assets/{id}/variants:
     get:
       summary: Fetch immutable creative variants and tombstones
@@ -455,6 +658,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OpsResponse"
+        "400":
+          description: Malformed body or op envelope; nothing was applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: More than `limits.maxOpsBatch` ops or `limits.maxOpsBodyBytes` body bytes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /changes:
     get:
       summary: Poll monotonic change feed
@@ -463,11 +678,21 @@ paths:
       parameters:
         - name: since
           in: query
+          description: Opaque `nextCursor` of the previous page; omit to bootstrap.
           schema:
             type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 500
       responses:
         "200":
           description: Operations and affected assets since cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChangesResponse"
   /handoff:
     post:
       summary: Store an ephemeral 5-minute handoff state for QR pickup

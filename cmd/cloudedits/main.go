@@ -139,12 +139,12 @@ func cmdSetup(args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	var folders stringSliceFlag
 	fs.Var(&folders, "folder", "photo folder path (repeatable)")
-	hostname := fs.String("hostname", "library", "Tailscale node hostname")
+	hostname := fs.String("hostname", "", "Tailscale node hostname (default: keep the configured one, initially \"library\")")
 	name := fs.String("name", "", "Library display name")
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "rebuildable index/cache/state directory")
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory for :ro mounts")
 	authKeyStdin := fs.Bool("tailscale-auth-key-stdin", false, "read one-time Tailscale auth key from stdin")
-	installService := fs.Bool("install-service", false, "record service install intent")
+	_ = fs.Bool("install-service", false, "accepted for compatibility; no service is installed, run the reported serve command under your own service manager")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -195,6 +195,9 @@ func cmdSetup(args []string) int {
 			fqdn = node.FQDN()
 			tailscaleIP = node.TailscaleIP()
 			_ = node.Close()
+			if recErr := recordNodeIdentity(cfg.DataDir, fqdn, tailscaleIP); recErr != nil {
+				return failOut(*jsonOut, exitStorage, "save node address failed", recErr)
+			}
 		}
 		if errors.Is(err, tsnetnode.ErrHTTPSNotEnabled) {
 			actionRequired = "Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns"
@@ -216,21 +219,26 @@ func cmdSetup(args []string) int {
 	}
 
 	res := map[string]any{
-		"ok":             true,
-		"libraryId":      cfg.LibraryID,
-		"libraryName":    cfg.LibraryName,
-		"hostname":       cfg.Hostname,
-		"fqdn":           fqdn,
-		"tailscaleIp":    tailscaleIP,
-		"dataDir":        cfg.DataDir,
-		"sidecarDir":     cfg.SidecarDir,
-		"folders":        cfg.Folders,
-		"installService": *installService,
+		"ok":          true,
+		"libraryId":   cfg.LibraryID,
+		"libraryName": cfg.LibraryName,
+		"hostname":    cfg.Hostname,
+		"fqdn":        fqdn,
+		"tailscaleIp": tailscaleIP,
+		"dataDir":     cfg.DataDir,
+		"sidecarDir":  cfg.SidecarDir,
+		"folders":     cfg.Folders,
+		// setup only writes configuration (and enrolls the node when given an
+		// auth key). Nothing is serving until this command runs.
+		"serviceInstalled": false,
+		"serveCommand":     []string{"cloudedits", "serve", "--tsnet", "--data-dir", cfg.DataDir},
 	}
 	if fqdn != "" {
 		res["url"] = "https://" + fqdn
 	}
-	emitOutput(*jsonOut, res, fmt.Sprintf("Configured %d folder(s) in %s (hostname=%s)", len(cfg.Folders), cfg.DataDir, cfg.Hostname))
+	emitOutput(*jsonOut, res, fmt.Sprintf(
+		"Configured %d folder(s) in %s (hostname=%s)\nStart the server with: cloudedits serve --tsnet --data-dir %q",
+		len(cfg.Folders), cfg.DataDir, cfg.Hostname, cfg.DataDir))
 	return exitOK
 }
 
@@ -248,7 +256,7 @@ func cmdServe(args []string) int {
 	requireToken := fs.Bool("require-token", false, "require Authorization: Bearer token on authenticated endpoints")
 	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token")
 	publicURL := fs.String("public-url", "", "override public base URL for redirects and handoff links")
-	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
+	noWatch := fs.Bool("no-watch", false, "do not follow folder changes after the initial scan")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -292,16 +300,6 @@ func cmdServe(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Perform initial scan synchronously for small libraries or immediately start serving.
-	if err := idx.ScanAll(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "initial scan warning: %v\n", err)
-	}
-	if !*noWatch {
-		if err := idx.StartWatcher(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "watcher warning: %v\n", err)
-		}
-	}
-
 	sessions := auth.NewSessionManager(30 * time.Minute)
 	authenticator := &auth.CompositeAuthenticator{
 		Sessions:      sessions,
@@ -336,6 +334,9 @@ func cmdServe(args []string) int {
 		tsNode = node
 		defer func() { _ = tsNode.Close() }()
 		authenticator.WhoIs = tsNode.WhoIs
+		if recErr := recordNodeIdentity(cfg.DataDir, tsNode.FQDN(), tsNode.TailscaleIP()); recErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record node address: %v\n", recErr)
+		}
 		if pubURL == "" && tsNode.FQDN() != "" {
 			pubURL = "https://" + tsNode.FQDN()
 		}
@@ -378,29 +379,86 @@ func cmdServe(args []string) int {
 		return exitStorage
 	}
 
-	httpSrv := &http.Server{
-		Handler:           apiSrv,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(shutCtx)
-	}()
-
+	logf := func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
 	cnt, _ := idx.Count(ctx, index.Filter{})
 	if tsNode != nil && tsNode.TailscaleIP() != "" {
-		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (Tailscale IP %s, %d assets, %d folders)\n", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
+		logf("cloudedits %s serving %s (Tailscale IP %s, %d assets already indexed, %d folders)", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
 	} else {
-		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (%d assets, %d folders)\n", version, pubURL, cnt, len(cfg.Folders))
+		logf("cloudedits %s serving %s (%d assets already indexed, %d folders)", version, pubURL, cnt, len(cfg.Folders))
 	}
-	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Fprintf(os.Stderr, "serve error: %v\n", err)
+	if err := serveUntilDone(ctx, ln, apiSrv, idx, !*noWatch, logf); err != nil {
+		logf("serve error: %v", err)
 		return exitStorage
 	}
 	return exitOK
+}
+
+// backgroundIndexer is the part of the index that serve keeps current while
+// the HTTP API is already answering.
+type backgroundIndexer interface {
+	ScanAll(ctx context.Context) error
+	// Watch blocks until ctx is cancelled and no scan is running.
+	Watch(ctx context.Context) error
+}
+
+// shutdownGrace bounds how long in-flight requests may run after a stop signal.
+const shutdownGrace = 5 * time.Second
+
+// serveUntilDone serves handler on ln at once and brings the index up to date
+// in the background, so the size of the library never delays the first
+// response: requests are answered from the persisted index while the rescan
+// runs. It returns only after ctx is cancelled (or the listener failed),
+// in-flight requests have drained within shutdownGrace, and the background
+// scan has stopped. The caller may close the index as soon as it returns.
+func serveUntilDone(ctx context.Context, ln net.Listener, handler http.Handler, idx backgroundIndexer, watch bool, logf func(string, ...any)) error {
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	bgCtx, stopBackground := context.WithCancel(ctx)
+	indexed := make(chan struct{})
+	go func() {
+		defer close(indexed)
+		start := time.Now()
+		if err := idx.ScanAll(bgCtx); err != nil {
+			if bgCtx.Err() != nil {
+				return
+			}
+			logf("initial scan warning: %v", err)
+		} else {
+			logf("initial scan finished in %s", time.Since(start).Round(time.Millisecond))
+		}
+		if watch {
+			if err := idx.Watch(bgCtx); err != nil {
+				logf("watcher warning: %v", err)
+			}
+		}
+	}()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	var err error
+	select {
+	case err = <-serveErr:
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
+			// Requests still running after the grace period (for example a
+			// long original download) are cut off rather than left to race
+			// the index close.
+			_ = srv.Close()
+		}
+		cancel()
+		err = <-serveErr
+	}
+	stopBackground()
+	<-indexed
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func cmdStatus(args []string) int {
@@ -437,6 +495,8 @@ func cmdStatus(args []string) int {
 		"sidecarDir":   cfg.SidecarDir,
 		"folders":      cfg.Folders,
 		"indexedCount": indexed,
+		"url":          cfg.PublicURL,
+		"tailscaleIp":  cfg.TailscaleIP,
 	}
 	emitOutput(*jsonOut, out, fmt.Sprintf("cloudedits %s | %s | %d folder(s) | %d indexed | sidecars: %s",
 		version, cfg.LibraryName, len(cfg.Folders), indexed, sidecarMode))
@@ -555,7 +615,8 @@ func cmdFolders(args []string) int {
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "data directory")
 	label := fs.String("label", "", "optional folder label (for add)")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args[1:]); err != nil {
+	positional, err := parseInterspersed(fs, args[1:])
+	if err != nil {
 		return exitUsage
 	}
 
@@ -569,10 +630,10 @@ func cmdFolders(args []string) int {
 		emitOutput(*jsonOut, map[string]any{"folders": cfg.Folders}, fmt.Sprintf("%d folder(s) configured", len(cfg.Folders)))
 		return exitOK
 	case "add":
-		if fs.NArg() < 1 {
+		if len(positional) < 1 {
 			return failOut(*jsonOut, exitUsage, "missing folder path", nil)
 		}
-		fc, err := cfg.AddFolder(fs.Arg(0), *label)
+		fc, err := cfg.AddFolder(positional[0], *label)
 		if err != nil {
 			return failOut(*jsonOut, exitStorage, "add folder failed", err)
 		}
@@ -582,10 +643,10 @@ func cmdFolders(args []string) int {
 		emitOutput(*jsonOut, map[string]any{"added": fc, "folders": cfg.Folders}, "added folder "+fc.Path)
 		return exitOK
 	case "remove":
-		if fs.NArg() < 1 {
+		if len(positional) < 1 {
 			return failOut(*jsonOut, exitUsage, "missing folder path or id", nil)
 		}
-		removed := cfg.RemoveFolder(fs.Arg(0))
+		removed := cfg.RemoveFolder(positional[0])
 		if err := config.Save(cfg); err != nil {
 			return failOut(*jsonOut, exitStorage, "save config failed", err)
 		}
@@ -593,6 +654,43 @@ func cmdFolders(args []string) int {
 		return exitOK
 	default:
 		return failOut(*jsonOut, exitUsage, "unknown folders subcommand "+sub, nil)
+	}
+}
+
+// recordNodeIdentity stores the enrolled node's tailnet address in the config
+// on disk. It reloads the stored config rather than saving the caller's
+// in-memory copy, so per-invocation overrides (serve --folder, --name, ...)
+// are never persisted as a side effect. An empty fqdn records nothing.
+func recordNodeIdentity(dataDir, fqdn, tailscaleIP string) error {
+	if fqdn == "" {
+		return nil
+	}
+	stored, err := config.Load(dataDir)
+	if err != nil {
+		return err
+	}
+	url := "https://" + fqdn
+	if stored.PublicURL == url && stored.TailscaleIP == tailscaleIP {
+		return nil
+	}
+	stored.PublicURL, stored.TailscaleIP = url, tailscaleIP
+	return config.Save(stored)
+}
+
+// parseInterspersed parses flags that may appear before, between or after
+// positional arguments (the standard flag package stops at the first
+// positional) and returns the positionals in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			return positional, nil
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
 	}
 }
 
@@ -609,9 +707,12 @@ func cmdQR(args []string) int {
 	cfg, _ := config.Load(*dataDir)
 	target := strings.TrimRight(strings.TrimSpace(*baseURL), "/")
 	if target == "" {
-		if cfg != nil && cfg.ListenAddr != "" {
+		switch {
+		case cfg != nil && cfg.PublicURL != "":
+			target = cfg.PublicURL
+		case cfg != nil && cfg.ListenAddr != "":
 			target = "http://" + cfg.ListenAddr
-		} else {
+		default:
 			target = "http://127.0.0.1:8787"
 		}
 	}
@@ -654,39 +755,40 @@ func cmdDockerInit(args []string) int {
 	return exitOK
 }
 
+// guiState backs the setup wizard with the config on disk. It reloads on
+// every read so the page follows changes made by other commands while it is
+// open (for example `setup` enrolling the node), and a wizard save starts
+// from the stored config instead of overwriting it with a stale copy.
 type guiState struct {
-	mu      sync.RWMutex
-	cfg     *config.Config
-	pubURL  string
+	mu      sync.Mutex
+	dataDir string
 	indexed int
 }
 
 func (g *guiState) GetConfig() *config.Config {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	cp := *g.cfg
-	return &cp
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cfg, err := config.Load(g.dataDir)
+	if err != nil {
+		return config.Default(g.dataDir)
+	}
+	return cfg
 }
 
 func (g *guiState) SaveConfig(cfg *config.Config) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := config.Save(cfg); err != nil {
-		return err
-	}
-	g.cfg = cfg
-	return nil
+	return config.Save(cfg)
 }
 
+// PublicURL is the library's tailnet URL, or "" until the node is enrolled.
 func (g *guiState) PublicURL() string {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.pubURL
+	return g.GetConfig().PublicURL
 }
 
 func (g *guiState) IndexedCount() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	return g.indexed
 }
 
@@ -712,21 +814,12 @@ func cmdGUI(args []string) int {
 			_ = idx.Close()
 		}
 	}
-	listenAddr := cfg.ListenAddr
-	if listenAddr == "" {
-		listenAddr = "127.0.0.1:8787"
-	}
-
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "listen %s: %v\n", *listen, err)
 		return exitStorage
 	}
-	state := &guiState{
-		cfg:     cfg,
-		pubURL:  "http://" + listenAddr,
-		indexed: indexed,
-	}
+	state := &guiState{dataDir: cfg.DataDir, indexed: indexed}
 	srv := &http.Server{
 		Handler:           setupui.Handler(state),
 		ReadHeaderTimeout: 10 * time.Second,

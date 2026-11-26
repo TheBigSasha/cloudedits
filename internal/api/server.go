@@ -27,12 +27,20 @@ import (
 const (
 	remoteLibraryProfile  = "chrome-local-parity/1"
 	maxOpsBatch           = 100
+	maxOpsBodyBytes       = 4 * 1024 * 1024
 	maxRangeLimit         = 500
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	maxRenderBytes        = 64 * 1024 * 1024
 	maxHandoffBytes       = 64 * 1024
 	maxConcurrentStreams  = 16
+
+	// corsAllowHeaders lists every non-safelisted request header a browser
+	// client may attach. A header missing here fails the CORS preflight, so
+	// the request never reaches its handler.
+	corsAllowHeaders = "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, " +
+		"X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id, X-HDRToys-Render-Id, " +
+		"X-HDRToys-Variant-Id, X-HDRToys-Channel, X-HDRToys-Filename, X-HDRToys-Schema-Version"
 )
 
 // Options configures a Remote Library HTTP API Server.
@@ -244,7 +252,7 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 			h.Set("Access-Control-Allow-Origin", "*")
 		}
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id")
+		h.Set("Access-Control-Allow-Headers", corsAllowHeaders)
 		h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 
 		if r.Method == http.MethodOptions {
@@ -437,6 +445,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"permissions": perms,
 		"limits": map[string]any{
 			"maxOpsBatch":           maxOpsBatch,
+			"maxOpsBodyBytes":       maxOpsBodyBytes,
 			"maxRangeLimit":         maxRangeLimit,
 			"maxCursorLimit":        maxCursorLimit,
 			"maxEditThumbnailBytes": maxEditThumbnailBytes,
@@ -476,7 +485,7 @@ func parseFilter(r *http.Request) index.Filter {
 		Flag:     q.Get("flag"),
 		Label:    q.Get("label"),
 		Keywords: q["keyword"],
-		Kind:     q.Get("kind"),
+		Kind:     strings.Join(q["kind"], ","),
 		Folder:   q.Get("folder"),
 		Sort:     q.Get("sort"),
 		Dir:      q.Get("dir"),
@@ -954,9 +963,14 @@ func singleOpRejection(receipts []index.OpReceipt) (status int, message string, 
 }
 
 func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxOpsBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("ops body exceeds %d bytes", maxOpsBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "failed to read ops body")
 		return
 	}
@@ -1107,6 +1121,9 @@ func (s *Server) handlePostRender(w http.ResponseWriter, r *http.Request) {
 		renderID = strings.TrimSpace(r.URL.Query().Get("renderId"))
 	}
 	variantID := strings.TrimSpace(r.URL.Query().Get("variantId"))
+	if variantID == "" {
+		variantID = strings.TrimSpace(r.Header.Get("X-HDRToys-Variant-Id"))
+	}
 	mimeType := strings.TrimSpace(r.Header.Get("Content-Type"))
 	if mimeType == "" {
 		mimeType = "image/jpeg"

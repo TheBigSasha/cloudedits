@@ -9,7 +9,7 @@ Every HTTP response (JSON, binary blobs, redirects, and errors) includes:
 - `Cross-Origin-Resource-Policy: cross-origin`
 - `Access-Control-Allow-Origin` (reflecting allowed origin or `*`)
 - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
-- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile`
+- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id, X-HDRToys-Render-Id, X-HDRToys-Variant-Id, X-HDRToys-Channel, X-HDRToys-Filename, X-HDRToys-Schema-Version`
 - `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing`
 - `Server-Timing: app;dur=<ms>`
 
@@ -45,14 +45,14 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 | `GET` | `/assets/{id}` | Authenticated | `asset:read` | Full asset metadata (including `thumbnailUrl`, `rawUrl`, `recipeUrl`, `editedByHdrToys`, full `exif`) |
 | `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`, supports `&bt=<signed>`) |
 | `GET` | `/assets/{id}/file` | Authenticated | `asset:read` | Alias for `/assets/{id}/blob` |
-| `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ v, hlc }` (`404` `not-found` when unedited) |
+| `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ assetId, recipe, hlc }` (`404` `not-found` when unedited) |
 | `POST` | `/assets/{id}/rating` | Authenticated | `edits:write` | Write asset rating (`0`–`5`) durably as an HLC op |
 | `GET` | `/assets/{id}/variants` | Authenticated | `asset:read` | Active immutable variants (`{ id, name, hlc, recipeUrl, recipe }`; pass `?includeTombstones=true` for deleted entries) |
 | `GET` | `/assets/{id}/variants/{variantId}/recipe` | Authenticated | `asset:read` | Fetch one variant's recipe JSON |
 | `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint (accepts raw `[op, ...]` or `{ "ops": [...] }`; returns `{ durable, applied, duplicates, stale, receipts }`) |
-| `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<seq>` |
+| `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<cursor>&limit=<n<=500>` -> `{ ops[], assets[], nextCursor, snapshotRequired? }` |
 | `PUT` | `/assets/{id}/edit-thumbnail` | Authenticated | `media:write` | Persist edited JPEG preview (<= 4 MiB, `FF D8` verified) |
-| `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` / `renderId`) |
+| `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` header or `renderId` query; owning variant from `variantId` query or `X-HDRToys-Variant-Id` header) |
 | `GET` | `/assets/{id}/renders` | Authenticated | `asset:read` | List stored rendered exports for an asset |
 | `DELETE` | `/assets/{id}/variants/{variantId}` | Authenticated | `variants:write` | Append a tombstone op for a variant |
 | `POST` | `/handoff` | Authenticated | `handoff:create` | Create ephemeral 5-minute UI state handoff (`8`-char base62 ID) |
@@ -65,14 +65,20 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 - `q`: case-insensitive substring match against filename, relative path, or keywords
 - `rating`: exact integer rating (`0`–`5`)
 - `rating_gte`: minimum integer rating (`0`–`5`)
-- `flag`: `pick`, `reject`, or `none`
-- `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`, `none`)
+- `flag`: `pick`, `reject`, `any` (any flagged), or `none`
+- `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`), `any` (any labeled), or `none`
 - `keyword`: repeatable (`&keyword=tokyo&keyword=night`), matched with logical AND
-- `kind`: `image` or `raw` (or file extension)
+- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image`, `photo` (every non-RAW asset), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
 - `folder`: folder ID or folder label filter
-- `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`)
-- `dir`: `asc` or `desc` (default `desc`)
+- `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`); the single-token forms `<field>_asc` / `<field>_desc` (for example `name_asc`, `rating_desc`) are accepted as well
+- `dir`: `asc` or `desc` (default `desc`; overrides a `sort` token suffix)
 - `fields`: `grid` (compact) or `full`
+
+## Change Feed (`GET /changes`)
+
+- `since` is the opaque `nextCursor` of the previous page; omit it to bootstrap from the start of the journal.
+- Each page carries the applied ops after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array with an unchanged `nextCursor` means the client is caught up.
+- `snapshotRequired: true` means the cursor is not a position in this server's journal — the rebuildable index was re-created after the cursor was issued. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
 
 ## Batch Operations (`POST /ops`)
 
@@ -108,6 +114,8 @@ Response body:
 ```
 
 `POST /ops` answers `200` with exactly one receipt per op, in request order. Only a body that is not a JSON op list (or exceeds the batch limit) fails the request as a whole; an op that cannot be applied gets its own `rejected` receipt and never blocks the ops around it.
+
+Limits: at most `limits.maxOpsBatch` ops and `limits.maxOpsBodyBytes` request-body bytes per call (both advertised by `GET /capabilities`). A request over either limit is rejected whole with `413` and error code `payload-too-large`; split the batch and retry.
 
 Receipt `status` values:
 - `applied`: accepted and written atomically to `.hdrtoys/<rel>.edits`.
