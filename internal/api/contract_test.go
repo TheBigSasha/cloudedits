@@ -92,3 +92,42 @@ func TestRenderUploadReadsVariantFromHeader(t *testing.T) {
 		t.Errorf("render variantId = %q, want %q", out.Render.VariantID, "variant-7")
 	}
 }
+
+// TestOversizedOpsBodyIsPayloadTooLarge pins that a POST /ops body over the
+// byte limit is answered with 413 payload-too-large (not a generic 400 a
+// client cannot tell apart from malformed JSON), and that the limit a client
+// must stay under is advertised in /capabilities.
+func TestOversizedOpsBodyIsPayloadTooLarge(t *testing.T) {
+	srv, _, _ := newTestServer(t, "")
+
+	_, caps := getJSON(t, srv, "/capabilities")
+	limits, _ := caps["limits"].(map[string]any)
+	advertised, ok := limits["maxOpsBodyBytes"].(float64)
+	if !ok || advertised <= 0 {
+		t.Fatalf("limits.maxOpsBodyBytes = %v, want the POST /ops byte limit", limits["maxOpsBodyBytes"])
+	}
+
+	post := func(size int) (int, string) {
+		pad := strings.Repeat("a", size)
+		body := `[{"hlc":"019a2f001000-0001-d","device":"d","assetKey":"missing","field":"keywords","value":["` + pad + `"]}]`
+		req := httptest.NewRequest(http.MethodPost, "/ops", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:50000"
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		var out struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out.Error.Code
+	}
+
+	if code, errCode := post(int(advertised) + 1); code != http.StatusRequestEntityTooLarge || errCode != "payload-too-large" {
+		t.Errorf("body over the advertised limit: %d %q, want 413 payload-too-large", code, errCode)
+	}
+	if code, _ := post(1024); code == http.StatusRequestEntityTooLarge {
+		t.Errorf("small body was rejected as too large (%d)", code)
+	}
+}

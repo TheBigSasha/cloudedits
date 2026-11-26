@@ -26,6 +26,7 @@ import (
 const (
 	remoteLibraryProfile  = "chrome-local-parity/1"
 	maxOpsBatch           = 100
+	maxOpsBodyBytes       = 4 * 1024 * 1024
 	maxRangeLimit         = 500
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
@@ -442,6 +443,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"permissions": perms,
 		"limits": map[string]any{
 			"maxOpsBatch":           maxOpsBatch,
+			"maxOpsBodyBytes":       maxOpsBodyBytes,
 			"maxRangeLimit":         maxRangeLimit,
 			"maxCursorLimit":        maxCursorLimit,
 			"maxEditThumbnailBytes": maxEditThumbnailBytes,
@@ -912,9 +914,14 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxOpsBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("ops body exceeds %d bytes", maxOpsBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "failed to read ops body")
 		return
 	}

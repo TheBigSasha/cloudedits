@@ -113,6 +113,8 @@ Response body:
 }
 ```
 
+Limits: at most `limits.maxOpsBatch` ops and `limits.maxOpsBodyBytes` request-body bytes per call (both advertised by `GET /capabilities`). A request over either limit is rejected whole with `413` and error code `payload-too-large`; split the batch and retry.
+
 Receipt `status` values:
 - `applied`: accepted and written atomically to `.hdrtoys/<rel>.edits`.
 - `duplicate`: `(device, hlc)` was already processed (`originalStatus` included).
