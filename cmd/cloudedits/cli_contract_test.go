@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/thebigsasha/cloudedits/internal/config"
 )
 
 func runJSON(t *testing.T, args ...string) (int, map[string]any) {
@@ -71,5 +74,30 @@ func TestSetupReportsThatNoServiceWasInstalled(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--tsnet") || !strings.Contains(joined, dataDir) {
 		t.Errorf("serveCommand %q must serve over the tailnet from the configured data dir", joined)
+	}
+}
+
+// TestFoldersFlagsAfterThePathAreHonored pins the documented argument order
+// `folders add <dir> --json`: flags placed after the path must still apply.
+func TestFoldersFlagsAfterThePathAreHonored(t *testing.T) {
+	defaultDir := isolateDefaultDataDir(t)
+	dataDir := t.TempDir()
+	photoDir := t.TempDir()
+
+	code, out := runJSON(t, "folders", "add", photoDir, "--data-dir", dataDir, "--json")
+	if code != exitOK || out["added"] == nil {
+		t.Fatalf("folders add: code=%d out=%v", code, out)
+	}
+	cfg, err := config.Load(dataDir)
+	if err != nil || len(cfg.Folders) != 1 {
+		t.Fatalf("folder not saved under --data-dir: folders=%v err=%v", cfg.Folders, err)
+	}
+	if _, err := os.Stat(config.ConfigPath(defaultDir)); err == nil {
+		t.Errorf("folders add wrote the default data dir although --data-dir was given")
+	}
+
+	code, out = runJSON(t, "folders", "remove", photoDir, "--data-dir", dataDir, "--json")
+	if code != exitOK || out["removed"] != true {
+		t.Fatalf("folders remove: code=%d out=%v", code, out)
 	}
 }

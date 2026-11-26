@@ -607,7 +607,8 @@ func cmdFolders(args []string) int {
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "data directory")
 	label := fs.String("label", "", "optional folder label (for add)")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args[1:]); err != nil {
+	positional, err := parseInterspersed(fs, args[1:])
+	if err != nil {
 		return exitUsage
 	}
 
@@ -621,10 +622,10 @@ func cmdFolders(args []string) int {
 		emitOutput(*jsonOut, map[string]any{"folders": cfg.Folders}, fmt.Sprintf("%d folder(s) configured", len(cfg.Folders)))
 		return exitOK
 	case "add":
-		if fs.NArg() < 1 {
+		if len(positional) < 1 {
 			return failOut(*jsonOut, exitUsage, "missing folder path", nil)
 		}
-		fc, err := cfg.AddFolder(fs.Arg(0), *label)
+		fc, err := cfg.AddFolder(positional[0], *label)
 		if err != nil {
 			return failOut(*jsonOut, exitStorage, "add folder failed", err)
 		}
@@ -634,10 +635,10 @@ func cmdFolders(args []string) int {
 		emitOutput(*jsonOut, map[string]any{"added": fc, "folders": cfg.Folders}, "added folder "+fc.Path)
 		return exitOK
 	case "remove":
-		if fs.NArg() < 1 {
+		if len(positional) < 1 {
 			return failOut(*jsonOut, exitUsage, "missing folder path or id", nil)
 		}
-		removed := cfg.RemoveFolder(fs.Arg(0))
+		removed := cfg.RemoveFolder(positional[0])
 		if err := config.Save(cfg); err != nil {
 			return failOut(*jsonOut, exitStorage, "save config failed", err)
 		}
@@ -645,6 +646,23 @@ func cmdFolders(args []string) int {
 		return exitOK
 	default:
 		return failOut(*jsonOut, exitUsage, "unknown folders subcommand "+sub, nil)
+	}
+}
+
+// parseInterspersed parses flags that may appear before, between or after
+// positional arguments (the standard flag package stops at the first
+// positional) and returns the positionals in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			return positional, nil
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
 	}
 }
 
