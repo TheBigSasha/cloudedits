@@ -317,3 +317,42 @@ func TestApplyOpsBatchRejectsBadOpsWithoutFailingTheBatch(t *testing.T) {
 		t.Fatalf("retry of a previously rejected op: %+v err=%v", retry, err)
 	}
 }
+
+// Camera counters wrap, so one library routinely holds several photos named
+// IMG_0001.JPG. An op whose asset key no longer resolves must not be applied
+// to whichever of them the database happens to return for its filename hint.
+func TestOpWithAmbiguousFileHintIsNotAppliedToAnArbitraryPhoto(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "100", "IMG_0001.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "101", "IMG_0001.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "101", "UNIQUE.JPG"))
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	receipts, err := idx.ApplyOpsBatch(ctx, []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: "stale-key", File: "IMG_0001.JPG", Field: "rating", Value: 5},
+		{HLC: "019a2f001000-0002-dev1", Device: "dev1", AssetKey: "stale-key", File: "UNIQUE.JPG", Field: "rating", Value: 2},
+		{HLC: "019a2f001000-0003-dev1", Device: "dev1", AssetKey: "stale-key", File: "100/IMG_0001.JPG", Field: "flag", Value: "pick"},
+	})
+	if err != nil {
+		t.Fatalf("ApplyOpsBatch: %v", err)
+	}
+	if receipts[0].Status != "rejected" || receipts[0].Reason != "asset-not-found" {
+		t.Errorf("ambiguous filename hint: receipt %+v, want rejected/asset-not-found", receipts[0])
+	}
+	if receipts[1].Status != "applied" || receipts[2].Status != "applied" {
+		t.Errorf("unambiguous hints must still rebind: %+v", receipts[1:])
+	}
+	for _, rel := range []string{"100/IMG_0001.JPG", "101/IMG_0001.JPG"} {
+		if a, err := idx.GetAsset(ctx, MakeAssetID("photos", rel)); err != nil || a.Rating != 0 {
+			t.Errorf("%s was rated %d by an op that did not name it (err=%v)", rel, a.Rating, err)
+		}
+	}
+}

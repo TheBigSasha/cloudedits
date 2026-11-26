@@ -135,7 +135,7 @@ type OpReceipt struct {
 // Rejection reasons carried by an OpReceipt whose Status is "rejected".
 const (
 	// ReasonAssetNotFound: the op's assetKey (and file hint) resolve to no
-	// indexed asset. A retry can succeed after a rescan.
+	// indexed asset, or to more than one. A retry can succeed after a rescan.
 	ReasonAssetNotFound = "asset-not-found"
 	// ReasonInvalidOp: the op is malformed (missing device/field/assetKey,
 	// malformed HLC, or a value its field cannot hold). A retry cannot succeed.
@@ -566,19 +566,46 @@ func (idx *Index) ResolveAsset(ctx context.Context, assetKey, fileHint string) (
 		if err == nil && id != "" {
 			return idx.GetAsset(ctx, id)
 		}
-		err = idx.db.QueryRowContext(ctx, `SELECT id FROM assets WHERE rel_path = ? OR name = ? LIMIT 1`, assetKey, assetKey).Scan(&id)
-		if err == nil && id != "" {
+		if id, ok := idx.uniqueAssetByPathOrName(ctx, assetKey); ok {
 			return idx.GetAsset(ctx, id)
 		}
 	}
 	if fileHint != "" {
-		var id string
-		err := idx.db.QueryRowContext(ctx, `SELECT id FROM assets WHERE rel_path = ? OR name = ? LIMIT 1`, fileHint, fileHint).Scan(&id)
-		if err == nil && id != "" {
+		if id, ok := idx.uniqueAssetByPathOrName(ctx, fileHint); ok {
 			return idx.GetAsset(ctx, id)
 		}
 	}
 	return nil, os.ErrNotExist
+}
+
+// uniqueAssetByPathOrName rebinds a relative path or bare filename to an asset
+// only when exactly one asset carries it. Filenames repeat across folders
+// (camera counters wrap), and applying an edit to whichever match the database
+// returns first would put it on a photo the op never named.
+func (idx *Index) uniqueAssetByPathOrName(ctx context.Context, key string) (string, bool) {
+	for _, column := range []string{"rel_path", "name"} {
+		rows, err := idx.db.QueryContext(ctx, `SELECT id FROM assets WHERE `+column+` = ? LIMIT 2`, key)
+		if err != nil {
+			return "", false
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				ids = append(ids, id)
+			}
+		}
+		_ = rows.Close()
+		switch len(ids) {
+		case 0:
+			continue
+		case 1:
+			return ids[0], true
+		default:
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func (idx *Index) scanAssets(ctx context.Context, rows *sql.Rows) ([]Asset, error) {
