@@ -122,14 +122,17 @@ Merging two sidecars for the same asset is a join-semilattice (associative, comm
 - `asset`, unknown top-level keys: per-key join where `null` is the bottom element and non-null ties resolve by larger canonical JSON.
 - `provenance`: joined as one value under the same rule.
 
-## Legacy Read Precedence & Quarantine
+## Two On-Disk Layouts, One Truth
 
-When reading an asset's sidecar, `cloudedits` checks in order:
+A browser editor may keep an asset's sidecar in either of two places, and older versions always used the second:
 
-1. `<sidecarRoot>/<rel>.edits` (canonical)
-2. `<photoFolder>/<rel>.edits` (colocated legacy)
-3. `<photoFolder>/<rel>.hdrt.json` (legacy JSON)
+1. `<sidecarRoot>/<rel>.edits` — the canonical sidecar, the only file `cloudedits` writes.
+2. Beside the photo: `<photoFolder>/<rel>.edits`, else `<photoFolder>/<rel>.hdrt.json` (legacy JSON; a missing `document` is read as `role: truth`).
 
-Writes **always** commit atomically to `<sidecarRoot>/<rel>.edits` via temp file in `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename`.
+A folder can therefore hold a copy in each layout. Every read joins the two with the merge lattice above, including conflict rescue with the origin-labelled name, which is exactly the document the browser editor computes for the same pair of files. Reading only one of them would show stale ratings, flags, or recipes whenever the other copy is newer.
 
-If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by a legacy file.
+- The copy beside the photo is strictly read-only: it is never written, moved, or removed.
+- A portable document beside the photo (`document.role: "portable"`) is a shared edit file, not folder truth, and is ignored.
+- Writes **always** commit the joined state atomically to `<sidecarRoot>/<rel>.edits` via temp file in `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename`.
+
+If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by the other copy.

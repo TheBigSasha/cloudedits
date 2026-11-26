@@ -215,3 +215,45 @@ func TestConcurrentApplyOpsBatchRaceAndCoalescing(t *testing.T) {
 		}
 	}
 }
+
+// An edit written beside the photo (by a browser editor configured for that
+// layout) must reach the index even though a canonical sidecar already exists
+// and did not change.
+func TestRescanPicksUpEditsWrittenBesideThePhoto(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "A.JPG"))
+
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aid := MakeAssetID("photos", "A.JPG")
+	if _, err := idx.ApplyOpsBatch(ctx, []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: aid, Field: "rating", Value: 2},
+	}); err != nil {
+		t.Fatalf("ApplyOpsBatch: %v", err)
+	}
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	beside := `{"hdrt":1,"document":{"role":"truth"},"asset":{"file":"A.JPG"},"fields":{"rating":{"hlc":"019a2f002000-0001-dev2","v":5},"flag":{"hlc":"019a2f002000-0002-dev2","v":"pick"}}}`
+	if err := os.WriteFile(filepath.Join(photoDir, "A.JPG.edits"), []byte(beside), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	asset, err := idx.GetAsset(ctx, aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asset.Rating != 5 || asset.Flag == nil || *asset.Flag != "pick" {
+		t.Fatalf("index shows rating=%d flag=%v; the folder's joined truth is rating=5 flag=pick", asset.Rating, asset.Flag)
+	}
+}

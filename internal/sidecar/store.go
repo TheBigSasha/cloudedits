@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"path"
 	"path/filepath"
@@ -105,23 +106,36 @@ func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
 
 // ReadResult describes a sidecar read outcome.
 type ReadResult struct {
-	Sidecar     *Sidecar
+	Sidecar *Sidecar
+	// SourcePath is the file the state came from: the canonical sidecar when
+	// it exists, otherwise the copy beside the photo.
 	SourcePath  string
 	Quarantined string
+	// MergedFrom is the beside-the-photo copy that was joined into the
+	// canonical sidecar, when both layouts hold truth for the asset.
+	MergedFrom string
 }
 
-// Read loads an asset's sidecar following legacy read precedence:
-//  1. <sidecarRoot>/<rel>.edits (canonical)
-//  2. <folderRoot>/<rel>.edits (colocated legacy)
-//  3. <folderRoot>/<rel>.hdrt.json (legacy JSON)
+// Read loads an asset's truth from both on-disk layouts and joins them:
+//
+//   - <sidecarRoot>/<rel>.edits, the canonical sidecar this server writes
+//   - beside the photo: <folderRoot>/<rel>.edits, else <folderRoot>/<rel>.hdrt.json
+//
+// A browser editor can be configured to keep sidecars beside the photos, and
+// older ones always did, so a folder may hold a copy in each layout. Reading
+// only the canonical one would show stale state whenever the other is newer.
+// The join is Merge with conflict rescue, exactly what the browser editor
+// computes for the same two files, so both tools show identical state. The
+// copy beside the photo is never written, moved, or removed.
 //
 // If the canonical .edits file exists on disk but fails parsing, it is moved
-// to <sidecarRoot>/.quarantine/ and NOT silently masked by a legacy fallback.
+// to <sidecarRoot>/.quarantine/ and NOT silently masked by the other copy.
 func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, error) {
 	canonical, err := CanonicalEditsPath(sidecarRoot, relPosix)
 	if err != nil {
 		return nil, err
 	}
+	var inFolder *Sidecar
 	if data, err := os.ReadFile(canonical); err == nil {
 		sc, parseErr := Parse(data)
 		if parseErr != nil {
@@ -131,33 +145,86 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 			}
 			return &ReadResult{Quarantined: qPath}, nil
 		}
-		return &ReadResult{Sidecar: sc, SourcePath: canonical}, nil
+		inFolder = sc
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
-	// Legacy read-only fallbacks (never written to).
-	colocated, err := SafeJoinRel(folderRoot, relPosix+".edits")
-	if err == nil {
-		if data, rerr := os.ReadFile(colocated); rerr == nil {
-			if sc, perr := Parse(data); perr == nil {
-				return &ReadResult{Sidecar: sc, SourcePath: colocated}, nil
-			}
-		}
+	beside, besidePath := readBesidePhoto(folderRoot, relPosix)
+	switch {
+	case inFolder == nil && beside == nil:
+		return &ReadResult{}, nil
+	case inFolder == nil:
+		return &ReadResult{Sidecar: beside, SourcePath: besidePath}, nil
+	case beside == nil:
+		return &ReadResult{Sidecar: inFolder, SourcePath: canonical}, nil
 	}
-	legacyJSON, err := SafeJoinRel(folderRoot, relPosix+".hdrt.json")
-	if err == nil {
-		if data, rerr := os.ReadFile(legacyJSON); rerr == nil {
-			if sc, perr := Parse(data); perr == nil {
-				if sc.Document == nil {
-					sc.Document = &DocumentMeta{Role: "truth"}
-				}
-				return &ReadResult{Sidecar: sc, SourcePath: legacyJSON}, nil
-			}
-		}
+	merged, err := Merge(inFolder, beside, MergeOptions{
+		RescueConflictingRecipes: true,
+		OriginA:                  OriginSidecarFolder,
+		OriginB:                  OriginBesidePhoto,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("merge %s with %s: %w", canonical, besidePath, err)
 	}
+	return &ReadResult{Sidecar: merged, SourcePath: canonical, MergedFrom: besidePath}, nil
+}
 
-	return &ReadResult{}, nil
+// besidePhotoCandidates lists the read-only sidecar names beside a photo, in
+// precedence order.
+func besidePhotoCandidates(folderRoot, relPosix string) []string {
+	var out []string
+	for _, suffix := range []string{".edits", ".hdrt.json"} {
+		if p, err := SafeJoinRel(folderRoot, relPosix+suffix); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// readBesidePhoto returns the first readable truth sidecar beside the photo.
+// These files are never written to. A portable document (an explicitly shared
+// edit file that happens to sit there) is not folder truth and is skipped.
+func readBesidePhoto(folderRoot, relPosix string) (*Sidecar, string) {
+	for _, p := range besidePhotoCandidates(folderRoot, relPosix) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		sc, err := Parse(data)
+		if err != nil {
+			continue
+		}
+		if sc.Document == nil {
+			sc.Document = &DocumentMeta{Role: "truth"}
+		}
+		if sc.Document.Role != "truth" {
+			continue
+		}
+		return sc, p
+	}
+	return nil, ""
+}
+
+// ChangeStamp summarizes the modification state of every file Read consults
+// for an asset, so an index can tell when its projection is stale. It equals
+// the canonical sidecar's mtime (0 when absent) while no copy exists beside
+// the photo.
+func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
+	var stamp uint64
+	if canonical, err := CanonicalEditsPath(sidecarRoot, relPosix); err == nil {
+		if info, err := os.Stat(canonical); err == nil {
+			stamp = uint64(info.ModTime().UTC().UnixNano())
+		}
+	}
+	for i, p := range besidePhotoCandidates(folderRoot, relPosix) {
+		if info, err := os.Stat(p); err == nil {
+			// Odd-forced so a present file always perturbs the stamp.
+			mixed := (uint64(info.ModTime().UTC().UnixNano()) ^ (uint64(info.Size()) * 0x9e3779b97f4a7c15)) | 1
+			stamp ^= bits.RotateLeft64(mixed, 7*(i+1))
+		}
+	}
+	return int64(stamp)
 }
 
 var (

@@ -118,13 +118,9 @@ func (idx *Index) indexOneFile(
 	mtimeNs := info.ModTime().UTC().UnixNano()
 	sizeBytes := info.Size()
 
-	// Check if already indexed with matching mtime, size, and sidecar mtime.
-	var sidecarMTimeNs int64
-	if canPath, err := sidecar.CanonicalEditsPath(sidecarRoot, relPosix); err == nil {
-		if sInfo, sErr := os.Stat(canPath); sErr == nil {
-			sidecarMTimeNs = sInfo.ModTime().UTC().UnixNano()
-		}
-	}
+	// Check if already indexed with matching mtime, size, and sidecar state
+	// (the canonical sidecar plus any copy beside the photo).
+	sidecarMTimeNs := sidecar.ChangeStamp(fc.Path, sidecarRoot, relPosix)
 
 	var curSize, curMTime, curSidecarMTime int64
 	err := idx.db.QueryRowContext(ctx,
