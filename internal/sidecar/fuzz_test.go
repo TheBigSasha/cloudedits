@@ -112,3 +112,33 @@ func FuzzSafeJoinRel(f *testing.F) {
 		}
 	})
 }
+
+// FuzzAuxChannelPath checks that no channel name or relative path yields an
+// auxiliary channel path outside the sidecar root or without a recognised
+// channel suffix.
+func FuzzAuxChannelPath(f *testing.F) {
+	for _, c := range []string{"depth", "DEPTH", "depth.png", "../depth", "..", "", "depth/..", "a\\b", "depth\x00", "normal", "d-e_p0"} {
+		f.Add("a/b.jpg", c)
+		f.Add("../../etc/passwd", c)
+	}
+	base := filepath.Join(string(filepath.Separator), "library", "root", ".hdrtoys")
+	f.Fuzz(func(t *testing.T, rel, channel string) {
+		suffix, verr := ValidateAuxChannel(channel)
+		full, err := AuxChannelPath(base, rel, channel)
+		if verr != nil {
+			if err == nil {
+				t.Fatalf("AuxChannelPath accepted channel %q that ValidateAuxChannel rejects", channel)
+			}
+			return
+		}
+		if channel != strings.ToLower(channel) || strings.ContainsAny(channel, "/\\.\x00") || !strings.HasSuffix(suffix, ".png") {
+			t.Fatalf("channel %q validated with suffix %q", channel, suffix)
+		}
+		if err != nil {
+			return
+		}
+		if filepath.Clean(full) != full || !strings.HasPrefix(full, base+string(filepath.Separator)) || !strings.HasSuffix(full, suffix) {
+			t.Fatalf("AuxChannelPath(%q, %q) = %q escapes %q or lacks suffix %q", rel, channel, full, base, suffix)
+		}
+	})
+}
