@@ -65,8 +65,15 @@ func SidecarRoot(folderRoot, folderID, customSidecarDir string) string {
 
 // SafeJoinRel validates a POSIX relative path and joins it under baseDir,
 // preventing any path traversal outside baseDir.
+//
+// A backslash separates path components only where the host filesystem says
+// so (Windows). Elsewhere it is an ordinary filename character: rewriting it
+// to "/" would map the file `x\y.jpg` onto `x/y.jpg`.
 func SafeJoinRel(baseDir, relPosix string) (string, error) {
-	cleaned := path.Clean("/" + strings.ReplaceAll(relPosix, "\\", "/"))
+	if filepath.Separator == '\\' {
+		relPosix = strings.ReplaceAll(relPosix, "\\", "/")
+	}
+	cleaned := path.Clean("/" + relPosix)
 	cleaned = strings.TrimPrefix(cleaned, "/")
 	if cleaned == "" || cleaned == "." || strings.HasPrefix(cleaned, "..") {
 		return "", fmt.Errorf("invalid relative path %q", relPosix)

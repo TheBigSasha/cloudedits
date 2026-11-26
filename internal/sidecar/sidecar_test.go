@@ -227,3 +227,33 @@ func TestExtractVerdictsAcceptsIntegerValuedRatingLiterals(t *testing.T) {
 		}
 	}
 }
+
+// On POSIX filesystems a backslash is an ordinary filename character. Mapping
+// it to "/" made `x\y.jpg` and `x/y.jpg` share one sidecar (and resolved the
+// former's bytes to the latter's file).
+func TestSafeJoinRelKeepsBackslashNamesDistinctOnPOSIX(t *testing.T) {
+	if filepath.Separator != '/' {
+		t.Skip("backslash is a path separator on this platform")
+	}
+	base := t.TempDir()
+	flat, err := SafeJoinRel(base, `x\y.jpg`)
+	if err != nil {
+		t.Fatalf("SafeJoinRel backslash name: %v", err)
+	}
+	nested, err := SafeJoinRel(base, "x/y.jpg")
+	if err != nil {
+		t.Fatalf("SafeJoinRel nested name: %v", err)
+	}
+	if flat == nested {
+		t.Fatalf(`x\y.jpg and x/y.jpg both map to %s`, flat)
+	}
+	if want := filepath.Join(base, `x\y.jpg`); flat != want {
+		t.Fatalf("backslash name mapped to %s, want %s", flat, want)
+	}
+	// Neither separator style may ever resolve outside the base directory.
+	for _, rel := range []string{"../escape", "a/../../escape", `..\..\escape`, `a\..\..\escape`, "", ".", "/"} {
+		if got, err := SafeJoinRel(base, rel); err == nil && !strings.HasPrefix(got, base+string(filepath.Separator)) {
+			t.Fatalf("SafeJoinRel(%q) escaped to %s", rel, got)
+		}
+	}
+}
