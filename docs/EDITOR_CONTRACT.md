@@ -96,7 +96,7 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 - `flag`: `pick`, `reject`, `any` (any flagged), or `none`
 - `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`), `any` (any labeled), or `none`
 - `keyword`: repeatable (`&keyword=tokyo&keyword=night`), matched with logical AND
-- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image`, `photo` (every non-RAW asset), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
+- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image` / `photo` (every non-RAW asset), `ultrahdr` (assets with an UltraHDR gain map), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
 - `folder`: folder ID or folder label filter
 - `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`); the single-token forms `<field>_asc` / `<field>_desc` (for example `name_asc`, `rating_desc`) are accepted as well
 - `dir`: `asc` or `desc` (default `desc`; overrides a `sort` token suffix)

@@ -21,14 +21,40 @@ func TestSupportedFormatsAndExclusions(t *testing.T) {
 	}
 
 	rawCount := 0
+	wantNonRAW := map[string]string{
+		"photo.jpg":  "jpeg",
+		"PHOTO.JPEG": "jpeg",
+		"a.png":      "png",
+		"b.webp":     "image",
+		"c.avif":     "image",
+		"d.jxl":      "image",
+		"e.heic":     "image",
+		"f.heif":     "image",
+		"g.hif":      "image",
+		"h.tif":      "image",
+		"i.tiff":     "image",
+		"j.exr":      "exr",
+	}
 	for _, f := range supported {
 		if IsRAW(f) {
 			rawCount++
 			if Kind(f) != "raw" {
 				t.Errorf("expected Kind(%q)=raw, got %q", f, Kind(f))
 			}
-		} else if Kind(f) != "image" {
-			t.Errorf("expected Kind(%q)=image, got %q", f, Kind(f))
+			if AssetKind(f, true) != "raw" {
+				t.Errorf("expected AssetKind(%q, true)=raw, got %q", f, AssetKind(f, true))
+			}
+		} else {
+			want := wantNonRAW[f]
+			if Kind(f) != want {
+				t.Errorf("expected Kind(%q)=%q, got %q", f, want, Kind(f))
+			}
+			if AssetKind(f, false) != want {
+				t.Errorf("expected AssetKind(%q, false)=%q, got %q", f, want, AssetKind(f, false))
+			}
+			if AssetKind(f, true) != "ultrahdr" {
+				t.Errorf("expected AssetKind(%q, true)=ultrahdr, got %q", f, AssetKind(f, true))
+			}
 		}
 	}
 	if rawCount != 20 {

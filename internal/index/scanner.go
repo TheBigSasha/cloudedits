@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -65,8 +66,10 @@ type assetRow struct {
 	stamp                 fileStamp
 	sourceRev             string
 	width, height         int
+	orientation           int
 	hasGainMap            bool
 	capturedAt            string
+	exifJSON              string
 	sidecar               sidecarView
 	// known is true when the asset was indexed before this scan; prev is the
 	// stamp the index held for it.
@@ -283,17 +286,34 @@ func (idx *Index) buildRow(
 	info fs.FileInfo,
 ) assetRow {
 	width, height, hasGainMap := thumb.ProbeImageHeader(absPath)
+	exifMeta := thumb.ProbeEXIF(absPath)
+	capturedAt := exifMeta.CapturedAt
+	if capturedAt == "" {
+		capturedAt = info.ModTime().UTC().Format(time.RFC3339Nano)
+	}
+	orientation := exifMeta.Orientation
+	if orientation < 1 || orientation > 8 {
+		orientation = 1
+	}
+	exifJSON := "{}"
+	if len(exifMeta.Fields) > 0 {
+		if b, err := json.Marshal(exifMeta.Fields); err == nil {
+			exifJSON = string(b)
+		}
+	}
 	return assetRow{
-		id:         assetID,
-		relPosix:   relPosix,
-		absPath:    absPath,
-		stamp:      stamp,
-		sourceRev:  computeSourceRevision(absPath, stamp.sizeBytes, stamp.mtimeNs),
-		width:      width,
-		height:     height,
-		hasGainMap: hasGainMap,
-		capturedAt: info.ModTime().UTC().Format(time.RFC3339Nano),
-		sidecar:    idx.readSidecarView(fc.Path, sidecarRoot, relPosix),
+		id:          assetID,
+		relPosix:    relPosix,
+		absPath:     absPath,
+		stamp:       stamp,
+		sourceRev:   computeSourceRevision(absPath, stamp.sizeBytes, stamp.mtimeNs),
+		width:       width,
+		height:      height,
+		orientation: orientation,
+		hasGainMap:  hasGainMap,
+		capturedAt:  capturedAt,
+		exifJSON:    exifJSON,
+		sidecar:     idx.readSidecarView(fc.Path, sidecarRoot, relPosix),
 	}
 }
 
@@ -349,24 +369,28 @@ func (idx *Index) upsertRows(ctx context.Context, fc config.FolderConfig, sideca
 				content_hash, source_revision, width, height, orientation, has_gain_map,
 				captured_at, imported_at, edited_at, rating, flag, color_label,
 				edited_by_hdrtoys, exif_json, sidecar_mtime_ns
-			) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)
+			) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
+				kind = excluded.kind,
 				size_bytes = excluded.size_bytes,
 				mtime_ns = excluded.mtime_ns,
 				content_hash = CASE WHEN excluded.content_hash != '' THEN excluded.content_hash ELSE assets.content_hash END,
 				source_revision = excluded.source_revision,
 				width = excluded.width,
 				height = excluded.height,
+				orientation = excluded.orientation,
 				has_gain_map = excluded.has_gain_map,
+				captured_at = excluded.captured_at,
 				edited_at = excluded.edited_at,
 				rating = excluded.rating,
 				flag = excluded.flag,
 				color_label = excluded.color_label,
 				edited_by_hdrtoys = excluded.edited_by_hdrtoys,
+				exif_json = excluded.exif_json,
 				sidecar_mtime_ns = excluded.sidecar_mtime_ns`,
-			row.id, fc.ID, row.relPosix, filepath.Base(row.absPath), formats.Kind(row.absPath), formats.MIME(row.absPath),
-			row.stamp.sizeBytes, row.stamp.mtimeNs, sc.hash, row.sourceRev, row.width, row.height, boolInt(row.hasGainMap),
-			row.capturedAt, nowStr, sc.editedAt, sc.rating, sc.flag, sc.label, boolInt(sc.edited), row.stamp.sidecarMtimeNs,
+			row.id, fc.ID, row.relPosix, filepath.Base(row.absPath), formats.AssetKind(row.absPath, row.hasGainMap), formats.MIME(row.absPath),
+			row.stamp.sizeBytes, row.stamp.mtimeNs, sc.hash, row.sourceRev, row.width, row.height, row.orientation, boolInt(row.hasGainMap),
+			row.capturedAt, nowStr, sc.editedAt, sc.rating, sc.flag, sc.label, boolInt(sc.edited), row.exifJSON, row.stamp.sidecarMtimeNs,
 		); err != nil {
 			return nil, fmt.Errorf("index %s: %w", row.relPosix, err)
 		}
