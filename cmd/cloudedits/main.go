@@ -392,10 +392,7 @@ func cmdServe(args []string) int {
 		return exitStorage
 	}
 
-	httpSrv := &http.Server{
-		Handler:           apiSrv,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	httpSrv := newHTTPServer(apiSrv)
 
 	go func() {
 		<-ctx.Done()
@@ -741,10 +738,7 @@ func cmdGUI(args []string) int {
 		pubURL:  "http://" + listenAddr,
 		indexed: indexed,
 	}
-	srv := &http.Server{
-		Handler:           setupui.Handler(state),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newHTTPServer(setupui.Handler(state))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -797,6 +791,19 @@ func openBrowser(rawURL string) error {
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// newHTTPServer returns an http.Server with the connection limits every
+// cloudedits listener needs. Header reads are bounded against slow-header
+// clients and idle keep-alive connections are reaped, so a peer cannot pin
+// file descriptors indefinitely. Body reads and response writes stay
+// unbounded in time because originals and renders are legitimately large.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 }
 
 // checkTestBuildExposure refuses to serve a dev_apis test build beyond loopback
