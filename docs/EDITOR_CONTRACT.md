@@ -7,11 +7,27 @@
 Every HTTP response (JSON, binary blobs, redirects, and errors) includes:
 
 - `Cross-Origin-Resource-Policy: cross-origin`
-- `Access-Control-Allow-Origin` (reflecting allowed origin or `*`)
-- `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
-- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile`
-- `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing`
+- `X-Content-Type-Options: nosniff`
+- `Vary: Origin`
 - `Server-Timing: app;dur=<ms>`
+
+Responses to a request whose `Origin` is allowed additionally include:
+
+- `Access-Control-Allow-Origin: <that origin>` (never `*`, never an origin that is not on the allowlist)
+- `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
+- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id`
+- `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing`
+- `Access-Control-Allow-Private-Network: true` on a preflight that asks for it
+
+## Origin Law
+
+A server that authenticates by network position (loopback, tailnet identity) MUST NOT serve requests on behalf of arbitrary web pages: the browser attaches that position to every request, whichever page issued it.
+
+1. A request carrying an `Origin` header that is not on the allowlist is refused with `403` `origin-not-allowed` before routing or authentication, for every method including `OPTIONS`. Omitting CORS headers is not sufficient: a `text/plain` `POST` needs no preflight.
+2. The allowlist is the editor origin (`https://hdr.toys`), the server's own public URL, and any origin configured with `--allow-origin` (or `allowedOrigins` in `config.json`). `https://*.example.com` matches subdomains; `*` disables enforcement.
+3. A loopback origin (`http://localhost:<port>`, `http://127.0.0.1:<port>`, `http://[::1]:<port>`) is allowed only when the request itself arrives directly over loopback.
+4. Requests without an `Origin` header (non-browser clients, navigations, `<img>` loads) are not subject to the allowlist and receive no CORS headers.
+5. Loopback trust requires a direct loopback connection whose `Host` header names the local machine (`localhost`, `*.localhost`, or a loopback IP) and which carries no `Forwarded` / `X-Forwarded-For` / `X-Forwarded-Host` / `X-Real-IP` header. DNS-rebound and reverse-proxied requests must present a bearer token.
 
 ## Original Blob Streaming Law (`?tier=original`)
 

@@ -249,6 +249,8 @@ func cmdServe(args []string) int {
 	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token")
 	publicURL := fs.String("public-url", "", "override public base URL for redirects and handoff links")
 	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
+	var allowOrigins stringSliceFlag
+	fs.Var(&allowOrigins, "allow-origin", "additional browser origin allowed to call the API, e.g. https://preview.example or https://*.example.com (repeatable; the hdr.toys editor and this server's own URL are always allowed)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -363,15 +365,16 @@ func cmdServe(args []string) int {
 	}
 
 	apiSrv, err := api.New(api.Options{
-		LibraryID:     cfg.LibraryID,
-		LibraryName:   cfg.LibraryName,
-		ScratchName:   *scratchName,
-		PublicBaseURL: pubURL,
-		Index:         idx,
-		Thumbs:        thumb.NewService(filepath.Join(cfg.DataDir, "thumbs"), 0),
-		Handoffs:      handoff.NewStore(5 * time.Minute),
-		Auth:          authenticator,
-		Sessions:      sessions,
+		LibraryID:      cfg.LibraryID,
+		LibraryName:    cfg.LibraryName,
+		ScratchName:    *scratchName,
+		PublicBaseURL:  pubURL,
+		AllowedOrigins: append(append([]string{}, cfg.AllowedOrigins...), allowOrigins...),
+		Index:          idx,
+		Thumbs:         thumb.NewService(filepath.Join(cfg.DataDir, "thumbs"), 0),
+		Handoffs:       handoff.NewStore(5 * time.Minute),
+		Auth:           authenticator,
+		Sessions:       sessions,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init API server: %v\n", err)

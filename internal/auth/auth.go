@@ -340,8 +340,10 @@ func (a *CompositeAuthenticator) Authenticate(r *http.Request) (*Principal, erro
 		}
 	}
 
-	// 4. Explicit loopback mode (local dev / CLI / single-host setup).
-	if a.AllowLoopback && IsLoopbackRemoteAddr(r.RemoteAddr) {
+	// 4. Explicit loopback mode (local dev / CLI / single-host setup). Ambient
+	// trust is granted only to direct loopback connections addressed to a
+	// loopback Host, never to DNS-rebound or reverse-proxied requests.
+	if a.AllowLoopback && IsTrustedLoopbackRequest(r) {
 		return OwnerPrincipal("loopback:local"), nil
 	}
 
@@ -368,4 +370,46 @@ func IsLoopbackRemoteAddr(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// IsLoopbackHost reports whether hostport (a Host header or URL host, with or
+// without a port) names the local machine: a loopback IP literal, "localhost",
+// or a "*.localhost" name.
+func IsLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// forwardingHeaders are set by reverse proxies. Their presence means the TCP
+// peer is a local proxy relaying someone else's request, so the loopback
+// source address says nothing about who the caller is.
+var forwardingHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip"}
+
+// IsTrustedLoopbackRequest reports whether r may be granted ambient
+// local-machine trust. All three must hold:
+//   - the TCP peer is a loopback address;
+//   - the Host header names the local machine, which defeats DNS rebinding
+//     (a hostile site resolving its own name to 127.0.0.1 still sends its own
+//     name as Host);
+//   - no reverse-proxy forwarding header is present, so a local proxy or
+//     tunnel exposing the port does not turn every remote caller into the
+//     local owner.
+func IsTrustedLoopbackRequest(r *http.Request) bool {
+	if r == nil || !IsLoopbackRemoteAddr(r.RemoteAddr) || !IsLoopbackHost(r.Host) {
+		return false
+	}
+	for _, h := range forwardingHeaders {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	return true
 }

@@ -23,16 +23,17 @@ type FolderConfig struct {
 
 // Config is persisted in <dataDir>/config.json.
 type Config struct {
-	LibraryID    string         `json:"libraryId"`
-	LibraryName  string         `json:"libraryName"`
-	Hostname     string         `json:"hostname"`
-	DataDir      string         `json:"dataDir"`
-	SidecarDir   string         `json:"sidecarDir,omitempty"`
-	AuthMode     string         `json:"authMode"` // "tailnet" | "token" | "loopback"
-	BearerToken  string         `json:"bearerToken,omitempty"`
-	ListenAddr   string         `json:"listenAddr,omitempty"`
-	Folders      []FolderConfig `json:"folders"`
-	AllowedHosts []string       `json:"allowedOrigins,omitempty"`
+	LibraryID   string         `json:"libraryId"`
+	LibraryName string         `json:"libraryName"`
+	Hostname    string         `json:"hostname"`
+	DataDir     string         `json:"dataDir"`
+	SidecarDir  string         `json:"sidecarDir,omitempty"`
+	AuthMode    string         `json:"authMode"` // "tailnet" | "token" | "loopback"
+	BearerToken string         `json:"bearerToken,omitempty"`
+	ListenAddr  string         `json:"listenAddr,omitempty"`
+	Folders     []FolderConfig `json:"folders"`
+	// AllowedOrigins lists extra browser origins allowed to call the API.
+	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
 }
 
 // DefaultDataDir returns the OS-standard directory outside photo folders where
