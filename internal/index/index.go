@@ -1027,38 +1027,18 @@ func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID,
 
 func syncAssetFromSidecarTx(ctx context.Context, tx *sql.Tx, assetID string, sc *sidecar.Sidecar) error {
 	rating, flag, label, keywords, edited := sidecar.ExtractVerdicts(sc)
-	editedInt := 0
-	editedAt := ""
-	if edited {
-		editedInt = 1
-	}
-	if latest := sidecar.LatestHLC(sc); latest != "" {
-		if p, err := hlc.Parse(latest); err == nil {
-			editedAt = time.UnixMilli(int64(p.Millis)).UTC().Format(time.RFC3339Nano)
-		}
-	}
+	editedAt := editedAtOf(sc)
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE assets
 		SET rating = ?, flag = ?, color_label = ?, edited_by_hdrtoys = ?,
 		    edited_at = CASE WHEN ? != '' THEN ? ELSE edited_at END
 		WHERE id = ?`,
-		rating, flag, label, editedInt, editedAt, editedAt, assetID,
+		rating, flag, label, boolInt(edited), editedAt, editedAt, assetID,
 	); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM asset_keywords WHERE asset_id = ?`, assetID); err != nil {
-		return err
-	}
-	for _, kw := range keywords {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO asset_keywords(asset_id, keyword) VALUES(?, ?)`,
-			assetID, kw,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	return replaceKeywordsTx(ctx, tx, assetID, keywords)
 }
 
 // ChangesSince returns all applied journaled ops after sinceCursor and the
