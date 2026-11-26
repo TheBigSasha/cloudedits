@@ -63,3 +63,21 @@ func TestJPEGMagic(t *testing.T) {
 		t.Fatal("truncated bytes must not match JPEG magic")
 	}
 }
+
+// An editor that keeps its artifacts beside the photos writes the edited
+// preview as "<photo>.edit_thumbnail.jpg". It is a derived preview of another
+// asset, never a photo of its own.
+func TestEditThumbnailBesidePhotoIsNotAnAsset(t *testing.T) {
+	for _, name := range []string{"IMG_0001.JPG.edit_thumbnail.jpg", "IMG_0001.ARW.EDIT_THUMBNAIL.JPG", "DCIM/a.jpg.edit_thumbnail.jpg"} {
+		if IsSupportedFile(name) {
+			t.Errorf("%q is an edited-preview artifact but was accepted as a photo", name)
+		}
+	}
+	// With nothing before the suffix there is no source photo, so it is an
+	// ordinary file.
+	for _, name := range []string{".edit_thumbnail.jpg.png", "edit_thumbnail.jpg", "IMG_0001.JPG"} {
+		if got, want := IsSupportedFile(name), name != ".edit_thumbnail.jpg.png"; got != want {
+			t.Errorf("IsSupportedFile(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
