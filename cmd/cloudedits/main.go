@@ -292,16 +292,6 @@ func cmdServe(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Perform initial scan synchronously for small libraries or immediately start serving.
-	if err := idx.ScanAll(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintf(os.Stderr, "initial scan warning: %v\n", err)
-	}
-	if !*noWatch {
-		if err := idx.StartWatcher(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "watcher warning: %v\n", err)
-		}
-	}
-
 	sessions := auth.NewSessionManager(30 * time.Minute)
 	authenticator := &auth.CompositeAuthenticator{
 		Sessions:      sessions,
@@ -378,29 +368,85 @@ func cmdServe(args []string) int {
 		return exitStorage
 	}
 
-	httpSrv := &http.Server{
-		Handler:           apiSrv,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(shutCtx)
-	}()
-
+	logf := func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
 	cnt, _ := idx.Count(ctx, index.Filter{})
 	if tsNode != nil && tsNode.TailscaleIP() != "" {
-		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (Tailscale IP %s, %d assets, %d folders)\n", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
+		logf("cloudedits %s serving %s (Tailscale IP %s, %d assets already indexed, %d folders)", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
 	} else {
-		fmt.Fprintf(os.Stderr, "cloudedits %s serving %s (%d assets, %d folders)\n", version, pubURL, cnt, len(cfg.Folders))
+		logf("cloudedits %s serving %s (%d assets already indexed, %d folders)", version, pubURL, cnt, len(cfg.Folders))
 	}
-	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Fprintf(os.Stderr, "serve error: %v\n", err)
+	if err := serveUntilDone(ctx, ln, apiSrv, idx, !*noWatch, logf); err != nil {
+		logf("serve error: %v", err)
 		return exitStorage
 	}
 	return exitOK
+}
+
+// backgroundIndexer is the part of the index that serve keeps current while
+// the HTTP API is already answering.
+type backgroundIndexer interface {
+	ScanAll(ctx context.Context) error
+	StartWatcher(ctx context.Context) error
+}
+
+// shutdownGrace bounds how long in-flight requests may run after a stop signal.
+const shutdownGrace = 5 * time.Second
+
+// serveUntilDone serves handler on ln at once and brings the index up to date
+// in the background, so the size of the library never delays the first
+// response: requests are answered from the persisted index while the rescan
+// runs. It returns only after ctx is cancelled (or the listener failed),
+// in-flight requests have drained within shutdownGrace, and the background
+// scan has stopped. The caller may close the index as soon as it returns.
+func serveUntilDone(ctx context.Context, ln net.Listener, handler http.Handler, idx backgroundIndexer, watch bool, logf func(string, ...any)) error {
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	bgCtx, stopBackground := context.WithCancel(ctx)
+	indexed := make(chan struct{})
+	go func() {
+		defer close(indexed)
+		start := time.Now()
+		if err := idx.ScanAll(bgCtx); err != nil {
+			if bgCtx.Err() != nil {
+				return
+			}
+			logf("initial scan warning: %v", err)
+		} else {
+			logf("initial scan finished in %s", time.Since(start).Round(time.Millisecond))
+		}
+		if watch {
+			if err := idx.StartWatcher(bgCtx); err != nil {
+				logf("watcher warning: %v", err)
+			}
+		}
+	}()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	var err error
+	select {
+	case err = <-serveErr:
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
+			// Requests still running after the grace period (for example a
+			// long original download) are cut off rather than left to race
+			// the index close.
+			_ = srv.Close()
+		}
+		cancel()
+		err = <-serveErr
+	}
+	stopBackground()
+	<-indexed
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func cmdStatus(args []string) int {
