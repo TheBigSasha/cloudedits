@@ -48,8 +48,10 @@ func TestCLISubcommands(t *testing.T) {
 	if code := run([]string{"status", "--data-dir", dataDir, "--json"}); code != exitOK {
 		t.Fatalf("status exited %d", code)
 	}
-	if code := run([]string{"doctor", "--data-dir", dataDir, "--json"}); code != exitOK {
-		t.Fatalf("doctor exited %d", code)
+	// A library that has not joined a tailnet and is not serving needs
+	// action from the user.
+	if code := run([]string{"doctor", "--data-dir", dataDir, "--json"}); code != exitActionRequired {
+		t.Fatalf("doctor exited %d, want %d", code, exitActionRequired)
 	}
 	if code := run([]string{"folders", "list", "--data-dir", dataDir, "--json"}); code != exitOK {
 		t.Fatalf("folders list exited %d", code)

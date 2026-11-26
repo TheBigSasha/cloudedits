@@ -1,18 +1,24 @@
 package setupui
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/thebigsasha/cloudedits/internal/config"
 )
 
 type stubState struct {
-	cfg *config.Config
+	mu        sync.Mutex
+	cfg       *config.Config
+	server    ServerState
+	connectFn func(ctx context.Context, key string, phase func(Phase)) (ConnectResult, error)
+	changed   int
 }
 
 func (s *stubState) GetConfig() *config.Config { return s.cfg }
@@ -22,6 +28,22 @@ func (s *stubState) SaveConfig(c *config.Config) error {
 }
 func (s *stubState) PublicURL() string { return "https://library.example.ts.net" }
 func (s *stubState) IndexedCount() int { return 42 }
+func (s *stubState) Server(context.Context) ServerState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.server
+}
+func (s *stubState) Connect(ctx context.Context, key string, phase func(Phase)) (ConnectResult, error) {
+	if s.connectFn == nil {
+		return ConnectResult{}, nil
+	}
+	return s.connectFn(ctx, key, phase)
+}
+func (s *stubState) ConfigChanged(context.Context) {
+	s.mu.Lock()
+	s.changed++
+	s.mu.Unlock()
+}
 
 func TestSetupUIEndpoints(t *testing.T) {
 	st := &stubState{cfg: config.Default(t.TempDir())}

@@ -20,8 +20,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -H -u 10001 cloudedits && \
-    mkdir -p /data /library && \
-    chown -R cloudedits:cloudedits /data
+    mkdir -p /data /data/sidecars /library && \
+    chown -R cloudedits:cloudedits /data && \
+    chmod 1777 /data /data/sidecars
 
 COPY --from=builder /out/cloudedits /usr/local/bin/cloudedits
 

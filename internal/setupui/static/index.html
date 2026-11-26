@@ -3,16 +3,38 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
   <title>cloudedits setup</title>
   <style>
     :root {
-      --bg: #0f1115;
-      --card: #171a21;
-      --border: #2a303c;
-      --text: #eceff4;
-      --muted: #9aa4b2;
-      --accent: #e5a93c;
-      --accent-ink: #111318;
+      --bg: #f4f5f7;
+      --card: #ffffff;
+      --border: #d5d9e0;
+      --text: #15181e;
+      --muted: #555f6d;
+      --field: #ffffff;
+      --button: #eceef2;
+      --accent: #b9770e;
+      --accent-ink: #ffffff;
+      --ok: #1d7a3a;
+      --warn: #9a5b00;
+      --error: #b3261e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1115;
+        --card: #171a21;
+        --border: #2a303c;
+        --text: #eceff4;
+        --muted: #9aa4b2;
+        --field: #0d1016;
+        --button: #232834;
+        --accent: #e5a93c;
+        --accent-ink: #111318;
+        --ok: #5cc27e;
+        --warn: #e5a93c;
+        --error: #ff8a80;
+      }
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }
@@ -44,9 +66,11 @@
       margin-bottom: 10px;
     }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    input[type="text"] {
+    .row + .row, .row + div { margin-top: 10px; }
+    input[type="text"], input[type="password"] {
       flex: 1 1 240px;
-      background: #0d1016;
+      min-width: 0;
+      background: var(--field);
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -61,30 +85,34 @@
       padding: 9px 14px;
       border-radius: 8px;
       border: 1px solid var(--border);
-      background: #232834;
+      background: var(--button);
       color: var(--text);
       text-decoration: none;
       font-size: 0.9rem;
       cursor: pointer;
     }
+    button:disabled { opacity: 0.55; cursor: default; }
     button.primary, a.btn.primary {
       background: var(--accent);
       color: var(--accent-ink);
       border-color: var(--accent);
       font-weight: 600;
     }
+    a { color: var(--accent); }
     ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); }
-    .qr-wrap { width: 180px; height: 180px; background: #fff; padding: 8px; border-radius: 10px; }
+    .steps { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 0.88rem; }
+    .qr-wrap { width: 180px; height: 180px; background: #fff; padding: 8px; border-radius: 10px; flex: 0 0 auto; }
     .qr-wrap svg { width: 100%; height: 100%; display: block; }
     code {
-      background: #0d1016;
+      background: var(--field);
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 2px 6px;
       font-size: 0.85rem;
+      overflow-wrap: anywhere;
     }
     pre {
-      background: #0d1016;
+      background: var(--field);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 10px 12px;
@@ -93,6 +121,11 @@
       margin: 8px 0 0;
     }
     .muted { color: var(--muted); font-size: 0.88rem; }
+    .status { margin: 10px 0 0; font-size: 0.9rem; overflow-wrap: anywhere; }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.error { color: var(--error); }
+    .link { font-size: 1rem; }
   </style>
 </head>
 <body>
@@ -103,119 +136,192 @@
     </header>
 
     <section class="card">
-      <h2>1. Photo Folders</h2>
+      <h2>1. Photo folders</h2>
       <div class="badge">Source files are strictly read-only. Edits save to .hdrtoys/</div>
       <div class="row">
-        <input id="folderPath" type="text" placeholder="/Users/you/Pictures" />
+        <input id="folderPath" type="text" placeholder="/Users/you/Pictures" aria-label="Folder path" />
         <button id="addFolderBtn" class="primary">Add folder</button>
       </div>
       <ul id="folderList"></ul>
     </section>
 
     <section class="card">
-      <h2>2. Tailscale Library Node (Required — Server-Level)</h2>
-      <div class="badge">Runs embedded inside cloudedits via a pre-approved auth token — not system-wide</div>
-      <div class="row" style="margin-bottom: 10px;">
-        <input id="hostname" type="text" placeholder="library" />
-        <button id="saveHostBtn">Save hostname</button>
-      </div>
+      <h2>2. Tailscale</h2>
+      <div class="badge">The library joins your tailnet as its own device</div>
       <div class="row">
-        <a class="btn" href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">Get pre-approved auth token from Tailscale</a>
-        <a class="btn" href="https://login.tailscale.com/admin/dns" target="_blank" rel="noopener noreferrer">Enable MagicDNS &amp; HTTPS</a>
+        <input id="hostname" type="text" placeholder="library" aria-label="Device name" />
+        <button id="saveHostBtn">Save name</button>
       </div>
+      <div id="keyForm">
+        <div class="row">
+          <input id="authKey" type="password" placeholder="tskey-auth-…" autocomplete="off" spellcheck="false" aria-label="Tailscale auth key" />
+          <button id="connectBtn" class="primary">Connect</button>
+        </div>
+        <ol class="steps">
+          <li>Create an auth key at <a href="https://login.tailscale.com/admin/settings/keys" target="_blank" rel="noopener noreferrer">Tailscale → Settings → Keys</a>. Leave Ephemeral off. If device approval is on, turn on Pre-approved.</li>
+          <li>Turn on MagicDNS and HTTPS Certificates in <a href="https://login.tailscale.com/admin/dns" target="_blank" rel="noopener noreferrer">DNS settings</a>.</li>
+          <li>Paste the key and connect. It is used once to join and is not saved.</li>
+        </ol>
+      </div>
+      <div id="startForm" class="row" hidden>
+        <button id="startBtn" class="primary">Start library</button>
+      </div>
+      <p id="connectStatus" class="status" hidden></p>
       <p class="muted" style="margin-top: 10px;">
-        Your library joins your tailnet directly at its MagicDNS URL (<code>https://library.&lt;tailnet&gt;.ts.net</code>) and Tailscale IP (<code>100.x.y.z</code>) without installing system-wide Tailscale on the host.
-        Run <code>cloudedits setup --hostname library --tailscale-auth-key-stdin</code> or start with <code>TS_AUTHKEY=... cloudedits serve --tsnet</code>.
-      </p>
-      <p class="muted" style="margin-top: 8px;">
         We try to keep cloudedits secure, but it's only as secure as your Tailscale setup and is written using AI tools, so use it with caution.
       </p>
     </section>
 
     <section class="card">
-      <h2>3. Connect from Phone or Desktop</h2>
+      <h2>3. Open on your phone or computer</h2>
       <div class="row" style="align-items: flex-start; gap: 18px;">
         <div class="qr-wrap" id="qrBox" hidden></div>
-        <div style="flex: 1 1 260px;">
-          <p style="margin-top: 0;">Library URL: <code id="pubUrl">loading...</code></p>
+        <div style="flex: 1 1 260px; min-width: 0;">
+          <p class="link" style="margin-top: 0;"><code id="pubUrl">loading…</code></p>
+          <p id="serverStatus" class="status" hidden></p>
           <p class="muted">Indexed photos: <strong id="indexedCount">0</strong></p>
+          <p id="openNote" class="muted" hidden>Opens on devices signed in to the same tailnet.</p>
           <a id="openHdrToys" class="btn primary" href="https://hdr.toys" target="_blank" rel="noopener noreferrer" hidden>Open in hdr.toys</a>
         </div>
       </div>
     </section>
 
     <section class="card">
-      <h2>4. Next Steps — Use with AI Agents</h2>
+      <h2>4. Next steps — use with AI agents</h2>
       <p class="muted" style="margin: 0 0 8px;">
         Connect interactive browser agents or headless CLI workflows to this library. See
-        <a href="https://hdr.toys/agents" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">https://hdr.toys/agents</a>.
+        <a href="https://hdr.toys/agents" target="_blank" rel="noopener noreferrer">https://hdr.toys/agents</a>.
       </p>
-      <pre id="agentSnippet">cloudedits status --json</pre>
+      <pre id="agentSnippet">cloudedits doctor --json
+cloudedits qr</pre>
     </section>
   </main>
 
   <script>
-    async function refresh() {
-      const res = await fetch('/api/state');
-      const data = await res.json();
-      const hostInput = document.getElementById('hostname');
-      if (document.activeElement !== hostInput) hostInput.value = data.hostname || 'library';
-      document.getElementById('indexedCount').textContent = String(data.indexedCount || 0);
-      // The library has a URL other devices can open only once step 2 is done.
-      const pubUrl = data.publicUrl || '';
-      const qrBox = document.getElementById('qrBox');
-      const openLink = document.getElementById('openHdrToys');
-      document.getElementById('pubUrl').textContent = pubUrl || 'not on your tailnet yet (finish step 2)';
-      qrBox.hidden = !pubUrl || !data.qrSvg;
-      qrBox.innerHTML = pubUrl ? (data.qrSvg || '') : '';
-      openLink.hidden = !pubUrl;
-      if (pubUrl) {
-        openLink.href =
-          'https://hdr.toys/?gallery_api_url=' + encodeURIComponent(pubUrl) +
-          '&gallery_name=' + encodeURIComponent(data.libraryName || 'Cloud Library');
-      }
-      document.getElementById('agentSnippet').textContent =
-        'cloudedits doctor --json\ncloudedits qr';
+    const $ = (id) => document.getElementById(id);
+    const phaseText = { joining: 'Joining your tailnet…', starting: 'Starting the library…' };
+    // A request the wizard refused (for example a mistyped key) stays shown
+    // until the next attempt.
+    let refused = '';
 
-      const list = document.getElementById('folderList');
+    function setStatus(el, text, kind) {
+      el.hidden = !text;
+      el.textContent = text || '';
+      el.className = 'status' + (kind ? ' ' + kind : '');
+    }
+
+    function render(data) {
+      const hostInput = $('hostname');
+      if (document.activeElement !== hostInput) hostInput.value = data.hostname || 'library';
+
+      const list = $('folderList');
       list.innerHTML = '';
       for (const f of (data.folders || [])) {
         const li = document.createElement('li');
         li.textContent = f.label + ' — ' + f.path;
         list.appendChild(li);
       }
+
+      const srv = data.server || {};
+      const job = data.connect || {};
+      const serving = srv.running && srv.state === 'serving';
+
+      $('keyForm').hidden = !!srv.enrolled && job.phase !== 'failed';
+      $('startForm').hidden = !srv.enrolled || srv.running || !!job.running;
+      $('connectBtn').disabled = !!job.running;
+      $('startBtn').disabled = !!job.running;
+
+      const st = $('connectStatus');
+      if (job.running) {
+        setStatus(st, phaseText[job.phase] || 'Working…', '');
+      } else if (refused) {
+        setStatus(st, refused, 'error');
+      } else if (job.phase === 'failed') {
+        setStatus(st, job.error, 'error');
+      } else if (job.actionRequired && !serving) {
+        setStatus(st, job.actionRequired, 'warn');
+      } else if (srv.enrolled) {
+        setStatus(st, 'Joined your tailnet.', 'ok');
+      } else {
+        setStatus(st, '', '');
+      }
+
+      // The library's own address redirects to hdr.toys with the library
+      // selected, so the link, the QR code and the button are one URL.
+      const pubUrl = data.publicUrl || '';
+      const ready = serving && !!pubUrl;
+      $('pubUrl').textContent = pubUrl || 'not on your tailnet yet';
+      $('qrBox').hidden = !ready || !data.qrSvg;
+      $('qrBox').innerHTML = ready ? (data.qrSvg || '') : '';
+      $('openHdrToys').hidden = !ready;
+      $('openNote').hidden = !ready;
+      if (ready) $('openHdrToys').href = pubUrl;
+      $('indexedCount').textContent = String(data.indexedCount || 0);
+
+      const ss = $('serverStatus');
+      if (serving && srv.https && !srv.https.ok) {
+        setStatus(ss, 'HTTPS: ' + srv.https.detail, 'warn');
+      } else if (serving && srv.magicDns && !srv.magicDns.ok) {
+        setStatus(ss, 'MagicDNS: ' + srv.magicDns.detail, 'warn');
+      } else if (serving) {
+        setStatus(ss, srv.serviceInstalled ? 'Running. Starts again at login.' : 'Running.', 'ok');
+      } else if (srv.running) {
+        setStatus(ss, 'Starting…', '');
+      } else if (srv.enrolled && srv.error) {
+        setStatus(ss, srv.error, 'error');
+      } else if (srv.enrolled) {
+        setStatus(ss, 'Not running.', '');
+      } else {
+        setStatus(ss, '', '');
+      }
     }
 
-    document.getElementById('addFolderBtn').addEventListener('click', async () => {
-      const path = document.getElementById('folderPath').value.trim();
-      if (!path) return;
-      const res = await fetch('/api/folders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path })
-      });
-      if (res.ok) {
-        document.getElementById('folderPath').value = '';
-        await refresh();
-      } else {
-        const err = await res.json();
-        alert(err.error || 'Failed to add folder');
-      }
-    });
+    async function refresh() {
+      const res = await fetch('/api/state');
+      render(await res.json());
+    }
 
-    document.getElementById('saveHostBtn').addEventListener('click', async () => {
-      const hostname = document.getElementById('hostname').value.trim();
-      await fetch('/api/config', {
+    async function post(path, body) {
+      const res = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hostname })
+        body: JSON.stringify(body)
       });
+      let data = {};
+      try { data = await res.json(); } catch (e) { data = {}; }
+      return { ok: res.ok, data };
+    }
+
+    $('addFolderBtn').addEventListener('click', async () => {
+      const path = $('folderPath').value.trim();
+      if (!path) return;
+      const { ok, data } = await post('/api/folders', { path });
+      if (ok) {
+        $('folderPath').value = '';
+      } else {
+        alert(data.error || 'Failed to add folder');
+      }
       await refresh();
     });
 
+    $('saveHostBtn').addEventListener('click', async () => {
+      await post('/api/config', { hostname: $('hostname').value.trim() });
+      await refresh();
+    });
+
+    async function connect(authKey) {
+      refused = '';
+      const { ok, data } = await post('/api/connect', { authKey });
+      if (ok) $('authKey').value = '';
+      else refused = data.error || 'Could not connect';
+      await refresh();
+    }
+    $('connectBtn').addEventListener('click', () => connect($('authKey').value.trim()));
+    $('authKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') connect($('authKey').value.trim()); });
+    $('startBtn').addEventListener('click', () => connect(''));
+
     refresh();
-    // Step 2 happens in a terminal; pick up its result without a manual reload.
-    setInterval(refresh, 5000);
+    setInterval(refresh, 2000);
   </script>
 </body>
 </html>

@@ -31,6 +31,7 @@ import (
 	"github.com/thebigsasha/cloudedits/internal/handoff"
 	"github.com/thebigsasha/cloudedits/internal/index"
 	"github.com/thebigsasha/cloudedits/internal/qr"
+	"github.com/thebigsasha/cloudedits/internal/runstate"
 	"github.com/thebigsasha/cloudedits/internal/setupui"
 	"github.com/thebigsasha/cloudedits/internal/sidecar"
 	"github.com/thebigsasha/cloudedits/internal/thumb"
@@ -83,6 +84,8 @@ func run(args []string) int {
 		return cmdQR(rest)
 	case "docker-init":
 		return cmdDockerInit(rest)
+	case "service":
+		return cmdService(rest)
 	case "gui":
 		return cmdGUI(rest)
 	case "version", "--version", "-v":
@@ -104,10 +107,11 @@ Usage:
   cloudedits <command> [flags]
 
 Commands:
-  setup        Configure photo folders and Tailscale node (--json supported)
+  setup        Configure photo folders, join the tailnet, optionally --install-service (--json)
   serve        Run the Remote Library HTTP API v1 server (--listen or --tsnet)
+  service      Keep serve running at login: install | uninstall | status (--json)
   status       Show library config, folders, and index summary (--json)
-  doctor       Verify folders, .hdrtoys writability, SQLite WAL, and endpoint health (--json)
+  doctor       Check folders, sidecars, index, tailnet, server, MagicDNS, HTTPS (exit 0/3/4, --json)
   folders      Manage configured photo folders: list | add <dir> | remove <dir|id>
   qr           Print terminal UTF-8 QR code for library or asset (--asset <id>)
   docker-init  Generate docker-compose.yml and .env.example for NAS/Docker
@@ -145,7 +149,8 @@ func cmdSetup(args []string) int {
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "rebuildable index/cache/state directory")
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory for :ro mounts")
 	authKeyStdin := fs.Bool("tailscale-auth-key-stdin", false, "read one-time Tailscale auth key from stdin")
-	_ = fs.Bool("install-service", false, "accepted for compatibility; no service is installed, run the reported serve command under your own service manager")
+	ownerUserID := fs.Int64("owner-user-id", 0, "pin the Tailscale numeric UserID authorized as owner (required for tagged auth keys; also CLOUDEDITS_OWNER_USER_ID)")
+	installSvc := fs.Bool("install-service", false, "install and start a per-user service (launchd, systemd --user or a Task Scheduler logon task) that runs serve with this config")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -164,6 +169,12 @@ func cmdSetup(args []string) int {
 	if strings.TrimSpace(*sidecarDir) != "" {
 		cfg.SidecarDir = strings.TrimSpace(*sidecarDir)
 	}
+	if *ownerUserID < 0 {
+		return failOut(*jsonOut, exitUsage, "--owner-user-id must be a positive Tailscale UserID", nil)
+	}
+	if *ownerUserID > 0 {
+		cfg.OwnerUserID = *ownerUserID
+	}
 	for _, f := range folders {
 		if _, err := cfg.AddFolder(f, ""); err != nil {
 			return failOut(*jsonOut, exitStorage, "invalid folder "+f, err)
@@ -177,46 +188,11 @@ func cmdSetup(args []string) int {
 	if *authKeyStdin {
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		authKey = strings.TrimSpace(line)
+		if authKey == "" {
+			return failOut(*jsonOut, exitUsage, "no auth key on stdin", nil)
+		}
 	} else if envKey := strings.TrimSpace(os.Getenv("TS_AUTHKEY")); envKey != "" {
 		authKey = envKey
-	}
-
-	var fqdn string
-	var tailscaleIP string
-	var actionRequired string
-	if authKey != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer cancel()
-		node, err := tsnetnode.Start(ctx, tsnetnode.Options{
-			Hostname: cfg.Hostname,
-			StateDir: tsnetnode.StateDir(cfg.DataDir),
-			AuthKey:  authKey,
-		})
-		if node != nil {
-			fqdn = node.FQDN()
-			tailscaleIP = node.TailscaleIP()
-			_ = node.Close()
-			if recErr := recordNodeIdentity(cfg.DataDir, fqdn, tailscaleIP); recErr != nil {
-				return failOut(*jsonOut, exitStorage, "save node address failed", recErr)
-			}
-		}
-		if errors.Is(err, tsnetnode.ErrHTTPSNotEnabled) {
-			actionRequired = "Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns"
-			out := map[string]any{
-				"ok":             false,
-				"exitCode":       exitActionRequired,
-				"actionRequired": actionRequired,
-				"hostname":       cfg.Hostname,
-				"fqdn":           fqdn,
-				"tailscaleIp":    tailscaleIP,
-				"folders":        cfg.Folders,
-			}
-			emitOutput(*jsonOut, out, "ACTION REQUIRED: "+actionRequired)
-			return exitActionRequired
-		}
-		if err != nil {
-			return failOut(*jsonOut, exitActionRequired, "Tailscale registration failed", err)
-		}
 	}
 
 	res := map[string]any{
@@ -224,23 +200,81 @@ func cmdSetup(args []string) int {
 		"libraryId":   cfg.LibraryID,
 		"libraryName": cfg.LibraryName,
 		"hostname":    cfg.Hostname,
-		"fqdn":        fqdn,
-		"tailscaleIp": tailscaleIP,
 		"dataDir":     cfg.DataDir,
 		"sidecarDir":  cfg.SidecarDir,
 		"folders":     cfg.Folders,
-		// setup only writes configuration (and enrolls the node when given an
-		// auth key). Nothing is serving until this command runs.
-		"serviceInstalled": false,
-		"serveCommand":     []string{"cloudedits", "serve", "--tsnet", "--data-dir", cfg.DataDir},
 	}
-	if fqdn != "" {
-		res["url"] = "https://" + fqdn
+	code := exitOK
+	var human []string
+	human = append(human, fmt.Sprintf("Configured %d folder(s) in %s (hostname=%s)", len(cfg.Folders), cfg.DataDir, cfg.Hostname))
+
+	if authKey != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		enrolled, err := enrollNode(ctx, cfg, authKey)
+		cancel()
+		if err != nil {
+			return failOut(*jsonOut, exitActionRequired, "Tailscale registration failed", err)
+		}
+		res["fqdn"], res["tailscaleIp"] = enrolled.FQDN, enrolled.TailscaleIP
+		if enrolled.OwnerUserID > 0 {
+			res["ownerUserId"] = enrolled.OwnerUserID
+		}
+		if enrolled.FQDN != "" {
+			res["url"] = "https://" + enrolled.FQDN
+			human = append(human, "Joined the tailnet as https://"+enrolled.FQDN)
+		}
+		if enrolled.Tagged && enrolled.OwnerUserID == 0 {
+			res["warning"] = "enrolled as a tagged Tailscale node with no owner UserID; tailnet peer auth fails closed until --owner-user-id (or CLOUDEDITS_OWNER_USER_ID / --require-token) is configured"
+			human = append(human, "WARNING: tagged Tailscale node has no owner UserID; tailnet peer auth fails closed until --owner-user-id (or --require-token) is set")
+		}
+		if !enrolled.HTTPSEnabled {
+			res["ok"] = false
+			res["actionRequired"] = actionEnableHTTPS
+			code = exitActionRequired
+			human = append(human, "ACTION REQUIRED: "+actionEnableHTTPS)
+		}
 	}
-	emitOutput(*jsonOut, res, fmt.Sprintf(
-		"Configured %d folder(s) in %s (hostname=%s)\nStart the server with: cloudedits serve --tsnet --data-dir %q",
-		len(cfg.Folders), cfg.DataDir, cfg.Hostname, cfg.DataDir))
-	return exitOK
+	res["enrolled"] = libraryEnrolled(cfg.DataDir)
+	res["serveCommand"] = append([]string{"cloudedits"}, serveArgs(cfg.DataDir, runtime.GOOS)...)
+
+	res["serviceInstalled"] = false
+	if *installSvc {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		st, spec, err := installService(ctx, "", cfg.DataDir)
+		if err != nil {
+			cancel()
+			res["ok"] = false
+			res["serviceError"] = err.Error()
+			emitOutput(*jsonOut, res, strings.Join(append(human,
+				"ERROR: could not install the service: "+err.Error(),
+				"Run the server yourself with: "+strings.Join(res["serveCommand"].([]string), " ")), "\n"))
+			return exitActionRequired
+		}
+		live := waitForServer(ctx, cfg.DataDir, 30*time.Second)
+		cancel()
+		res["serviceInstalled"] = st.Installed
+		res["service"] = st
+		res["serviceArgs"] = spec.Args
+		res["server"] = live
+		human = append(human, fmt.Sprintf("Installed %s service %s (%s)", st.Manager, st.Name, st.UnitPath))
+		switch {
+		case live.Running && live.State == runstate.StateServing:
+			human = append(human, "Serving "+live.URL)
+		case live.Error != "":
+			human = append(human, "The server reported: "+live.Error)
+			if code == exitOK {
+				code = exitActionRequired
+				res["ok"] = false
+			}
+		default:
+			human = append(human, "The service is starting; check it with: cloudedits doctor")
+		}
+	} else {
+		human = append(human, "Start the server with: "+strings.Join(res["serveCommand"].([]string), " "),
+			"or keep it running with: cloudedits service install")
+	}
+	emitOutput(*jsonOut, res, strings.Join(human, "\n"))
+	return code
 }
 
 func cmdServe(args []string) int {
@@ -261,8 +295,24 @@ func cmdServe(args []string) int {
 	var allowOrigins stringSliceFlag
 	fs.Var(&allowOrigins, "allow-origin", "additional browser origin allowed to call the API, e.g. https://preview.example or https://*.example.com (repeatable; the hdr.toys editor and this server's own URL are always allowed)")
 	allowDevNetwork := fs.Bool("allow-dev-apis-on-network", false, "permit a dev_apis test build to listen beyond loopback")
+	ownerUserID := fs.Int64("owner-user-id", 0, "pin the Tailscale numeric UserID authorized as owner (required for tagged nodes; also CLOUDEDITS_OWNER_USER_ID)")
+	logFile := fs.String("log-file", "", "append server output to this file instead of the terminal")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	if *ownerUserID < 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: --owner-user-id must be a positive Tailscale UserID")
+		return exitUsage
+	}
+	if *logFile != "" {
+		f, err := openLogFile(*logFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open log file: %v\n", err)
+			return exitStorage
+		}
+		defer func() { _ = f.Close() }()
+		os.Stdout, os.Stderr = f, f
+		releaseOwnConsole()
 	}
 
 	// Enforce a 192 MiB soft memory limit by default so thumbnail bursts stay
@@ -286,6 +336,9 @@ func cmdServe(args []string) int {
 	if strings.TrimSpace(*sidecarDir) != "" {
 		cfg.SidecarDir = strings.TrimSpace(*sidecarDir)
 	}
+	if *ownerUserID > 0 {
+		cfg.OwnerUserID = *ownerUserID
+	}
 	for _, f := range folders {
 		if _, err := cfg.AddFolder(f, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "folder %q: %v\n", f, err)
@@ -293,11 +346,27 @@ func cmdServe(args []string) int {
 		}
 	}
 
+	// One process per data dir: it owns the tailnet identity and the index.
+	lock, err := runstate.Acquire(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return exitActionRequired
+	}
+	defer func() { _ = lock.Release() }()
+	status := newStatusReporter(cfg.DataDir)
+	fail := func(code int, format string, args ...any) int {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Fprintln(os.Stderr, msg)
+		status.update(func(st *runstate.Status) {
+			st.State, st.Error, st.ExitCode = runstate.StateFailed, strings.TrimPrefix(msg, "ERROR: "), code
+		})
+		return code
+	}
+
 	idxPath := filepath.Join(cfg.DataDir, "index.db")
 	idx, err := index.Open(idxPath, cfg.SidecarDir, cfg.Folders, sidecar.NewStore())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open index: %v\n", err)
-		return exitStorage
+		return fail(exitStorage, "open index: %v", err)
 	}
 	defer func() { _ = idx.Close() }()
 
@@ -322,24 +391,18 @@ func cmdServe(args []string) int {
 	if *useTsnet {
 		// Fail before joining the tailnet rather than after.
 		if err := checkTestBuildExposure(api.HasTestRoutes(), nil, *allowDevNetwork); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			return exitUsage
+			return fail(exitUsage, "ERROR: %v", err)
 		}
-		node, err := tsnetnode.Start(ctx, tsnetnode.Options{
-			Hostname: cfg.Hostname,
-			StateDir: tsnetnode.StateDir(cfg.DataDir),
-			AuthKey:  strings.TrimSpace(os.Getenv("TS_AUTHKEY")),
-		})
+		node, err := tsnetnode.Start(ctx, tsnetOptions(cfg, strings.TrimSpace(os.Getenv("TS_AUTHKEY"))))
 		if errors.Is(err, tsnetnode.ErrHTTPSNotEnabled) {
 			if node != nil {
+				status.update(func(st *runstate.Status) { st.FQDN, st.TailscaleIP = node.FQDN(), node.TailscaleIP() })
 				_ = node.Close()
 			}
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			return exitActionRequired
+			return fail(exitActionRequired, "ERROR: %s", actionEnableHTTPS)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tsnet start failed: %v\n", err)
-			return exitActionRequired
+			return fail(exitActionRequired, "tsnet start failed: %v", err)
 		}
 		tsNode = node
 		defer func() { _ = tsNode.Close() }()
@@ -347,13 +410,18 @@ func cmdServe(args []string) int {
 		if recErr := recordNodeIdentity(cfg.DataDir, tsNode.FQDN(), tsNode.TailscaleIP()); recErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not record node address: %v\n", recErr)
 		}
+		if recErr := recordNodeOwner(cfg.DataDir, int64(tsNode.OwnerUserID()), tsNode.OwnerLogin()); recErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record owner user id: %v\n", recErr)
+		}
+		if tsNode.OwnerUserID() == 0 && !mustUseToken {
+			fmt.Fprintln(os.Stderr, "WARNING: this tsnet node is tagged or has no owner UserID; Tailscale WhoIs auth fails closed until --owner-user-id (or CLOUDEDITS_OWNER_USER_ID / --require-token) is configured")
+		}
 		if pubURL == "" && tsNode.FQDN() != "" {
 			pubURL = "https://" + tsNode.FQDN()
 		}
 		ln, err = tsNode.ListenTLS()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tsnet ListenTLS failed: %v\n", err)
-			return exitActionRequired
+			return fail(exitActionRequired, "tsnet ListenTLS failed: %v", err)
 		}
 	} else {
 		addr := strings.TrimSpace(*listen)
@@ -365,8 +433,7 @@ func cmdServe(args []string) int {
 		}
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "listen %s: %v\n", addr, err)
-			return exitStorage
+			return fail(exitStorage, "listen %s: %v", addr, err)
 		}
 		if pubURL == "" {
 			pubURL = "http://" + ln.Addr().String()
@@ -374,8 +441,7 @@ func cmdServe(args []string) int {
 	}
 	defer func() { _ = ln.Close() }()
 	if err := checkTestBuildExposure(api.HasTestRoutes(), ln.Addr(), *allowDevNetwork); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		return exitUsage
+		return fail(exitUsage, "ERROR: %v", err)
 	}
 
 	apiSrv, err := api.New(api.Options{
@@ -391,21 +457,37 @@ func cmdServe(args []string) int {
 		Sessions:       sessions,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init API server: %v\n", err)
-		return exitStorage
+		return fail(exitStorage, "init API server: %v", err)
 	}
 
 	logf := func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	warnUnwritableSidecars(cfg, logf)
 	cnt, _ := idx.Count(ctx, index.Filter{})
+	status.update(func(st *runstate.Status) {
+		st.State, st.URL, st.ListenAddr, st.IndexedAssets = runstate.StateServing, pubURL, ln.Addr().String(), cnt
+		st.Mode = "listen"
+		if tsNode != nil {
+			st.Mode, st.FQDN, st.TailscaleIP = "tsnet", tsNode.FQDN(), tsNode.TailscaleIP()
+		}
+	})
+	if tsNode != nil {
+		go selfCheckLoop(ctx, tsNode, status, logf)
+	}
 	if tsNode != nil && tsNode.TailscaleIP() != "" {
 		logf("cloudedits %s serving %s (Tailscale IP %s, %d assets already indexed, %d folders)", version, pubURL, tsNode.TailscaleIP(), cnt, len(cfg.Folders))
 	} else {
 		logf("cloudedits %s serving %s (%d assets already indexed, %d folders)", version, pubURL, cnt, len(cfg.Folders))
 	}
-	if err := serveUntilDone(ctx, ln, apiSrv, idx, !*noWatch, logf); err != nil {
-		logf("serve error: %v", err)
-		return exitStorage
+	scanned := reportingIndexer{Index: idx, after: func() {
+		n, err := idx.Count(context.Background(), index.Filter{})
+		if err == nil {
+			status.update(func(st *runstate.Status) { st.IndexedAssets = n })
+		}
+	}}
+	if err := serveUntilDone(ctx, ln, apiSrv, scanned, !*noWatch, logf); err != nil {
+		return fail(exitStorage, "serve error: %v", err)
 	}
+	status.update(func(st *runstate.Status) { st.State = runstate.StateStopped })
 	return exitOK
 }
 
@@ -516,6 +598,18 @@ func cmdStatus(args []string) int {
 	return exitOK
 }
 
+// doctorCheck is one doctor finding. A failed check carries the exit code
+// class it belongs to: exitStorage for local files the library cannot read
+// or write, exitActionRequired for a step the user has to take.
+type doctorCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Status string `json:"status"` // ok | fail | warn | skip
+	Detail string `json:"detail"`
+	Fix    string `json:"fix,omitempty"`
+	exit   int
+}
+
 func cmdDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "data directory")
@@ -524,98 +618,233 @@ func cmdDoctor(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	checks := runDoctor(context.Background(), *dataDir, strings.TrimRight(strings.TrimSpace(*probeURL), "/"))
+	code := exitOK
+	for _, c := range checks {
+		if c.Status == "fail" && c.exit > code {
+			code = c.exit
+		}
+	}
+	var human strings.Builder
+	for _, c := range checks {
+		fmt.Fprintf(&human, "%-5s %-14s %s\n", strings.ToUpper(c.Status), c.Name, c.Detail)
+		if c.Fix != "" && c.Status != "ok" {
+			fmt.Fprintf(&human, "      %-14s fix: %s\n", "", c.Fix)
+		}
+	}
+	switch code {
+	case exitOK:
+		human.WriteString("doctor: all checks passed")
+	case exitActionRequired:
+		human.WriteString("doctor: action required (exit 3)")
+	default:
+		human.WriteString("doctor: storage problem (exit 4)")
+	}
+	emitOutput(*jsonOut, map[string]any{"ok": code == exitOK, "exitCode": code, "checks": checks}, human.String())
+	return code
+}
 
-	cfg, err := config.Load(*dataDir)
+func runDoctor(ctx context.Context, dataDir, probeURL string) []doctorCheck {
+	var checks []doctorCheck
+	add := func(c doctorCheck) {
+		c.OK = c.Status == "ok"
+		checks = append(checks, c)
+	}
+	cfg, err := config.Load(dataDir)
 	if err != nil {
-		return failOut(*jsonOut, exitStorage, "load config failed", err)
+		add(doctorCheck{Name: "config", Status: "fail", Detail: err.Error(), Fix: "repair or remove " + config.ConfigPath(dataDir), exit: exitStorage})
+		return checks
 	}
+	add(doctorCheck{Name: "config", Status: "ok", Detail: config.ConfigPath(cfg.DataDir)})
 
-	type check struct {
-		Name   string `json:"name"`
-		OK     bool   `json:"ok"`
-		Detail string `json:"detail"`
+	if len(cfg.Folders) == 0 {
+		add(doctorCheck{Name: "folders", Status: "fail", Detail: "no photo folders configured", Fix: "cloudedits folders add <dir>", exit: exitActionRequired})
 	}
-	var checks []check
-	allOK := true
-
-	if cfg.SidecarDir != "" {
-		checks = append(checks, check{
-			Name:   "sidecar_mode",
-			OK:     true,
-			Detail: "external --sidecar-dir active (" + cfg.SidecarDir + "); not colocated inside photo folders",
-		})
-	} else {
-		checks = append(checks, check{
-			Name:   "sidecar_mode",
-			OK:     true,
-			Detail: "inside-folder .hdrtoys/ (100% colocated interop)",
-		})
-	}
-
 	for _, f := range cfg.Folders {
-		info, serr := os.Stat(f.Path)
-		if serr != nil || !info.IsDir() {
-			allOK = false
-			checks = append(checks, check{Name: "folder:" + f.ID, OK: false, Detail: "unreadable directory: " + f.Path})
+		name := "folder:" + f.ID
+		if _, err := os.ReadDir(f.Path); err != nil {
+			c := doctorCheck{Name: name, Status: "fail", Detail: "cannot read " + f.Path + ": " + err.Error(), exit: exitStorage}
+			if runtime.GOOS == "darwin" && errors.Is(err, os.ErrPermission) {
+				c.Fix = "macOS privacy settings denied access; allow cloudedits under System Settings > Privacy & Security > Files and Folders or Full Disk Access"
+			}
+			add(c)
 			continue
 		}
 		sRoot := sidecar.SidecarRoot(f.Path, f.ID, cfg.SidecarDir)
-		tmpProbe := filepath.Join(sRoot, ".tmp", ".doctor-probe")
-		if mkErr := os.MkdirAll(filepath.Dir(tmpProbe), 0o755); mkErr != nil {
-			allOK = false
-			checks = append(checks, check{Name: "folder:" + f.ID, OK: false, Detail: "cannot create sidecar dir: " + mkErr.Error()})
+		if err := probeWritable(filepath.Join(sRoot, ".tmp")); err != nil {
+			add(doctorCheck{Name: name, Status: "fail", Detail: "sidecar directory " + sRoot + " is not writable: " + err.Error(),
+				Fix: "give this user write access to " + sRoot + ", or set --sidecar-dir to a writable directory", exit: exitStorage})
 			continue
 		}
-		if wErr := os.WriteFile(tmpProbe, []byte("ok"), 0o644); wErr != nil {
-			allOK = false
-			checks = append(checks, check{Name: "folder:" + f.ID, OK: false, Detail: "sidecar dir not writable: " + wErr.Error()})
-			continue
-		}
-		_ = os.Remove(tmpProbe)
-		checks = append(checks, check{Name: "folder:" + f.ID, OK: true, Detail: "readable + sidecar writable (" + sRoot + ")"})
+		add(doctorCheck{Name: name, Status: "ok", Detail: "readable; sidecars writable in " + sRoot})
 	}
 
-	// SQLite WAL check.
-	idxPath := filepath.Join(cfg.DataDir, "index.db")
-	idx, oerr := index.Open(idxPath, cfg.SidecarDir, cfg.Folders, sidecar.NewStore())
-	if oerr != nil {
-		allOK = false
-		checks = append(checks, check{Name: "sqlite_wal", OK: false, Detail: oerr.Error()})
+	idx, err := index.Open(filepath.Join(cfg.DataDir, "index.db"), cfg.SidecarDir, cfg.Folders, sidecar.NewStore())
+	if err != nil {
+		add(doctorCheck{Name: "index", Status: "fail", Detail: err.Error(), Fix: "the index is rebuildable: stop the server and delete " + filepath.Join(cfg.DataDir, "index.db*"), exit: exitStorage})
 	} else {
-		cnt, _ := idx.Count(context.Background(), index.Filter{})
+		cnt, cerr := idx.Count(ctx, index.Filter{})
 		_ = idx.Close()
-		checks = append(checks, check{Name: "sqlite_wal", OK: true, Detail: fmt.Sprintf("WAL healthy (%d indexed assets)", cnt)})
-	}
-
-	// Optional HTTP self-probe.
-	if u := strings.TrimRight(strings.TrimSpace(*probeURL), "/"); u != "" {
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, perr := client.Get(u + "/capabilities")
-		if perr != nil {
-			allOK = false
-			checks = append(checks, check{Name: "http_probe", OK: false, Detail: perr.Error()})
+		if cerr != nil {
+			add(doctorCheck{Name: "index", Status: "fail", Detail: cerr.Error(), exit: exitStorage})
 		} else {
-			_ = resp.Body.Close()
-			ok := resp.StatusCode == http.StatusOK
-			if !ok {
-				allOK = false
-			}
-			checks = append(checks, check{Name: "http_probe", OK: ok, Detail: fmt.Sprintf("GET %s/capabilities -> %d", u, resp.StatusCode)})
+			add(doctorCheck{Name: "index", Status: "ok", Detail: fmt.Sprintf("%d assets indexed", cnt)})
 		}
 	}
 
-	out := map[string]any{
-		"ok":     allOK,
-		"checks": checks,
+	stateDir := tsnetnode.StateDir(cfg.DataDir)
+	enrolled := libraryEnrolled(cfg.DataDir)
+	if enrolled {
+		add(doctorCheck{Name: "tailscale", Status: "ok", Detail: "node identity in " + stateDir})
+	} else {
+		add(doctorCheck{Name: "tailscale", Status: "fail", Detail: "this library has not joined a tailnet",
+			Fix: "create an auth key at https://login.tailscale.com/admin/settings/keys, then: cloudedits setup --tailscale-auth-key-stdin", exit: exitActionRequired})
 	}
-	msg := "doctor: all checks passed"
-	code := exitOK
-	if !allOK {
-		msg = "doctor: one or more checks failed"
-		code = exitStorage
+
+	live := runstate.Observe(cfg.DataDir)
+	switch {
+	case live.Running && live.State == runstate.StateServing:
+		add(doctorCheck{Name: "server", Status: "ok", Detail: fmt.Sprintf("pid %d serving %s since %s", live.PID, live.URL, live.StartedAt.Format(time.RFC3339))})
+	case live.Running:
+		add(doctorCheck{Name: "server", Status: "fail", Detail: fmt.Sprintf("pid %d is %s", live.PID, live.State), Fix: "wait a few seconds and run doctor again", exit: exitActionRequired})
+	default:
+		detail := "no server is running for this data directory"
+		if live.Error != "" {
+			detail += "; last error: " + live.Error
+		}
+		add(doctorCheck{Name: "server", Status: "fail", Detail: detail, Fix: "cloudedits service install (or run: cloudedits " + strings.Join(serveArgs(cfg.DataDir, runtime.GOOS), " ") + ")", exit: exitActionRequired})
 	}
-	emitOutput(*jsonOut, out, msg)
-	return code
+
+	if svc, err := serviceStatus(ctx, ""); err == nil {
+		if svc.Installed {
+			add(doctorCheck{Name: "service", Status: "ok", Detail: fmt.Sprintf("%s %s (%s)", svc.Manager, svc.Name, svc.Detail)})
+		} else {
+			add(doctorCheck{Name: "service", Status: "warn", Detail: "no " + svc.Manager + " service installed; the library stops when this session ends", Fix: "cloudedits service install"})
+		}
+	}
+
+	serving := live.Running && live.State == runstate.StateServing
+	switch {
+	case serving && live.Mode == "listen":
+		add(probeCapabilities("listener", "http://"+live.ListenAddr))
+	case serving && live.Mode == "tsnet":
+		add(doctorCheck{Name: "listener", Status: "ok", Detail: "HTTPS listener on the tailnet at " + live.FQDN + ":443"})
+		add(selfCheck("magicdns", live.MagicDNS, "Enable MagicDNS at https://login.tailscale.com/admin/dns"))
+		https := selfCheck("https_cert", live.HTTPS, actionEnableHTTPS)
+		if live.CertNotAfter != nil && https.Status == "ok" {
+			https.Detail += ", expires " + live.CertNotAfter.Format("2006-01-02")
+		}
+		add(https)
+	case enrolled:
+		for _, name := range []string{"listener", "magicdns", "https_cert"} {
+			add(doctorCheck{Name: name, Status: "skip", Detail: "the server is not running"})
+		}
+	}
+
+	if probeURL != "" {
+		add(probeCapabilities("http_probe", probeURL))
+	}
+	return checks
+}
+
+func selfCheck(name string, c *runstate.Check, fix string) doctorCheck {
+	if c == nil {
+		return doctorCheck{Name: name, Status: "skip", Detail: "the server has not finished this check yet"}
+	}
+	if !c.OK {
+		return doctorCheck{Name: name, Status: "fail", Detail: c.Detail, Fix: fix, exit: exitActionRequired}
+	}
+	return doctorCheck{Name: name, Status: "ok", Detail: c.Detail + " (checked " + c.CheckedAt.Format(time.RFC3339) + ")"}
+}
+
+func probeCapabilities(name, base string) doctorCheck {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(base + "/capabilities")
+	if err != nil {
+		return doctorCheck{Name: name, Status: "fail", Detail: err.Error(), exit: exitActionRequired}
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return doctorCheck{Name: name, Status: "fail", Detail: fmt.Sprintf("GET %s/capabilities -> %d", base, resp.StatusCode), exit: exitActionRequired}
+	}
+	return doctorCheck{Name: name, Status: "ok", Detail: fmt.Sprintf("GET %s/capabilities -> 200", base)}
+}
+
+// probeWritable creates and removes a file in dir, creating dir if needed.
+func probeWritable(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".doctor-probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	return os.Remove(name)
+}
+
+func cmdService(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: cloudedits service <install|uninstall|status> [--data-dir DIR] [--name NAME] [--json]")
+		return exitUsage
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("service "+sub, flag.ContinueOnError)
+	dataDir := fs.String("data-dir", config.DefaultDataDir(), "data directory the service serves")
+	name := fs.String("name", "", "service name (default: toys.hdr.cloudedits on macOS, cloudedits elsewhere)")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return exitUsage
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	switch sub {
+	case "install":
+		cfg, err := config.Load(*dataDir)
+		if err != nil {
+			return failOut(*jsonOut, exitStorage, "load config failed", err)
+		}
+		if err := config.Save(cfg); err != nil {
+			return failOut(*jsonOut, exitStorage, "save config failed", err)
+		}
+		st, spec, err := installService(ctx, *name, cfg.DataDir)
+		if err != nil {
+			return failOut(*jsonOut, exitActionRequired, "install service failed", err)
+		}
+		live := waitForServer(ctx, cfg.DataDir, 30*time.Second)
+		out := map[string]any{"ok": live.Running && live.State == runstate.StateServing, "service": st, "args": spec.Args, "executable": spec.Executable, "server": live}
+		msg := fmt.Sprintf("Installed %s service %s (%s)\nruns: %s %s", st.Manager, st.Name, st.UnitPath, spec.Executable, strings.Join(spec.Args, " "))
+		if out["ok"] == true {
+			emitOutput(*jsonOut, out, msg+"\nserving "+live.URL)
+			return exitOK
+		}
+		reason := "not serving yet; check it with: cloudedits doctor"
+		if live.Error != "" {
+			reason = "the server reported: " + live.Error
+		}
+		out["actionRequired"] = reason
+		emitOutput(*jsonOut, out, msg+"\n"+reason)
+		return exitActionRequired
+	case "uninstall":
+		st, err := uninstallService(ctx, *name)
+		if err != nil {
+			return failOut(*jsonOut, exitActionRequired, "uninstall service failed", err)
+		}
+		emitOutput(*jsonOut, map[string]any{"ok": true, "service": st}, fmt.Sprintf("Removed %s service %s", st.Manager, st.Name))
+		return exitOK
+	case "status":
+		st, err := serviceStatus(ctx, *name)
+		if err != nil {
+			return failOut(*jsonOut, exitActionRequired, "service status failed", err)
+		}
+		live := runstate.Observe(*dataDir)
+		emitOutput(*jsonOut, map[string]any{"ok": true, "service": st, "server": live},
+			fmt.Sprintf("%s %s: installed=%v loaded=%v (%s)\nserver: running=%v state=%s %s", st.Manager, st.Name, st.Installed, st.Loaded, st.Detail, live.Running, live.State, live.URL))
+		return exitOK
+	default:
+		return failOut(*jsonOut, exitUsage, "unknown service subcommand "+sub, nil)
+	}
 }
 
 func cmdFolders(args []string) int {
@@ -673,21 +902,60 @@ func cmdFolders(args []string) int {
 // recordNodeIdentity stores the enrolled node's tailnet address in the config
 // on disk. It reloads the stored config rather than saving the caller's
 // in-memory copy, so per-invocation overrides (serve --folder, --name, ...)
-// are never persisted as a side effect. An empty fqdn records nothing.
+// are never persisted as a side effect. An empty identity records nothing;
+// an address without a MagicDNS name keeps the stored URL.
 func recordNodeIdentity(dataDir, fqdn, tailscaleIP string) error {
-	if fqdn == "" {
+	if fqdn == "" && tailscaleIP == "" {
 		return nil
 	}
 	stored, err := config.Load(dataDir)
 	if err != nil {
 		return err
 	}
-	url := "https://" + fqdn
+	url := stored.PublicURL
+	if fqdn != "" {
+		url = "https://" + fqdn
+	}
 	if stored.PublicURL == url && stored.TailscaleIP == tailscaleIP {
 		return nil
 	}
 	stored.PublicURL, stored.TailscaleIP = url, tailscaleIP
 	return config.Save(stored)
+}
+
+// recordNodeOwner persists the library owner's Tailscale UserID (and display
+// login) on first enrolment without overwriting an explicit ownerUserId or any
+// other persisted setting.
+func recordNodeOwner(dataDir string, ownerUserID int64, ownerLogin string) error {
+	if ownerUserID <= 0 {
+		return nil
+	}
+	stored, err := config.Load(dataDir)
+	if err != nil {
+		return err
+	}
+	if stored.OwnerUserID > 0 {
+		if stored.OwnerUserID == ownerUserID && ownerLogin != "" && stored.OwnerLogin == "" {
+			stored.OwnerLogin = ownerLogin
+			return config.Save(stored)
+		}
+		return nil
+	}
+	stored.OwnerUserID = ownerUserID
+	stored.OwnerLogin = ownerLogin
+	return config.Save(stored)
+}
+
+// warnUnwritableSidecars checks each configured folder's sidecar directory at
+// startup and logs an actionable hint if writes will fail (for example in
+// Docker when host folder UID/GID differs from the container user).
+func warnUnwritableSidecars(cfg *config.Config, logf func(string, ...any)) {
+	for _, f := range cfg.Folders {
+		sRoot := sidecar.SidecarRoot(f.Path, f.ID, cfg.SidecarDir)
+		if err := checkSidecarRootWritable(sRoot); err != nil {
+			logf("WARNING: sidecar directory %s for folder %q is not writable (%v); edits will fail until permissions match this user (in Docker, set PUID/PGID to the photo folder owner) or --sidecar-dir / CLOUDEDITS_SIDECAR_DIR is set to a writable path", sRoot, f.ID, err)
+		}
+	}
 }
 
 // parseInterspersed parses flags that may appear before, between or after
@@ -776,6 +1044,8 @@ type guiState struct {
 	mu      sync.Mutex
 	dataDir string
 	indexed int
+	// serviceName is the service the wizard installs ("" = platform default).
+	serviceName string
 }
 
 func (g *guiState) GetConfig() *config.Config {
@@ -803,6 +1073,59 @@ func (g *guiState) IndexedCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.indexed
+}
+
+// Server reports the node, service and server state for the wizard.
+func (g *guiState) Server(ctx context.Context) setupui.ServerState {
+	out := setupui.ServerState{Enrolled: libraryEnrolled(g.dataDir)}
+	if st, err := serviceStatus(ctx, g.serviceName); err == nil {
+		out.ServiceInstalled, out.ServiceManager = st.Installed, st.Manager
+	}
+	live := runstate.Observe(g.dataDir)
+	out.Running, out.State, out.Error, out.URL = live.Running, string(live.State), live.Error, live.URL
+	if live.Running && live.State == runstate.StateServing {
+		n := live.IndexedAssets
+		out.Indexed = &n
+	}
+	if live.HTTPS != nil {
+		out.HTTPS = &setupui.Check{OK: live.HTTPS.OK, Detail: live.HTTPS.Detail}
+	}
+	if live.MagicDNS != nil {
+		out.MagicDNS = &setupui.Check{OK: live.MagicDNS.OK, Detail: live.MagicDNS.Detail}
+	}
+	return out
+}
+
+// Connect joins the tailnet with authKey through the same enrolment path as
+// `setup`, then installs and starts the library service.
+func (g *guiState) Connect(ctx context.Context, authKey string, phase func(setupui.Phase)) (setupui.ConnectResult, error) {
+	var res setupui.ConnectResult
+	if authKey != "" {
+		phase(setupui.PhaseJoining)
+		enrolled, err := enrollNode(ctx, g.GetConfig(), authKey)
+		if err != nil {
+			return res, err
+		}
+		if !enrolled.HTTPSEnabled {
+			res.ActionRequired = actionEnableHTTPS
+		}
+	}
+	phase(setupui.PhaseStarting)
+	if _, _, err := installService(ctx, g.serviceName, g.dataDir); err != nil {
+		return res, fmt.Errorf("start the library service: %w", err)
+	}
+	return res, nil
+}
+
+// ConfigChanged restarts an installed service so it serves the saved config.
+func (g *guiState) ConfigChanged(ctx context.Context) {
+	st, err := serviceStatus(ctx, g.serviceName)
+	if err != nil || !st.Installed {
+		return
+	}
+	if _, _, err := installService(ctx, g.serviceName, g.dataDir); err != nil {
+		fmt.Fprintf(os.Stderr, "restart service after a config change: %v\n", err)
+	}
 }
 
 func cmdGUI(args []string) int {
