@@ -30,6 +30,7 @@ import (
 	_ "golang.org/x/image/webp" // Register WebP decoder for raster thumbnail generation.
 
 	"github.com/thebigsasha/cloudedits/internal/formats"
+	"github.com/thebigsasha/cloudedits/internal/safefile"
 )
 
 // ErrOverloaded is returned when the bounded decode pool is saturated.
@@ -53,6 +54,11 @@ const (
 )
 
 var largeDecodeGate = make(chan struct{}, 1)
+
+// maxEditThumbnailReadBytes bounds an edited-preview thumbnail read from the
+// sidecar folder. Uploads are capped at 4 MiB; a local editor may write a
+// larger gain-mapped preview, so reads allow a generous multiple.
+const maxEditThumbnailReadBytes = 32 * 1024 * 1024
 
 // acquireDecodeBudget validates cfg against the decode budget and, for large
 // frames, serialises the decode. progressiveJPEG must be set for progressive
@@ -141,18 +147,18 @@ func (s *Service) Resolve(
 	normTier := normalizeTier(tier)
 
 	// Priority 1: edited preview thumbnail (.hdrtoys/<rel>.edit_thumbnail.jpg).
+	// Only a regular file of sane size is trusted: the sidecar folder is
+	// writable by other software, so a symbolic link or oversized file there
+	// falls through to the generated thumbnail.
 	if editThumbPath != "" {
-		if info, err := os.Stat(editThumbPath); err == nil && !info.IsDir() && info.Size() > 0 {
-			data, err := os.ReadFile(editThumbPath)
-			if err == nil && formats.IsJPEGMagic(data) {
-				etag := fmt.Sprintf(`"et-%d-%d"`, info.ModTime().UTC().UnixNano(), info.Size())
-				return &Result{
-					Data:       data,
-					TierSource: "edit-thumbnail",
-					ETag:       etag,
-					MIME:       "image/jpeg",
-				}, nil
-			}
+		if data, info, err := safefile.ReadRegular(editThumbPath, maxEditThumbnailReadBytes); err == nil && formats.IsJPEGMagic(data) {
+			etag := fmt.Sprintf(`"et-%d-%d"`, info.ModTime().UTC().UnixNano(), info.Size())
+			return &Result{
+				Data:       data,
+				TierSource: "edit-thumbnail",
+				ETag:       etag,
+				MIME:       "image/jpeg",
+			}, nil
 		}
 	}
 
