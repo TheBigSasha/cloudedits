@@ -828,6 +828,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Another process kept rewriting a target sidecar; nothing was applied. Retry after `Retry-After` seconds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /changes:
     get:
       summary: Poll monotonic change feed

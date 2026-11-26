@@ -143,6 +143,8 @@ Response body:
 
 `POST /ops` answers `200` with exactly one receipt per op, in request order. Only a body that is not a JSON op list (or exceeds the batch limit) fails the request as a whole; an op that cannot be applied gets its own `rejected` receipt and never blocks the ops around it.
 
+A `503` with `Retry-After` means another process (for example a browser editor that has the same folder open through direct file access) kept rewriting a target sidecar for the whole attempt. Nothing was applied; keep the ops and send them again.
+
 Limits: at most `limits.maxOpsBatch` ops and `limits.maxOpsBodyBytes` request-body bytes per call (both advertised by `GET /capabilities`). A request over either limit is rejected whole with `413` and error code `payload-too-large`; split the batch and retry.
 
 Receipt `status` values:

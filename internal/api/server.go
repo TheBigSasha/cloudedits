@@ -853,7 +853,7 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 	if status, message, rejected := singleOpRejection(receipts); rejected {
@@ -972,7 +972,7 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 	if status, message, rejected := singleOpRejection(receipts); rejected {
@@ -983,6 +983,19 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		"durable":  true,
 		"receipts": receipts,
 	})
+}
+
+// writeApplyFailure answers a failed op application. A sidecar another
+// process kept rewriting is a passing condition, so it is 503 with Retry-After
+// (the client keeps the ops and sends them again); anything else is the
+// request's own fault.
+func writeApplyFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, sidecar.ErrContended) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // singleOpRejection maps the receipt of a one-op endpoint onto an HTTP error:
@@ -1061,7 +1074,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 
