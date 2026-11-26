@@ -32,8 +32,9 @@ func (g *gatedIndexer) ScanAll(ctx context.Context) error {
 	}
 }
 
-func (g *gatedIndexer) StartWatcher(context.Context) error {
+func (g *gatedIndexer) Watch(ctx context.Context) error {
 	g.watching.Store(true)
+	<-ctx.Done()
 	return nil
 }
 

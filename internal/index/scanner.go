@@ -8,10 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 
 	"github.com/thebigsasha/cloudedits/internal/config"
 	"github.com/thebigsasha/cloudedits/internal/formats"
@@ -348,78 +345,5 @@ func replaceKeywordsTx(ctx context.Context, tx *sql.Tx, assetID string, keywords
 			return err
 		}
 	}
-	return nil
-}
-
-// StartWatcher watches configured folders and their .hdrtoys/ sidecar trees via
-// fsnotify (with debounced rescan) so external edits appear automatically.
-func (idx *Index) StartWatcher(ctx context.Context) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-
-	addTree := func(root string) {
-		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || !d.IsDir() {
-				return nil //nolint:nilerr // best-effort directory watcher registration
-			}
-			base := d.Name()
-			if base == ".tmp" || base == ".quarantine" || strings.HasPrefix(base, "._") {
-				return filepath.SkipDir
-			}
-			_ = watcher.Add(p)
-			return nil
-		})
-	}
-
-	for _, fc := range idx.Folders() {
-		addTree(fc.Path)
-		sRoot := sidecar.SidecarRoot(fc.Path, fc.ID, idx.sidecarDir)
-		if info, statErr := os.Stat(sRoot); statErr == nil && info.IsDir() {
-			addTree(sRoot)
-		}
-	}
-
-	go func() {
-		defer func() { _ = watcher.Close() }()
-		var timer *time.Timer
-		triggerRescan := func() {
-			if timer != nil {
-				timer.Reset(350 * time.Millisecond)
-				return
-			}
-			timer = time.AfterFunc(350*time.Millisecond, func() {
-				_ = idx.ScanAll(ctx)
-			})
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				if timer != nil {
-					timer.Stop()
-				}
-				return
-			case ev, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if ev.Has(fsnotify.Create) {
-					if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-						addTree(ev.Name)
-					}
-				}
-				if strings.Contains(ev.Name, string(filepath.Separator)+".tmp"+string(filepath.Separator)) {
-					continue
-				}
-				triggerRescan()
-			case _, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-			}
-		}
-	}()
 	return nil
 }

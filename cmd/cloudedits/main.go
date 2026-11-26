@@ -248,7 +248,7 @@ func cmdServe(args []string) int {
 	requireToken := fs.Bool("require-token", false, "require Authorization: Bearer token on authenticated endpoints")
 	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token")
 	publicURL := fs.String("public-url", "", "override public base URL for redirects and handoff links")
-	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
+	noWatch := fs.Bool("no-watch", false, "do not follow folder changes after the initial scan")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -386,7 +386,8 @@ func cmdServe(args []string) int {
 // the HTTP API is already answering.
 type backgroundIndexer interface {
 	ScanAll(ctx context.Context) error
-	StartWatcher(ctx context.Context) error
+	// Watch blocks until ctx is cancelled and no scan is running.
+	Watch(ctx context.Context) error
 }
 
 // shutdownGrace bounds how long in-flight requests may run after a stop signal.
@@ -418,7 +419,7 @@ func serveUntilDone(ctx context.Context, ln net.Listener, handler http.Handler, 
 			logf("initial scan finished in %s", time.Since(start).Round(time.Millisecond))
 		}
 		if watch {
-			if err := idx.StartWatcher(bgCtx); err != nil {
+			if err := idx.Watch(bgCtx); err != nil {
 				logf("watcher warning: %v", err)
 			}
 		}

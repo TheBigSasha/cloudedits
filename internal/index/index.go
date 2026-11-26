@@ -1,5 +1,5 @@
 // Package index maintains the strictly rebuildable SQLite WAL index and
-// read-only folder scanner + fsnotify watcher for cloudedits.
+// read-only folder scanner + change watcher for cloudedits.
 // Deleting index.db and restarting reconstructs 100% of library state losslessly
 // from source files and .hdrtoys/**/*.edits sidecars.
 package index
