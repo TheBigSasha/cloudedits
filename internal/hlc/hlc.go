@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/thebigsasha/cloudedits/internal/jsjson"
 )
 
 // Parsed represents the decoded components of a canonical HLC string:
@@ -78,7 +80,8 @@ func Parse(s string) (Parsed, error) {
 }
 
 // Compare compares two HLC strings numerically on (Millis, Counter) and then
-// lexicographically on Device. Returns -1, 0, or 1.
+// on Device in UTF-16 code-unit order (the order browser editors compare
+// device ids in). Returns -1, 0, or 1.
 func Compare(a, b string) (int, error) {
 	if a == b {
 		if _, err := Parse(a); err != nil {
@@ -106,7 +109,7 @@ func Compare(a, b string) (int, error) {
 		}
 		return 1, nil
 	}
-	return strings.Compare(pa.Device, pb.Device), nil
+	return jsjson.CompareUTF16(pa.Device, pb.Device), nil
 }
 
 // Clock is a thread-safe monotonic Hybrid Logical Clock.

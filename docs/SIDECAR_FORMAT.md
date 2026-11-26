@@ -27,7 +27,7 @@
 - `unixMillis-hex`: lowercase hex Unix milliseconds, zero-padded to at least 12 hex digits (`%012x`).
 - `counter-hex`: lowercase hex logical counter, zero-padded to at least 4 hex digits (`%04x`).
 - `deviceId`: non-empty string identifying the originating device. `deviceId` may contain `-`; parsers MUST split only on the **first two** `-` characters.
-- **Comparison order:** Parse `unixMillis` as `uint64` and `counter` as `uint32`. Compare `unixMillis`, then `counter`, then `deviceId` lexicographically. Never compare raw HLC strings lexicographically, because variable-width hex (`ff` vs `100`) would sort incorrectly.
+- **Comparison order:** Parse `unixMillis` as `uint64` and `counter` as `uint32`. Compare `unixMillis`, then `counter`, then `deviceId` in UTF-16 code-unit order (the order of the ECMAScript `<` operator). Never compare raw HLC strings lexicographically, because variable-width hex (`ff` vs `100`) would sort incorrectly.
 
 ## JSON Envelope (`hdrt: 1`)
 
@@ -87,25 +87,40 @@
 
 ## Canonical Serialization Rules
 
-1. Top-level key `hdrt` is always emitted **first**.
-2. All other top-level keys and all nested JSON object keys are recursively sorted lexicographically (UTF-8 / code-unit order).
-3. `fields` is always emitted (`{}` when empty).
-4. `variants` is sorted ascending by `id` and omitted when empty.
-5. 2-space indentation with a single trailing newline (`\n`).
-6. **Additive-only & unknown-field preservation:** Readers accept any `hdrt >= 1` and preserve all unknown top-level keys, unknown `fields` keys, and unknown properties on `document`, `asset`, `fields[*]`, `recipe`, and `variants[*]` untouched through parse -> mutate -> serialize.
+The canonical bytes of a sidecar are exactly what `JSON.stringify(value, null, 2) + "\n"` produces in an ECMAScript engine for a recursively key-sorted object. A browser editor emits that form natively; every other implementation must reproduce the same four rules, or two tools rewriting one file will never agree on its bytes or on a merge tie-break.
+
+1. **Key order.** Within every object, keys that are array indices (the canonical decimal form of an integer in `0 … 2^32-2`, such as `"0"`, `"9"`, `"10"`) come first in ascending numeric order; all other keys follow in UTF-16 code-unit order. UTF-16 order differs from UTF-8 byte order when a supplementary-plane character meets one in `U+E000–U+FFFF`.
+2. **`hdrt` first.** At the top level `hdrt` precedes every non-index key.
+3. **Strings.** Only `"`, `\`, and the C0 controls are escaped (`\b \t \n \f \r`, otherwise `\u00xx` in lowercase hex). `<`, `>`, `&`, `U+007F`, `U+2028`, and `U+2029` are written raw.
+4. **Numbers.** Every number is written as the shortest decimal that round-trips an IEEE-754 double: `1.0` → `1`, `-0` → `0`, `1e21` → `1e+21`, `1.5e-07` → `1.5e-7`. Integers beyond `2^53` therefore lose precision, and a literal outside the double range becomes `null`.
+5. `fields` is always emitted (`{}` when empty).
+6. `variants` is stably sorted ascending by `id` in UTF-16 code-unit order and omitted when empty.
+7. 2-space indentation with a single trailing newline (`\n`).
+8. **Additive-only & unknown-field preservation:** Readers accept any `hdrt >= 1` and preserve all unknown top-level keys, unknown `fields` keys, and unknown properties on `document`, `asset`, `fields[*]`, `recipe`, and `variants[*]` through parse -> mutate -> serialize. A field cell without a `v` member stays without one, and a variant `name`, `recipe`, or `tombstone` of an unexpected JSON type is re-emitted verbatim.
+
+`testdata/reference_vectors/vectors.jsonl` freezes inputs together with the bytes the browser editor produces for them (parse -> serialize, op application, merge, conflict rescue, HLC parse/compare/format). `go test ./internal/sidecar` fails on any byte of drift.
+
+### Known differences from the browser editor
+
+- A lone UTF-16 surrogate escape (`"\ud800"`) cannot be represented in a Go string and is read as `U+FFFD`.
+- A key named `__proto__` is preserved here; the browser editor drops it.
+- HLC strings are validated on read. A sidecar whose cell carries a malformed HLC is quarantined here, while the browser editor loads it and fails only when it next compares that cell.
+- A `variant` op keeps every member of its value (for example `snapshotKind`), not only `id`, `name`, `recipe`, and `tombstone`.
 
 ## Deterministic Merge Lattice
 
 Merging two sidecars for the same asset is a join-semilattice (associative, commutative, idempotent):
 
 - `hdrt`: `max(a.hdrt, b.hdrt)`.
-- `fields.*`: per-cell LWW by numeric HLC; exact HLC ties break by larger canonical compact JSON bytes. `keywords` is LWW on the whole array.
-- `recipe`: LWW by numeric HLC (same tie-break). **Conflict rescue:** when merging two concurrent truth sidecars that contain valid recipes with distinct canonical JSON bytes, the losing recipe is preserved automatically as an immutable manual variant with:
-  - `id`: `"conflict-<loserHlc>-<8-char-sha256-prefix>"`
-  - `name`: `"Merged edit"`
+- `document`: `role` only (`truth` if either copy is truth). A portable copy never merges into a truth copy; the truth copy is returned unchanged.
+- `fields.*`: per-cell LWW by numeric HLC; exact HLC ties break by larger canonical compact JSON of the cell, compared in UTF-16 code-unit order. `keywords` is LWW on the whole array.
+- `recipe`: LWW by numeric HLC (same tie-break). **Conflict rescue:** when two truth copies carry recipes with distinct canonical JSON and the losing value is a JSON object, the losing recipe is preserved as an immutable manual variant with:
+  - `id`: `"conflict-<loserHlc>-<32-hex-digit content hash>"`. The hash input is the compact JSON `{"hlc":<loserHlc>,"recipe":<loserRecipe>}` with keys in plain UTF-16 code-unit order (no array-index hoisting); the hash is four independently seeded 32-bit lanes (`0x811c9dc5`, `0x9e3779b9`, `0x85ebca6b`, `0xc2b2ae35`), each updated per UTF-16 code unit `c` of that string as `h = (h XOR (c + lane*257)) * 0x01000193 mod 2^32; h = h XOR (h >> 16)`, printed as 8 lowercase hex digits per lane.
+  - `name`: `"Merged edit"`, or `"Merged edit · from .hdrtoys"` / `"Merged edit · from beside the photo"` when the two copies came from the two on-disk layouts.
   - `snapshotKind`: `"manual"`
 - `variants`: append-only union keyed by `id`. Payload winner is selected by `(hlc, canonical payload JSON without tombstone)`; `tombstone` is logical OR (`a.tombstone || b.tombstone`) so deletions dominate forever regardless of HLC order.
-- `asset`, `provenance`, unknown top-level keys: per-key join where `null` is the bottom element and non-null ties resolve by larger canonical JSON bytes.
+- `asset`, unknown top-level keys: per-key join where `null` is the bottom element and non-null ties resolve by larger canonical JSON.
+- `provenance`: joined as one value under the same rule.
 
 ## Legacy Read Precedence & Quarantine
 

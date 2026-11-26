@@ -14,8 +14,8 @@ This repository contains `cloudedits`, a standalone MIT-licensed Go server imple
 
 - **Source folders are strictly read-only.** Never modify, rename, or remove original media files. Sidecars write only under `<folder>/.hdrtoys/` (or `--sidecar-dir` when configured).
 - **Atomic durable sidecars.** Every `.edits` write acquires a per-asset lock, reads and merges disk state first, writes to `<sidecarRoot>/.tmp/<uuid>`, calls `fsync`, closes, and atomically renames into place.
-- **Canonical `.edits` serialization.** Always emit `hdrt` first, recursively sort all object keys lexicographically, sort `variants` by `id`, use 2-space indentation, and end with `\n`. Preserve unknown top-level and nested fields verbatim.
-- **Numeric HLC comparison.** Parse `<unixMillis-hex>-<counter-hex>-<deviceId>` (splitting on the first two `-` only) and compare numerically on `(millis, counter)` before `deviceId`. Never use raw string comparison on HLC values.
+- **Canonical `.edits` serialization.** Emit exactly the bytes `JSON.stringify(value, null, 2) + "\n"` produces for a recursively key-sorted object: array-index keys first in numeric order, then UTF-16 code-unit order, `hdrt` ahead of every non-index top-level key, `variants` sorted by `id`, JSON.stringify string escaping and number formatting (`internal/jsjson`). Preserve unknown top-level and nested fields. `testdata/reference_vectors/` is the byte-identity gate against the browser editor; never edit a vector to make a test pass.
+- **Numeric HLC comparison.** Parse `<unixMillis-hex>-<counter-hex>-<deviceId>` (splitting on the first two `-` only) and compare numerically on `(millis, counter)` before `deviceId` (UTF-16 code-unit order). Never use raw string comparison on HLC values.
 - **Fail-closed `RouteSpec` registry.** Every HTTP endpoint must register through `internal/api/routespec.go` with explicit `AuthPolicy`, `Permission` (when `Authenticated`), `ResourceScope`, and `SLOBudgetMs`.
 - **Compile-time dev API isolation.** All `/__dev/*` handlers live strictly behind `//go:build dev_apis`. Default release builds compile only a zero-symbol stub (`dev_stub.go`).
 
