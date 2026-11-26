@@ -494,9 +494,9 @@ var kindExtAliases = map[string][]string{
 
 // kindCond builds the predicate for the kind filter. The value is a
 // comma-separated list (the repeatable query parameter joined by the API
-// layer) matched with logical OR. "raw" and "image" match the stored kind,
-// "photo" is every non-RAW asset, and any other token is a file extension or
-// extension family.
+// layer) matched with logical OR. "raw" matches RAW assets, "image" and "photo"
+// match every non-RAW asset, "ultrahdr" matches gain-mapped HDR images, and any
+// other token is a file extension or extension family.
 func kindCond(value string) (cond string, args []any, ok bool) {
 	var ors []string
 	for _, k := range strings.Split(strings.ToLower(value), ",") {
@@ -504,11 +504,12 @@ func kindCond(value string) (cond string, args []any, ok bool) {
 		switch k {
 		case "":
 			continue
-		case "raw", "image":
-			ors = append(ors, `a.kind = ?`)
-			args = append(args, k)
-		case "photo":
+		case "raw":
+			ors = append(ors, `a.kind = 'raw'`)
+		case "image", "photo":
 			ors = append(ors, `a.kind != 'raw'`)
+		case "ultrahdr":
+			ors = append(ors, `(a.kind = 'ultrahdr' OR a.has_gain_map = 1)`)
 		default:
 			exts, alias := kindExtAliases[k]
 			if !alias {

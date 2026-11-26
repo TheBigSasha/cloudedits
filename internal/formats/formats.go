@@ -135,12 +135,35 @@ func IsRAW(name string) bool {
 	return ok
 }
 
-// Kind returns "raw" for camera RAW files and "image" for raster/HDR files.
+// Kind returns the format family for filename ("raw", "exr", "jpeg", "png", or
+// "image" for other raster formats). Call AssetKind when header probing has
+// also determined whether the asset carries an UltraHDR gain map.
 func Kind(name string) string {
 	if IsRAW(name) {
 		return "raw"
 	}
-	return "image"
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".exr":
+		return "exr"
+	case ".jpg", ".jpeg":
+		return "jpeg"
+	case ".png":
+		return "png"
+	default:
+		return "image"
+	}
+}
+
+// AssetKind returns the specific LP/2 asset kind for filename, classifying
+// non-RAW assets carrying an UltraHDR gain map as "ultrahdr".
+func AssetKind(name string, hasGainMap bool) string {
+	if IsRAW(name) {
+		return "raw"
+	}
+	if hasGainMap {
+		return "ultrahdr"
+	}
+	return Kind(name)
 }
 
 // MIME returns the canonical MIME type for a supported file, or
