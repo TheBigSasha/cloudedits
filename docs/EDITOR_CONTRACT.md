@@ -161,6 +161,7 @@ Receipt `status` values:
 - `rejected`: not applied and not journaled; `reason` says why.
   - `asset-not-found`: `assetKey` (and the optional `file` hint) resolve to no indexed asset, or the hint matches more than one. The photo may have been removed, or a rescan may be in progress, so a later retry can succeed.
   - `invalid-op`: missing `device`/`field`/`assetKey`, a malformed `hlc`, or a value the field cannot hold. Retrying the same op cannot succeed.
+  - `clock-skew`: the op's `hlc` is more than 24 hours ahead of the server's clock (see the drift bound in `docs/SIDECAR_FORMAT.md`). Retrying the same op cannot succeed until that time has passed, and it would then win against every edit made in between; the device has a wrong clock and must issue the edit again once it is corrected.
 
 `durable: true` covers every op reported `applied`.
 

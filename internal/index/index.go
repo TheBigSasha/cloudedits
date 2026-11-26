@@ -144,6 +144,10 @@ const (
 	// ReasonInvalidOp: the op is malformed (missing device/field/assetKey,
 	// malformed HLC, or a value its field cannot hold). A retry cannot succeed.
 	ReasonInvalidOp = "invalid-op"
+	// ReasonClockSkew: the op's HLC is further ahead of this server's clock
+	// than hlc.MaxDrift. The op can never be ordered fairly against other
+	// devices' edits; the device that issued it has a wrong clock.
+	ReasonClockSkew = "clock-skew"
 )
 
 // ChangeOp is one journal entry returned by GET /changes: an applied op, or
@@ -900,6 +904,10 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		// ops around it and is never journaled.
 		if !opWellFormed(op) {
 			plans[i].outcome, plans[i].reason = "rejected", ReasonInvalidOp
+			continue
+		}
+		if stamp, err := hlc.Parse(op.HLC); err == nil && hlc.BeyondDrift(stamp, time.Now()) {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonClockSkew
 			continue
 		}
 		key := opKey{device: op.Device, hlc: op.HLC}

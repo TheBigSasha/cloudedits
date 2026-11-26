@@ -57,7 +57,7 @@ func TestClockMonotonicAndObserve(t *testing.T) {
 		t.Fatalf("expected h1 < h2, got %q vs %q (cmp=%d err=%v)", h1, h2, cmp, err)
 	}
 
-	future := Format(1800000000000, 5, "remote-dev")
+	future := Format(1700000000000+3_600_000, 5, "remote-dev")
 	if err := clk.Observe(future); err != nil {
 		t.Fatalf("Observe failed: %v", err)
 	}

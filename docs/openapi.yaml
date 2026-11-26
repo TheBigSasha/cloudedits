@@ -283,8 +283,8 @@ components:
           type: string
         reason:
           type: string
-          enum: [asset-not-found, invalid-op]
-          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will.
+          enum: [asset-not-found, invalid-op, clock-skew]
+          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will; clock-skew means the op's HLC is more than 24 hours ahead of the server's clock and the op must be issued again with a correct clock.
     OpsRequest:
       type: object
       required: [ops]
