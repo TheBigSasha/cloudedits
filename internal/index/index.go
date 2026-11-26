@@ -186,7 +186,7 @@ func MakeAssetID(folderID, relPosix string) string {
 
 // Open initializes or opens the rebuildable SQLite WAL index at dbPath.
 func Open(dbPath, customSidecarDir string, folders []config.FolderConfig, sidecars *sidecar.Store) (*Index, error) {
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create index dir: %w", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)

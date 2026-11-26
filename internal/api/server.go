@@ -33,6 +33,7 @@ const (
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	maxRenderBytes        = 64 * 1024 * 1024
 	maxHandoffBytes       = 64 * 1024
+	maxSmallJSONBytes     = 64 * 1024
 	maxConcurrentStreams  = 16
 
 	// corsAllowHeaders lists every non-safelisted request header a browser
@@ -50,13 +51,16 @@ type Options struct {
 	ScratchName   string
 	PublicBaseURL string
 	EditorBaseURL string
-	Index         *index.Index
-	Thumbs        *thumb.Service
-	Handoffs      *handoff.Store
-	Auth          auth.Authenticator
-	Authorizer    auth.Authorizer
-	Sessions      *auth.SessionManager
-	Clock         *hlc.Clock
+	// AllowedOrigins lists additional browser origins permitted to call the
+	// API besides EditorBaseURL and PublicBaseURL (see newOriginPolicy).
+	AllowedOrigins []string
+	Index          *index.Index
+	Thumbs         *thumb.Service
+	Handoffs       *handoff.Store
+	Auth           auth.Authenticator
+	Authorizer     auth.Authorizer
+	Sessions       *auth.SessionManager
+	Clock          *hlc.Clock
 }
 
 // Server serves the hdr.toys Remote Library HTTP API v1.
@@ -71,9 +75,11 @@ type Server struct {
 	clock         *hlc.Clock
 	v1Clock       *hlc.Clock
 	v1Seed        sync.Once
+	origins       *originPolicy
 	streamSem     chan struct{}
 	activeStreams atomic.Int64
 	routes        []RouteSpec
+	mux           *http.ServeMux
 	handler       http.Handler
 }
 
@@ -114,8 +120,14 @@ func New(opts Options) (*Server, error) {
 		opts.Clock = hlc.NewClock("cloudedits", nil)
 	}
 
+	origins, err := newOriginPolicy(append([]string{opts.EditorBaseURL, opts.PublicBaseURL}, opts.AllowedOrigins...)...)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		opts:      opts,
+		origins:   origins,
 		idx:       opts.Index,
 		thumbs:    opts.Thumbs,
 		handoffs:  opts.Handoffs,
@@ -140,6 +152,7 @@ func New(opts Options) (*Server, error) {
 		mux.HandleFunc(specCopy.Method+" "+specCopy.Pattern, s.wrapRoute(specCopy))
 	}
 	mux.HandleFunc("/", s.handleFallback)
+	s.mux = mux
 	s.handler = s.withHeadersLaw(mux)
 	return s, nil
 }
@@ -151,6 +164,10 @@ func (s *Server) handleFallback(w http.ResponseWriter, r *http.Request) {
 	}
 	writeAPIError(w, http.StatusNotImplemented, "unsupported-capability", "unsupported capability")
 }
+
+// HasTestRoutes reports whether this binary was compiled with the dev_apis
+// build tag and therefore serves the destructive /__dev/* test endpoints.
+func HasTestRoutes() bool { return extraModeEnabled }
 
 // Routes returns a copy of the registered declarative RouteSpecs.
 func (s *Server) Routes() []RouteSpec {
@@ -225,7 +242,7 @@ func (s *Server) wrapRoute(spec RouteSpec) http.HandlerFunc {
 			spec.Handler(w, r)
 			return
 		case auth.AuthDevOnly:
-			if !auth.IsLoopbackRemoteAddr(r.RemoteAddr) {
+			if !auth.IsTrustedLoopbackRequest(r) {
 				writeError(w, http.StatusForbidden, "loopback only")
 				return
 			}
@@ -241,21 +258,31 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		// Headers Law: apply CORP + CORS on EVERY response (including 206/304/4xx/5xx/OPTIONS).
+		// Headers Law: apply CORP + nosniff on EVERY response (including
+		// 206/304/4xx/5xx/OPTIONS), and CORS to every allowed origin.
 		h := w.Header()
 		h.Set("Cross-Origin-Resource-Policy", "cross-origin")
-		origin := r.Header.Get("Origin")
-		if origin != "" {
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Add("Vary", "Origin")
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if !s.origins.allows(r, origin) {
+				// Refuse before routing or authentication: callers are
+				// authenticated by network position, so a foreign page must
+				// not be able to borrow it (nor trigger preflight-free writes).
+				h.Set("Server-Timing", formatServerTiming(start))
+				writeAPIError(w, http.StatusForbidden, "origin-not-allowed", "origin not allowed")
+				return
+			}
 			h.Set("Access-Control-Allow-Origin", origin)
-			h.Add("Vary", "Origin")
-		} else {
-			h.Set("Access-Control-Allow-Origin", "*")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", corsAllowHeaders)
+			h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 		}
-		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", corsAllowHeaders)
-		h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 
 		if r.Method == http.MethodOptions {
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				h.Set("Access-Control-Allow-Private-Network", "true")
+			}
 			h.Set("Access-Control-Max-Age", "600")
 			h.Set("Server-Timing", formatServerTiming(start))
 			w.WriteHeader(http.StatusNoContent)
@@ -761,6 +788,7 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Rating *int `json:"rating"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSmallJSONBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == nil {
 		writeError(w, http.StatusBadRequest, "invalid rating payload")
 		return

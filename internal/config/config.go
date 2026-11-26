@@ -34,10 +34,11 @@ type Config struct {
 	// PublicURL and TailscaleIP are the tailnet address of the enrolled node,
 	// recorded when it last came up so commands that do not start the node
 	// (qr, status, the setup wizard) can show where the library is reachable.
-	PublicURL    string         `json:"publicUrl,omitempty"`
-	TailscaleIP  string         `json:"tailscaleIp,omitempty"`
-	Folders      []FolderConfig `json:"folders"`
-	AllowedHosts []string       `json:"allowedOrigins,omitempty"`
+	PublicURL   string         `json:"publicUrl,omitempty"`
+	TailscaleIP string         `json:"tailscaleIp,omitempty"`
+	Folders     []FolderConfig `json:"folders"`
+	// AllowedOrigins lists extra browser origins allowed to call the API.
+	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
 }
 
 // DefaultDataDir returns the OS-standard directory outside photo folders where
@@ -132,7 +133,9 @@ func Save(cfg *Config) error {
 	if cfg.DataDir == "" {
 		cfg.DataDir = DefaultDataDir()
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	// The data directory holds the index (file names, ratings, keywords),
+	// the thumbnail cache and credentials: keep it private to this user.
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")

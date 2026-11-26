@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	_ "image/png" // Register PNG decoder for raster thumbnail generation.
 	"io"
@@ -33,6 +34,62 @@ import (
 
 // ErrOverloaded is returned when the bounded decode pool is saturated.
 var ErrOverloaded = errors.New("thumbnail worker pool saturated")
+
+// ErrImageTooLarge is returned when decoding a source image would need more
+// pixel memory than the thumbnail decode budget allows.
+var ErrImageTooLarge = errors.New("image dimensions exceed thumbnail decode budget")
+
+const (
+	// maxDecodeBytes bounds the estimated decoded pixel buffer of one source
+	// image. A file header can claim any dimensions in a few bytes (a 1 KiB
+	// lossless WebP or PNG may declare gigapixels), and the decoders allocate
+	// the full frame before reading pixel data, so without a bound a single
+	// hostile or corrupt file exhausts memory. 1 GiB admits every current
+	// camera format (100 MP at 16-bit RGBA is 0.8 GiB).
+	maxDecodeBytes = 1 << 30
+	// largeDecodeBytes is the estimate above which decodes run one at a time,
+	// so the worker pool cannot multiply the budget.
+	largeDecodeBytes = 256 << 20
+)
+
+var largeDecodeGate = make(chan struct{}, 1)
+
+// acquireDecodeBudget validates cfg against the decode budget and, for large
+// frames, serialises the decode. progressiveJPEG must be set for progressive
+// JPEG sources, whose decoder additionally keeps every DCT coefficient (four
+// bytes per sample) until the last scan. The caller must invoke release when
+// done.
+func acquireDecodeBudget(cfg image.Config, progressiveJPEG bool) (release func(), err error) {
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, errors.New("empty image dimensions")
+	}
+	bytesPerPixel := int64(4)
+	switch cfg.ColorModel {
+	case color.GrayModel:
+		bytesPerPixel = 1
+	case color.Gray16Model:
+		bytesPerPixel = 2
+	case color.YCbCrModel:
+		bytesPerPixel = 3
+	case color.RGBA64Model, color.NRGBA64Model:
+		bytesPerPixel = 8
+	}
+	if _, paletted := cfg.ColorModel.(color.Palette); paletted {
+		bytesPerPixel = 1
+	}
+	if progressiveJPEG {
+		bytesPerPixel *= 5
+	}
+	// Width and Height are at most 2^31 each, so compare by division.
+	if int64(cfg.Width) > maxDecodeBytes/bytesPerPixel/int64(cfg.Height) {
+		return nil, fmt.Errorf("%w (%dx%d)", ErrImageTooLarge, cfg.Width, cfg.Height)
+	}
+	if int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel <= largeDecodeBytes {
+		return func() {}, nil
+	}
+	largeDecodeGate <- struct{}{}
+	return func() { <-largeDecodeGate }, nil
+}
 
 // Result holds the resolved thumbnail bytes and provenance metadata.
 type Result struct {
@@ -244,11 +301,11 @@ func (s *Service) generateAndCache(
 
 	// Best-effort persist into app-data disk cache (never inside photo folders).
 	if s.cacheDir != "" {
-		if mkErr := os.MkdirAll(s.cacheDir, 0o755); mkErr == nil {
+		if mkErr := os.MkdirAll(s.cacheDir, 0o700); mkErr == nil {
 			tmp := cachePath + ".tmp"
-			if wErr := os.WriteFile(tmp, thumbBytes, 0o644); wErr == nil {
+			if wErr := os.WriteFile(tmp, thumbBytes, 0o600); wErr == nil {
 				_ = os.Rename(tmp, cachePath)
-				_ = os.WriteFile(metaPath, []byte(tierSource), 0o644)
+				_ = os.WriteFile(metaPath, []byte(tierSource), 0o600)
 			}
 		}
 	}
@@ -454,6 +511,10 @@ func findBestEmbeddedJPEGForTarget(data []byte, minLongEdge int) (best []byte, a
 			break
 		}
 		start := pos + idx
+		if start+3 >= len(data) {
+			// SOI at the very end of the scan window: no marker byte follows.
+			break
+		}
 		// Validate 4th byte is a valid JPEG marker (APP0..APP15, DQT, DHT, SOF0..SOF2, COM).
 		m := data[start+3]
 		if !isPlausibleJPEGStartMarker(m) {
@@ -621,6 +682,25 @@ func downscaleRasterFile(filePath string, maxDim int) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	cfg, format, err := image.DecodeConfig(bufio.NewReaderSize(f, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+	progressive := false
+	if format == "jpeg" {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		progressive = isProgressiveJPEG(bufio.NewReaderSize(f, 64*1024))
+	}
+	release, err := acquireDecodeBudget(cfg, progressive)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
 	img, _, err := image.Decode(bufio.NewReaderSize(f, 64*1024))
 	if err != nil {
 		return nil, err
@@ -633,11 +713,63 @@ func downscaleJPEGBytes(raw []byte, maxDim int) ([]byte, error) {
 	if img, err := decodeJPEGScale8Bytes(raw, minFastDim); err == nil {
 		return encodeBoundedJPEG(img, maxDim)
 	}
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireDecodeBudget(cfg, isProgressiveJPEG(bufio.NewReader(bytes.NewReader(raw))))
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	img, err := jpeg.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
 	return encodeBoundedJPEG(img, maxDim)
+}
+
+// isProgressiveJPEG walks JPEG segment headers up to the frame header and
+// reports whether it is progressive (SOF2). Anything unparseable reports false;
+// the decoder itself rejects such input.
+func isProgressiveJPEG(r *bufio.Reader) bool {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:2]); err != nil || hdr[0] != 0xFF || hdr[1] != 0xD8 {
+		return false
+	}
+	// A JPEG has at most a few dozen header segments before its frame header.
+	for segments := 0; segments < 1024; segments++ {
+		if _, err := io.ReadFull(r, hdr[:2]); err != nil || hdr[0] != 0xFF {
+			return false
+		}
+		marker := hdr[1]
+		for marker == 0xFF { // fill bytes
+			b, err := r.ReadByte()
+			if err != nil {
+				return false
+			}
+			marker = b
+		}
+		switch {
+		case marker == 0xC2:
+			return true
+		case marker == 0xDA || marker == 0xD9 || (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC):
+			return false
+		case marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8):
+			continue
+		}
+		if _, err := io.ReadFull(r, hdr[2:4]); err != nil {
+			return false
+		}
+		segLen := int(binary.BigEndian.Uint16(hdr[2:4]))
+		if segLen < 2 {
+			return false
+		}
+		if _, err := r.Discard(segLen - 2); err != nil {
+			return false
+		}
+	}
+	return false
 }
 
 func encodeBoundedJPEG(src image.Image, maxDim int) ([]byte, error) {
@@ -682,6 +814,14 @@ func ProbeImageHeader(filePath string) (width, height int, hasGainMap bool) {
 		return 0, 0, false
 	}
 	defer func() { _ = f.Close() }()
+	// The library scan probes every file on the caller's goroutine. A decoder
+	// panic on one malformed file must not take the whole server down (and
+	// keep taking it down on every restart): report unknown dimensions.
+	defer func() {
+		if r := recover(); r != nil {
+			width, height = 0, 0
+		}
+	}()
 
 	// Read initial 64 KiB for UltraHDR XMP/ISO 21496-1 markers.
 	hdr := make([]byte, 64*1024)

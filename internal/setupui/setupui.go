@@ -6,12 +6,17 @@ package setupui
 import (
 	"embed"
 	"encoding/json"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 
+	"github.com/thebigsasha/cloudedits/internal/auth"
 	"github.com/thebigsasha/cloudedits/internal/config"
 	"github.com/thebigsasha/cloudedits/internal/qr"
 )
+
+const maxRequestBytes = 64 * 1024
 
 //go:embed static/index.html
 var staticFS embed.FS
@@ -26,6 +31,54 @@ type StateProvider interface {
 
 // Handler returns an http.Handler for the loopback setup UI.
 func Handler(sp StateProvider) http.Handler {
+	return localOnly(newMux(sp))
+}
+
+// localOnly admits only requests the wizard's own page makes on this machine.
+// The wizard has no login: it reconfigures which folders the library serves,
+// so it must be unreachable from the network, from other web pages (which a
+// browser happily lets post to http://127.0.0.1), and from DNS-rebound names.
+func localOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("Referrer-Policy", "no-referrer")
+
+		if !auth.IsTrustedLoopbackRequest(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "setup is only available on this machine"})
+			return
+		}
+		// Browsers label every request with its relationship to this origin.
+		// Only the wizard's own page (same-origin) and address-bar or link
+		// navigations may proceed; another local port counts as "same-site".
+		navigation := r.Method == http.MethodGet && r.Header.Get("Sec-Fetch-Mode") == "navigate"
+		if site := r.Header.Get("Sec-Fetch-Site"); (site == "cross-site" || site == "same-site") && !navigation {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-site request refused"})
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || u.Scheme != "http" || !strings.EqualFold(u.Host, r.Host) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request refused"})
+				return
+			}
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			// A JSON content type cannot be sent cross-origin without a
+			// preflight, which this handler never answers.
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newMux(sp StateProvider) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {

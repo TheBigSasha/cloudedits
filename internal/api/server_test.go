@@ -25,7 +25,7 @@ import (
 	"github.com/thebigsasha/cloudedits/internal/thumb"
 )
 
-func sampleJPEG(t *testing.T, w, h int, c color.RGBA) []byte {
+func sampleJPEG(t testing.TB, w, h int, c color.RGBA) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
@@ -40,7 +40,7 @@ func sampleJPEG(t *testing.T, w, h int, c color.RGBA) []byte {
 	return buf.Bytes()
 }
 
-func newTestServer(t *testing.T, sidecarDir string) (*Server, string, string) {
+func newTestServer(t testing.TB, sidecarDir string) (*Server, string, string) {
 	t.Helper()
 	photoDir := t.TempDir()
 	dataDir := t.TempDir()

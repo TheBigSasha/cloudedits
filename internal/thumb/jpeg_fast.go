@@ -93,6 +93,7 @@ func (br *bitReader) refill() {
 			return
 		}
 		b := br.data[br.pos]
+		markerPos := br.pos
 		br.pos++
 		if b == 0xFF {
 			// Skip fill 0xFF bytes.
@@ -108,8 +109,10 @@ func (br *bitReader) refill() {
 				// Stuffed literal 0xFF byte.
 				br.pos++
 			} else {
-				// Reached a real marker (RSTm or EOI): back up to 0xFF and stop filling.
-				br.pos -= 2
+				// Reached a real marker (RSTm or EOI): back up to its 0xFF and
+				// stop filling. Entropy data ends here; never re-read the byte
+				// before the marker as if it were more scan data.
+				br.pos = markerPos
 				return
 			}
 		}

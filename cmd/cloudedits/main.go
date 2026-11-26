@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -254,9 +255,12 @@ func cmdServe(args []string) int {
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory (keeps source folders strictly read-only)")
 	scratchName := fs.String("scratch-name", "", "optional scratch library label advertised in /capabilities")
 	requireToken := fs.Bool("require-token", false, "require Authorization: Bearer token on authenticated endpoints")
-	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token")
+	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token (prefer the CLOUDEDITS_TOKEN environment variable: flags are visible to other local users)")
 	publicURL := fs.String("public-url", "", "override public base URL for redirects and handoff links")
 	noWatch := fs.Bool("no-watch", false, "do not follow folder changes after the initial scan")
+	var allowOrigins stringSliceFlag
+	fs.Var(&allowOrigins, "allow-origin", "additional browser origin allowed to call the API, e.g. https://preview.example or https://*.example.com (repeatable; the hdr.toys editor and this server's own URL are always allowed)")
+	allowDevNetwork := fs.Bool("allow-dev-apis-on-network", false, "permit a dev_apis test build to listen beyond loopback")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -301,10 +305,11 @@ func cmdServe(args []string) int {
 	defer stop()
 
 	sessions := auth.NewSessionManager(30 * time.Minute)
+	staticToken, mustUseToken := resolveTokenAuth(cfg, *token, *requireToken)
 	authenticator := &auth.CompositeAuthenticator{
 		Sessions:      sessions,
-		StaticToken:   *token,
-		RequireToken:  *requireToken,
+		StaticToken:   staticToken,
+		RequireToken:  mustUseToken,
 		AllowLoopback: !*useTsnet,
 	}
 
@@ -315,6 +320,11 @@ func cmdServe(args []string) int {
 	)
 
 	if *useTsnet {
+		// Fail before joining the tailnet rather than after.
+		if err := checkTestBuildExposure(api.HasTestRoutes(), nil, *allowDevNetwork); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			return exitUsage
+		}
 		node, err := tsnetnode.Start(ctx, tsnetnode.Options{
 			Hostname: cfg.Hostname,
 			StateDir: tsnetnode.StateDir(cfg.DataDir),
@@ -362,17 +372,23 @@ func cmdServe(args []string) int {
 			pubURL = "http://" + ln.Addr().String()
 		}
 	}
+	defer func() { _ = ln.Close() }()
+	if err := checkTestBuildExposure(api.HasTestRoutes(), ln.Addr(), *allowDevNetwork); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return exitUsage
+	}
 
 	apiSrv, err := api.New(api.Options{
-		LibraryID:     cfg.LibraryID,
-		LibraryName:   cfg.LibraryName,
-		ScratchName:   *scratchName,
-		PublicBaseURL: pubURL,
-		Index:         idx,
-		Thumbs:        thumb.NewService(filepath.Join(cfg.DataDir, "thumbs"), 0),
-		Handoffs:      handoff.NewStore(5 * time.Minute),
-		Auth:          authenticator,
-		Sessions:      sessions,
+		LibraryID:      cfg.LibraryID,
+		LibraryName:    cfg.LibraryName,
+		ScratchName:    *scratchName,
+		PublicBaseURL:  pubURL,
+		AllowedOrigins: append(append([]string{}, cfg.AllowedOrigins...), allowOrigins...),
+		Index:          idx,
+		Thumbs:         thumb.NewService(filepath.Join(cfg.DataDir, "thumbs"), 0),
+		Handoffs:       handoff.NewStore(5 * time.Minute),
+		Auth:           authenticator,
+		Sessions:       sessions,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init API server: %v\n", err)
@@ -411,10 +427,7 @@ const shutdownGrace = 5 * time.Second
 // in-flight requests have drained within shutdownGrace, and the background
 // scan has stopped. The caller may close the index as soon as it returns.
 func serveUntilDone(ctx context.Context, ln net.Listener, handler http.Handler, idx backgroundIndexer, watch bool, logf func(string, ...any)) error {
-	srv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newHTTPServer(handler)
 
 	bgCtx, stopBackground := context.WithCancel(ctx)
 	indexed := make(chan struct{})
@@ -820,10 +833,7 @@ func cmdGUI(args []string) int {
 		return exitStorage
 	}
 	state := &guiState{dataDir: cfg.DataDir, indexed: indexed}
-	srv := &http.Server{
-		Handler:           setupui.Handler(state),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newHTTPServer(setupui.Handler(state))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -871,11 +881,72 @@ func openBrowser(rawURL string) error {
 		return nil
 	}
 	cmd := exec.Command(name, args...)
+	cmd.Env = withoutSecrets(os.Environ())
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// newHTTPServer returns an http.Server with the connection limits every
+// cloudedits listener needs. Header reads are bounded against slow-header
+// clients and idle keep-alive connections are reaped, so a peer cannot pin
+// file descriptors indefinitely. Body reads and response writes stay
+// unbounded in time because originals and renders are legitimately large.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
+// resolveTokenAuth merges the token settings from config.json with the
+// command line: an explicit flag or environment token wins, and token mode is
+// required when either the flag or the persisted authMode asks for it.
+func resolveTokenAuth(cfg *config.Config, flagToken string, flagRequire bool) (token string, require bool) {
+	token = strings.TrimSpace(flagToken)
+	if token == "" {
+		token = strings.TrimSpace(cfg.BearerToken)
+	}
+	return token, flagRequire || strings.EqualFold(strings.TrimSpace(cfg.AuthMode), "token")
+}
+
+// checkTestBuildExposure refuses to serve a dev_apis test build beyond loopback
+// unless the operator opts in. Such builds carry /__dev/reset, which deletes
+// the sidecar directory, and must never be reachable from a network by
+// accident (for example a test binary started with --tsnet or 0.0.0.0).
+func checkTestBuildExposure(testBuild bool, addr net.Addr, allowNetwork bool) error {
+	if !testBuild || allowNetwork {
+		return nil
+	}
+	// Only a plain TCP listener bound to a loopback IP is local; a tailnet
+	// listener reports a non-TCP or non-loopback address.
+	if tcp, ok := addr.(*net.TCPAddr); ok && tcp.IP.IsLoopback() {
+		return nil
+	}
+	where := "the tailnet"
+	if addr != nil {
+		where = addr.String()
+	}
+	return fmt.Errorf("this is a dev_apis test build with destructive /__dev/* endpoints; refusing to listen on %s (not loopback). Use a release build, or pass --allow-dev-apis-on-network", where)
+}
+
+// secretEnvVars are credentials cloudedits reads from its environment that a
+// helper process such as the desktop browser must not inherit.
+var secretEnvVars = []string{"TS_AUTHKEY", "TS_AUTH_KEY", "CLOUDEDITS_TOKEN"}
+
+func withoutSecrets(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.ContainsFunc(secretEnvVars, func(s string) bool { return strings.EqualFold(s, name) }) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 func emitOutput(asJSON bool, payload any, human string) {

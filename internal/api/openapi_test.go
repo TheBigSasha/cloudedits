@@ -108,7 +108,7 @@ func TestLiveResponsesMatchOpenAPI(t *testing.T) {
 	srv, _, assetID := newTestServer(t, "")
 
 	do := func(method, target string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, target, nil)
+		req := httptest.NewRequest(method, "http://127.0.0.1"+target, nil)
 		req.RemoteAddr = "127.0.0.1:50000"
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, req)

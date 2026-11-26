@@ -201,7 +201,7 @@ components:
           properties:
             code:
               type: string
-              enum: [bad-request, invalid-path, unauthorized, forbidden, not-found, payload-too-large, unsupported-media-type, unprocessable-entity, rate-limited, unsupported-capability, service-unavailable, internal-error]
+              enum: [bad-request, invalid-path, unauthorized, forbidden, origin-not-allowed, not-found, payload-too-large, unsupported-media-type, unprocessable-entity, rate-limited, unsupported-capability, service-unavailable, internal-error]
             message:
               type: string
     ChangeOp:

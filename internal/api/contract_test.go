@@ -12,7 +12,7 @@ import (
 
 func getJSON(t *testing.T, srv *Server, target string) (int, map[string]any) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+target, nil)
 	req.RemoteAddr = "127.0.0.1:50000"
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -72,7 +72,7 @@ func TestPreflightAllowsEveryEditorRequestHeader(t *testing.T) {
 func TestRenderUploadReadsVariantFromHeader(t *testing.T) {
 	srv, _, assetID := newTestServer(t, t.TempDir())
 	body := bytes.NewReader(sampleJPEG(t, 32, 24, color.RGBA{10, 20, 30, 255}))
-	req := httptest.NewRequest(http.MethodPost, "/assets/"+assetID+"/renders", body)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/assets/"+assetID+"/renders", body)
 	req.RemoteAddr = "127.0.0.1:50000"
 	req.Header.Set("Content-Type", "image/jpeg")
 	req.Header.Set("Idempotency-Key", "render-hdr-1")
@@ -110,7 +110,7 @@ func TestOversizedOpsBodyIsPayloadTooLarge(t *testing.T) {
 	post := func(size int) (int, string) {
 		pad := strings.Repeat("a", size)
 		body := `[{"hlc":"019a2f001000-0001-d","device":"d","assetKey":"missing","field":"keywords","value":["` + pad + `"]}]`
-		req := httptest.NewRequest(http.MethodPost, "/ops", strings.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/ops", strings.NewReader(body))
 		req.RemoteAddr = "127.0.0.1:50000"
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()

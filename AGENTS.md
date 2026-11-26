@@ -30,10 +30,10 @@ go test -race -count=1 -tags dev_apis ./...
 golangci-lint run
 ```
 
-To verify zero dev symbols in a release binary:
+To verify zero dev symbols in a release binary (`go tool nm` reports nothing for a `-s -w` stripped binary, so use the script, which also scans embedded strings):
 
 ```bash
 go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-release ./cmd/cloudedits
-go tool nm /tmp/cloudedits-release | grep -E 'devapi|registerDevRoutesImpl|handleDev(Reset|Fault|Stats)' && exit 1 || echo OK
+./packaging/scripts/check-release-symbols.sh /tmp/cloudedits-release
 rm -f /tmp/cloudedits-release
 ```
