@@ -144,7 +144,7 @@ func cmdSetup(args []string) int {
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "rebuildable index/cache/state directory")
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory for :ro mounts")
 	authKeyStdin := fs.Bool("tailscale-auth-key-stdin", false, "read one-time Tailscale auth key from stdin")
-	installService := fs.Bool("install-service", false, "record service install intent")
+	_ = fs.Bool("install-service", false, "accepted for compatibility; no service is installed, run the reported serve command under your own service manager")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -216,21 +216,26 @@ func cmdSetup(args []string) int {
 	}
 
 	res := map[string]any{
-		"ok":             true,
-		"libraryId":      cfg.LibraryID,
-		"libraryName":    cfg.LibraryName,
-		"hostname":       cfg.Hostname,
-		"fqdn":           fqdn,
-		"tailscaleIp":    tailscaleIP,
-		"dataDir":        cfg.DataDir,
-		"sidecarDir":     cfg.SidecarDir,
-		"folders":        cfg.Folders,
-		"installService": *installService,
+		"ok":          true,
+		"libraryId":   cfg.LibraryID,
+		"libraryName": cfg.LibraryName,
+		"hostname":    cfg.Hostname,
+		"fqdn":        fqdn,
+		"tailscaleIp": tailscaleIP,
+		"dataDir":     cfg.DataDir,
+		"sidecarDir":  cfg.SidecarDir,
+		"folders":     cfg.Folders,
+		// setup only writes configuration (and enrolls the node when given an
+		// auth key). Nothing is serving until this command runs.
+		"serviceInstalled": false,
+		"serveCommand":     []string{"cloudedits", "serve", "--tsnet", "--data-dir", cfg.DataDir},
 	}
 	if fqdn != "" {
 		res["url"] = "https://" + fqdn
 	}
-	emitOutput(*jsonOut, res, fmt.Sprintf("Configured %d folder(s) in %s (hostname=%s)", len(cfg.Folders), cfg.DataDir, cfg.Hostname))
+	emitOutput(*jsonOut, res, fmt.Sprintf(
+		"Configured %d folder(s) in %s (hostname=%s)\nStart the server with: cloudedits serve --tsnet --data-dir %q",
+		len(cfg.Folders), cfg.DataDir, cfg.Hostname, cfg.DataDir))
 	return exitOK
 }
 
