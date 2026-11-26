@@ -344,7 +344,6 @@ func (a *CompositeAuthenticator) Authenticate(r *http.Request) (*Principal, erro
 		if a.StaticToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(a.StaticToken)) == 1 {
 			return OwnerPrincipal("token:default"), nil
 		}
-		return nil, ErrUnauthorized
 	}
 
 	// 2. Signed ?bt= query parameter (scoped solely to asset blob reads).
@@ -353,9 +352,15 @@ func (a *CompositeAuthenticator) Authenticate(r *http.Request) (*Principal, erro
 		if p, ok := a.Sessions.VerifyBlobToken(bt, assetID); ok {
 			return p, nil
 		}
-		return nil, ErrUnauthorized
 	}
 
+	// A token that is not recognised (expired, or issued before a restart:
+	// sessions and the blob-signing key live only in memory) authenticates
+	// nothing, but it does not disqualify the caller either. The identity
+	// checks below depend only on the connection, so a caller could reach
+	// them anyway by omitting the stale token; falling through lets an open
+	// tab keep working across a server restart. In token mode nothing below
+	// applies and the request is refused.
 	if a.RequireToken {
 		return nil, ErrUnauthorized
 	}
