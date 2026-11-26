@@ -6,6 +6,7 @@ package hlc
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,10 +142,20 @@ func (c *Clock) Tick() string {
 	defer c.mu.Unlock()
 
 	nowMs := uint64(max(c.nowFn().UnixMilli(), 0))
-	if nowMs > c.lastMillis {
+	switch {
+	case nowMs > c.lastMillis:
 		c.lastMillis = nowMs
 		c.lastCounter = 0
-	} else {
+	case c.lastCounter == math.MaxUint32:
+		// The counter is exhausted for this logical millisecond (an observed
+		// remote HLC can carry any counter): carry into the next millisecond
+		// rather than wrapping to zero and issuing an earlier timestamp. At
+		// the largest representable HLC the clock saturates.
+		if c.lastMillis < math.MaxUint64 {
+			c.lastMillis++
+			c.lastCounter = 0
+		}
+	default:
 		c.lastCounter++
 	}
 	return Format(c.lastMillis, c.lastCounter, c.device)

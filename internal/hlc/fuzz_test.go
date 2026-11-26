@@ -62,9 +62,8 @@ func FuzzParseCompare(f *testing.F) {
 		}
 		if errA == nil {
 			if cmp, err := Compare(after, a); err != nil || cmp <= 0 {
-				// A remote HLC at the counter ceiling cannot be exceeded within
-				// the same millisecond; that is the only permitted exception.
-				if pa.Counter != ^uint32(0) {
+				// Only the single largest representable HLC cannot be exceeded.
+				if pa.Counter != ^uint32(0) || pa.Millis != ^uint64(0) {
 					t.Fatalf("Tick %q is not greater than observed %q", after, a)
 				}
 			}
