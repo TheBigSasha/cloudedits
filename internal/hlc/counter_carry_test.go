@@ -11,7 +11,7 @@ import (
 func TestTickCarriesCounterOverflowIntoMillis(t *testing.T) {
 	fixed := time.UnixMilli(1_700_000_000_000)
 	c := NewClock("srv", func() time.Time { return fixed })
-	observed := Format(1_800_000_000_000, 0xFFFFFFFF, "peer")
+	observed := Format(1_700_003_600_000, 0xFFFFFFFF, "peer")
 	if err := c.Observe(observed); err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestTickCarriesCounterOverflowIntoMillis(t *testing.T) {
 		}
 		prev = next
 	}
-	if want := Format(1_800_000_000_001, 2, "srv"); prev != want {
+	if want := Format(1_700_003_600_001, 2, "srv"); prev != want {
 		t.Fatalf("after carry: %q, want %q", prev, want)
 	}
 }

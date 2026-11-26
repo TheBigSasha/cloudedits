@@ -104,9 +104,16 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 
 ## Change Feed (`GET /changes`)
 
-- `since` is the opaque `nextCursor` of the previous page; omit it to bootstrap from the start of the journal.
-- Each page carries the applied ops after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array with an unchanged `nextCursor` means the client is caught up.
-- `snapshotRequired: true` means the cursor is not a position in this server's journal — the rebuildable index was re-created after the cursor was issued. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- `since` is the opaque `nextCursor` of the previous page. Omit it to read from the oldest retained entry. Pass `since=head` to receive no entries and the current head as `nextCursor`: the starting point for a client that has just listed the assets and only needs what changes from now on.
+- Each page carries the journal entries after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array means the client is caught up.
+- An entry with `outcome: "applied"` is an op that `POST /ops` accepted. Apply it with the same last-writer-wins rule as a local edit.
+- An entry with `outcome: "observed"` is not an op. The server noticed the asset change outside the op stream, and `field` says what changed:
+  - `sidecar`: another program rewrote the asset's `.edits` state (a browser editor with direct access to the folder, a file sync, a hand edit, or a removed file). The entry's `hlc` is the newest HLC in the sidecar; fold it into the local clock so the next edit sorts after it. Take the asset's verdicts from `assets[]` and re-read its recipe and variants.
+  - `editThumbnail`: the asset's edited preview was replaced. The asset's `thumbnailUrl` in `assets[]` has changed; show that one.
+- `thumbnailUrl` carries a version (`v=`) that changes whenever the bytes it returns change, so a thumbnail may be cached for as long as its URL is in use.
+- `snapshotRequired: true` means the cursor is not a position in this server's retained journal: the rebuildable index was re-created after the cursor was issued, or the entries after it were already removed. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- The journal keeps its newest 20,000 entries. It is also what answers `duplicate` for a replayed `(device, hlc)`: an op replayed after its entry was removed is evaluated again and answered `stale` or `applied`.
+- Assets added to or removed from a folder are not journaled. A client learns of them by listing.
 
 ## Batch Operations (`POST /ops`)
 
@@ -143,6 +150,8 @@ Response body:
 
 `POST /ops` answers `200` with exactly one receipt per op, in request order. Only a body that is not a JSON op list (or exceeds the batch limit) fails the request as a whole; an op that cannot be applied gets its own `rejected` receipt and never blocks the ops around it.
 
+A `503` with `Retry-After` means another process (for example a browser editor that has the same folder open through direct file access) kept rewriting a target sidecar for the whole attempt. Nothing was applied; keep the ops and send them again.
+
 Limits: at most `limits.maxOpsBatch` ops and `limits.maxOpsBodyBytes` request-body bytes per call (both advertised by `GET /capabilities`). A request over either limit is rejected whole with `413` and error code `payload-too-large`; split the batch and retry.
 
 Receipt `status` values:
@@ -152,6 +161,7 @@ Receipt `status` values:
 - `rejected`: not applied and not journaled; `reason` says why.
   - `asset-not-found`: `assetKey` (and the optional `file` hint) resolve to no indexed asset, or the hint matches more than one. The photo may have been removed, or a rescan may be in progress, so a later retry can succeed.
   - `invalid-op`: missing `device`/`field`/`assetKey`, a malformed `hlc`, or a value the field cannot hold. Retrying the same op cannot succeed.
+  - `clock-skew`: the op's `hlc` is more than 24 hours ahead of the server's clock (see the drift bound in `docs/SIDECAR_FORMAT.md`). Retrying the same op cannot succeed until that time has passed, and it would then win against every edit made in between; the device has a wrong clock and must issue the edit again once it is corrected.
 
 `durable: true` covers every op reported `applied`.
 

@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -107,7 +108,7 @@ func CanonicalEditsPath(sidecarRoot, relPosix string) (string, error) {
 
 // EditThumbnailPath returns <sidecarRoot>/<relPosix>.edit_thumbnail.jpg.
 func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
-	return SafeJoinRel(sidecarRoot, relPosix+".edit_thumbnail.jpg")
+	return SafeJoinRel(sidecarRoot, relPosix+formats.EditThumbnailSuffix)
 }
 
 // ErrInvalidAuxChannel indicates an empty, syntactically invalid, or
@@ -164,6 +165,11 @@ type ReadResult struct {
 	// MergedFrom is the beside-the-photo copy that was joined into the
 	// canonical sidecar, when both layouts hold truth for the asset.
 	MergedFrom string
+
+	// canonicalRaw is the exact content of the canonical sidecar this read
+	// saw (nil when it was absent or quarantined). A writer compares it with
+	// the file again just before replacing it.
+	canonicalRaw []byte
 }
 
 // Read loads an asset's truth from both on-disk layouts and joins them:
@@ -185,7 +191,10 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 	if err != nil {
 		return nil, err
 	}
-	var inFolder *Sidecar
+	var (
+		inFolder     *Sidecar
+		canonicalRaw []byte
+	)
 	if data, _, err := safefile.ReadRegular(canonical, MaxSidecarBytes); err == nil {
 		sc, parseErr := Parse(data)
 		if parseErr != nil {
@@ -195,7 +204,7 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 			}
 			return &ReadResult{Quarantined: qPath}, nil
 		}
-		inFolder = sc
+		inFolder, canonicalRaw = sc, data
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -207,7 +216,7 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 	case inFolder == nil:
 		return &ReadResult{Sidecar: beside, SourcePath: besidePath}, nil
 	case beside == nil:
-		return &ReadResult{Sidecar: inFolder, SourcePath: canonical}, nil
+		return &ReadResult{Sidecar: inFolder, SourcePath: canonical, canonicalRaw: canonicalRaw}, nil
 	}
 	merged, err := Merge(inFolder, beside, MergeOptions{
 		RescueConflictingRecipes: true,
@@ -217,7 +226,7 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 	if err != nil {
 		return nil, fmt.Errorf("merge %s with %s: %w", canonical, besidePath, err)
 	}
-	return &ReadResult{Sidecar: merged, SourcePath: canonical, MergedFrom: besidePath}, nil
+	return &ReadResult{Sidecar: merged, SourcePath: canonical, MergedFrom: besidePath, canonicalRaw: canonicalRaw}, nil
 }
 
 // besidePhotoCandidates lists the read-only sidecar names beside a photo, in
@@ -275,6 +284,67 @@ func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
 		}
 	}
 	return int64(stamp)
+}
+
+// EditThumbnailStamp identifies the current content of an asset's edited
+// preview by modification time and size, or 0 when there is none. It changes
+// whenever the preview is replaced.
+func EditThumbnailStamp(sidecarRoot, relPosix string) int64 {
+	target, err := EditThumbnailPath(sidecarRoot, relPosix)
+	if err != nil {
+		return 0
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return 0
+	}
+	return editThumbnailStampOf(info)
+}
+
+func editThumbnailStampOf(info os.FileInfo) int64 {
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return 0
+	}
+	// Odd-forced so an existing preview never stamps as 0.
+	return int64((uint64(info.ModTime().UTC().UnixNano()) ^ (uint64(info.Size()) * 0x9e3779b97f4a7c15)) | 1)
+}
+
+// EditThumbnailStamps returns the stamp of every edited preview stored under
+// sidecarRoot, keyed by the asset's POSIX relative path. It lists directories
+// and stats only the previews, so its cost follows the number of edited
+// photos, not the size of the library.
+func EditThumbnailStamps(sidecarRoot string) map[string]int64 {
+	out := map[string]int64{}
+	_ = filepath.WalkDir(sidecarRoot, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // an unreadable entry only hides its own previews
+		}
+		if d.IsDir() {
+			if p != sidecarRoot && filepath.Dir(p) == sidecarRoot {
+				switch d.Name() {
+				case ".tmp", ".quarantine", "renders":
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), formats.EditThumbnailSuffix) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil //nolint:nilerr // vanished between listing and stat
+		}
+		rel, err := filepath.Rel(sidecarRoot, p)
+		if err != nil {
+			return nil //nolint:nilerr // cannot happen for a path under the walked root
+		}
+		if stamp := editThumbnailStampOf(info); stamp != 0 {
+			out[strings.TrimSuffix(filepath.ToSlash(rel), formats.EditThumbnailSuffix)] = stamp
+		}
+		return nil
+	})
+	return out
 }
 
 // staleStagingAge is how old an orphaned staging file must be before it is
@@ -377,6 +447,13 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 }
 
 func writeAtomic(sidecarRoot, targetPath string, data []byte, durable bool) error {
+	return writeAtomicGuarded(sidecarRoot, targetPath, data, durable, nil)
+}
+
+// writeAtomicGuarded is writeAtomic with a last-moment veto: precommit runs
+// after the bytes are staged and flushed, immediately before the rename. When
+// it returns an error nothing is replaced and that error is returned.
+func writeAtomicGuarded(sidecarRoot, targetPath string, data []byte, durable bool, precommit func() error) error {
 	tmpDir := filepath.Join(sidecarRoot, ".tmp")
 	if _, known := ensuredDirs.Load(tmpDir); !known {
 		sweepStaleStaging(tmpDir)
@@ -428,6 +505,11 @@ func writeAtomic(sidecarRoot, targetPath string, data []byte, durable bool) erro
 		return fmt.Errorf("close staging file: %w", err)
 	}
 
+	if precommit != nil {
+		if err := precommit(); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		// Target parent directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(targetDir)
@@ -478,55 +560,100 @@ func (s *Store) UpdateWithGen(
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	res, err := s.Read(folderRoot, sidecarRoot, relPosix)
-	if err != nil {
-		return nil, false, 0, err
-	}
-	sc := res.Sidecar
-	if sc == nil {
-		sc = Empty(path.Base(relPosix), sizeBytes, contentHash)
-	} else {
-		if sc.Asset == nil {
-			sc.Asset = map[string]any{}
+	// Another process can own the same folder: a browser editor with direct
+	// file access writes this very file with its own read-merge-write. Staging
+	// (write + flush) takes long enough for such a write to land after this
+	// update's read; renaming over it would discard an edit that process was
+	// told is saved. So the file is compared with what was read immediately
+	// before the rename, and a changed file restarts the read-merge-write.
+	for attempt := 1; ; attempt++ {
+		res, err := s.Read(folderRoot, sidecarRoot, relPosix)
+		if err != nil {
+			return nil, false, 0, err
 		}
-		if _, hasFile := sc.Asset["file"]; !hasFile {
-			sc.Asset["file"] = path.Base(relPosix)
-		}
-		if sizeBytes != nil {
-			if _, hasBytes := sc.Asset["bytes"]; !hasBytes {
-				sc.Asset["bytes"] = *sizeBytes
+		sc := res.Sidecar
+		if sc == nil {
+			sc = Empty(path.Base(relPosix), sizeBytes, contentHash)
+		} else {
+			if sc.Asset == nil {
+				sc.Asset = map[string]any{}
+			}
+			if _, hasFile := sc.Asset["file"]; !hasFile {
+				sc.Asset["file"] = path.Base(relPosix)
+			}
+			if sizeBytes != nil {
+				if _, hasBytes := sc.Asset["bytes"]; !hasBytes {
+					sc.Asset["bytes"] = *sizeBytes
+				}
+			}
+			if contentHash != "" {
+				if _, hasHash := sc.Asset["hash"]; !hasHash {
+					sc.Asset["hash"] = contentHash
+				}
 			}
 		}
-		if contentHash != "" {
-			if _, hasHash := sc.Asset["hash"]; !hasHash {
-				sc.Asset["hash"] = contentHash
-			}
+
+		changed, err := mutate(sc)
+		if err != nil {
+			return nil, false, 0, err
 		}
-	}
+		if !changed {
+			return sc, false, lk.gen, nil
+		}
 
-	changed, err := mutate(sc)
-	if err != nil {
-		return nil, false, 0, err
+		payload, err := Serialize(sc)
+		if err != nil {
+			return nil, false, 0, err
+		}
+		if len(payload) > MaxSidecarBytes {
+			// Never write a document Read would refuse: that would strand the
+			// asset's edits on disk where no later op could reach them.
+			return nil, false, 0, fmt.Errorf("%w: %s would be %d bytes (limit %d)", ErrSidecarTooLarge, canonical, len(payload), MaxSidecarBytes)
+		}
+		err = writeAtomicGuarded(sidecarRoot, canonical, payload, durableWrites, func() error {
+			return canonicalStillHolds(canonical, res.canonicalRaw)
+		})
+		if errors.Is(err, errCanonicalMoved) {
+			if attempt < maxCommitAttempts {
+				continue
+			}
+			return nil, false, 0, fmt.Errorf("%w: %s changed during %d consecutive writes", ErrContended, canonical, attempt)
+		}
+		if err != nil {
+			return nil, false, 0, err
+		}
+		lk.gen++
+		s.writeCount.Add(1)
+		return sc, true, lk.gen, nil
 	}
-	if !changed {
-		return sc, false, lk.gen, nil
-	}
+}
 
-	payload, err := Serialize(sc)
-	if err != nil {
-		return nil, false, 0, err
+// maxCommitAttempts bounds how often one update restarts because another
+// process replaced the sidecar under it.
+const maxCommitAttempts = 6
+
+// ErrContended reports that another process kept rewriting a sidecar for the
+// whole of an update, so nothing was written. The update can be retried.
+var ErrContended = errors.New("sidecar is being written by another process")
+
+var errCanonicalMoved = errors.New("canonical sidecar changed since it was read")
+
+// canonicalStillHolds reports errCanonicalMoved unless the canonical sidecar
+// still has exactly the content seen (nil: it did not exist).
+func canonicalStillHolds(canonical string, seen []byte) error {
+	now, _, err := safefile.ReadRegular(canonical, MaxSidecarBytes)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if seen == nil {
+			return nil
+		}
+		return errCanonicalMoved
+	case err != nil:
+		return err
+	case seen == nil || !bytes.Equal(now, seen):
+		return errCanonicalMoved
 	}
-	if len(payload) > MaxSidecarBytes {
-		// Never write a document Read would refuse: that would strand the
-		// asset's edits on disk where no later op could reach them.
-		return nil, false, 0, fmt.Errorf("%w: %s would be %d bytes (limit %d)", ErrSidecarTooLarge, canonical, len(payload), MaxSidecarBytes)
-	}
-	if err := WriteAtomic(sidecarRoot, canonical, payload); err != nil {
-		return nil, false, 0, err
-	}
-	lk.gen++
-	s.writeCount.Add(1)
-	return sc, true, lk.gen, nil
+	return nil
 }
 
 // WriteEditThumbnail atomically writes an edited preview JPEG to

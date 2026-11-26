@@ -196,7 +196,7 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 	}
 
 	// GET /changes returns the 3 ops.
-	chResp, err := http.Get(ts.URL + "/changes?since=0")
+	chResp, err := http.Get(ts.URL + "/changes")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -61,3 +61,57 @@ func TestPostOpsReportsRejectedOpsPerReceipt(t *testing.T) {
 		t.Fatalf("rating an unknown asset: status %d, want 404", ratingResp.StatusCode)
 	}
 }
+
+// An op stamped far ahead of the server's clock would win last-writer-wins
+// against every edit any device makes until that time arrives. It is refused
+// on its own receipt, leaves no trace in the sidecar or the journal, does not
+// move the server's clock, and does not block the op next to it.
+func TestPostOpsRejectsAnOpBeyondTheClockDriftBound(t *testing.T) {
+	srv, _, assetID := newTestServer(t, "")
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body := `[
+		{"hlc":"1fffffffffffff-ffffffff-z","device":"z","assetKey":"` + assetID + `","field":"rating","value":5},
+		{"hlc":"019a2f001000-0001-devA","device":"devA","assetKey":"` + assetID + `","field":"rating","value":2}
+	]`
+	resp, err := http.Post(ts.URL+"/ops", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out struct {
+		Receipts []struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"receipts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != http.StatusOK || len(out.Receipts) != 2 {
+		t.Fatalf("POST /ops: status=%d err=%v receipts=%+v", resp.StatusCode, err, out.Receipts)
+	}
+	if out.Receipts[0].Status != "rejected" || out.Receipts[0].Reason != "clock-skew" || out.Receipts[1].Status != "applied" {
+		t.Fatalf("receipts = %+v, want [rejected clock-skew, applied]", out.Receipts)
+	}
+	if asset, err := srv.idx.GetAsset(t.Context(), assetID); err != nil || asset.Rating != 2 {
+		t.Fatalf("rating = %+v err=%v, want the in-bound op's 2", asset, err)
+	}
+	if feed, err := srv.idx.ChangesSince(t.Context(), "", 0); err != nil || len(feed.Ops) != 1 {
+		t.Fatalf("journal = %+v err=%v, want only the applied op", feed, err)
+	}
+	// The next server-issued HLC is near the present, not at the refused one.
+	del, _ := http.NewRequest(http.MethodDelete, ts.URL+"/assets/"+assetID+"/variants/none", nil)
+	delResp, err := http.DefaultClient.Do(del)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delOut struct {
+		Receipts []struct {
+			HLC string `json:"hlc"`
+		} `json:"receipts"`
+	}
+	_ = json.NewDecoder(delResp.Body).Decode(&delOut)
+	_ = delResp.Body.Close()
+	if len(delOut.Receipts) != 1 || strings.HasPrefix(delOut.Receipts[0].HLC, "1fffffffffffff") {
+		t.Fatalf("server clock after the refused op issued %+v", delOut.Receipts)
+	}
+}

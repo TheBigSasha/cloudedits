@@ -225,6 +225,13 @@ components:
         value: {}
         outcome:
           type: string
+          enum: [applied, observed]
+          description: >-
+            `applied` is an op accepted by `POST /ops`. `observed` is not an op: the server
+            noticed the asset change outside the op stream, and `field` says what changed
+            (`sidecar`: the `.edits` state was rewritten by another program; `editThumbnail`:
+            the edited preview was replaced). Re-read the asset from `assets` instead of
+            applying `value`.
     ChangesResponse:
       type: object
       required: [ops, assets, nextCursor]
@@ -242,7 +249,7 @@ components:
           description: Opaque cursor to pass as `since` on the next poll.
         snapshotRequired:
           type: boolean
-          description: True when `since` is not a position in this server's journal; re-run the initial sync and continue from `nextCursor`.
+          description: True when `since` is not a position in this server's retained journal (it belongs to another journal, or the entries after it were already removed); re-run the initial sync and continue from `nextCursor`.
     TruthOp:
       type: object
       required: [hlc, device, assetKey, field]
@@ -276,8 +283,8 @@ components:
           type: string
         reason:
           type: string
-          enum: [asset-not-found, invalid-op]
-          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will.
+          enum: [asset-not-found, invalid-op, clock-skew]
+          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will; clock-skew means the op's HLC is more than 24 hours ahead of the server's clock and the op must be issued again with a correct clock.
     OpsRequest:
       type: object
       required: [ops]
@@ -828,6 +835,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Another process kept rewriting a target sidecar; nothing was applied. Retry after `Retry-After` seconds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /changes:
     get:
       summary: Poll monotonic change feed
@@ -836,7 +849,7 @@ paths:
       parameters:
         - name: since
           in: query
-          description: Opaque `nextCursor` of the previous page; omit to bootstrap.
+          description: Opaque `nextCursor` of the previous page. Omit it to read from the oldest retained entry, or pass `head` to get only the current head as `nextCursor`.
           schema:
             type: string
         - name: limit

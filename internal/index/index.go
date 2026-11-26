@@ -60,9 +60,13 @@ type Asset struct {
 	RecipeURL       string         `json:"recipeUrl,omitempty"`
 	EXIF            map[string]any `json:"exif,omitempty"`
 	EXIFJSON        string         `json:"-"`
-	FolderRoot      string         `json:"-"`
-	SidecarRoot     string         `json:"-"`
-	AbsPath         string         `json:"-"`
+	// ThumbnailVersion changes whenever the bytes a thumbnail request returns
+	// change (the source file or the edited preview was replaced). The API
+	// puts it in thumbnailUrl so a cached thumbnail is never shown stale.
+	ThumbnailVersion string `json:"-"`
+	FolderRoot       string `json:"-"`
+	SidecarRoot      string `json:"-"`
+	AbsPath          string `json:"-"`
 }
 
 // GridAsset is the compact projection returned for fields=grid range queries.
@@ -140,9 +144,14 @@ const (
 	// ReasonInvalidOp: the op is malformed (missing device/field/assetKey,
 	// malformed HLC, or a value its field cannot hold). A retry cannot succeed.
 	ReasonInvalidOp = "invalid-op"
+	// ReasonClockSkew: the op's HLC is further ahead of this server's clock
+	// than hlc.MaxDrift. The op can never be ordered fairly against other
+	// devices' edits; the device that issued it has a wrong clock.
+	ReasonClockSkew = "clock-skew"
 )
 
-// ChangeOp represents one journaled op returned by GET /changes.
+// ChangeOp is one journal entry returned by GET /changes: an applied op, or
+// (Outcome "observed") a change the server noticed outside the op stream.
 type ChangeOp struct {
 	Seq      int64           `json:"seq"`
 	Device   string          `json:"device"`
@@ -160,9 +169,10 @@ type ChangesFeed struct {
 	Ops        []ChangeOp `json:"ops"`
 	Assets     []Asset    `json:"assets"`
 	NextCursor string     `json:"nextCursor"`
-	// SnapshotRequired tells a client its cursor is not a position in this
-	// journal (the rebuildable index was re-created since the cursor was
-	// issued), so it must re-run its initial sync and resume from NextCursor.
+	// SnapshotRequired tells a client its cursor is not a position in the
+	// retained journal (the rebuildable index was re-created since the cursor
+	// was issued, or the entries after it were already removed), so it must
+	// re-run its initial sync and resume from NextCursor.
 	SnapshotRequired bool `json:"snapshotRequired,omitempty"`
 }
 
@@ -175,8 +185,16 @@ type Index struct {
 
 	writeMu    sync.Mutex
 	appliedGen map[string]uint64
-	mu         sync.RWMutex
-	folders    map[string]config.FolderConfig
+	// journalFloor mirrors journal_meta.floor; guarded by writeMu.
+	journalFloor int64
+	clock        *hlc.Clock
+
+	assetMuGuard sync.Mutex
+	assetMus     map[string]*sync.Mutex
+
+	mu           sync.RWMutex
+	folders      map[string]config.FolderConfig
+	journalEpoch string
 }
 
 // MakeAssetID constructs the opaque URL-safe asset ID for a (folderID, relPosix) pair.
@@ -224,7 +242,13 @@ func Open(dbPath, customSidecarDir string, folders []config.FolderConfig, sideca
 		sidecars:   sidecars,
 		sidecarDir: customSidecarDir,
 		appliedGen: map[string]uint64{},
+		clock:      hlc.NewClock(observedDevice, nil),
+		assetMus:   map[string]*sync.Mutex{},
 		folders:    map[string]config.FolderConfig{},
+	}
+	if err := idx.loadJournalMeta(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	if err := idx.SetFolders(context.Background(), folders); err != nil {
 		_ = db.Close()
@@ -366,6 +390,17 @@ CREATE TABLE IF NOT EXISTS ops_log (
 	outcome TEXT NOT NULL,
 	op_json TEXT NOT NULL,
 	UNIQUE(device, hlc)
+);
+
+CREATE TABLE IF NOT EXISTS journal_meta (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS asset_feed_state (
+	asset_id TEXT PRIMARY KEY,
+	sidecar_digest TEXT NOT NULL DEFAULT '',
+	thumb_stamp INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_captured ON assets(captured_at DESC, id);
@@ -770,7 +805,44 @@ func (idx *Index) scanAssets(ctx context.Context, rows *sql.Rows) ([]Asset, erro
 			out[pos].Keywords = append(out[pos].Keywords, kw)
 		}
 	}
-	return out, kRows.Err()
+	if err := kRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Batch load the accounted edited-preview stamp of each returned asset.
+	for i := range out {
+		out[i].ThumbnailVersion = thumbnailVersion(out[i].SourceRevision, 0)
+	}
+	tRows, err := idx.db.QueryContext(ctx,
+		`SELECT asset_id, thumb_stamp FROM asset_feed_state WHERE thumb_stamp != 0 AND asset_id IN (`+strings.Join(placeholders, ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tRows.Close() }()
+	for tRows.Next() {
+		var (
+			aid   string
+			stamp int64
+		)
+		if err := tRows.Scan(&aid, &stamp); err != nil {
+			return nil, err
+		}
+		if pos, ok := byID[aid]; ok {
+			out[pos].ThumbnailVersion = thumbnailVersion(out[pos].SourceRevision, stamp)
+		}
+	}
+	return out, tRows.Err()
+}
+
+// thumbnailVersion names the bytes a thumbnail request currently returns for
+// a source revision and edited-preview stamp.
+func thumbnailVersion(sourceRevision string, thumbStamp int64) string {
+	if thumbStamp == 0 {
+		return sourceRevision
+	}
+	return sourceRevision + "-" + strconv.FormatUint(uint64(thumbStamp), 36)
 }
 
 func (idx *Index) attachPaths(a *Asset) {
@@ -815,6 +887,9 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		sc        *sidecar.Sidecar
 		changed   bool
 		gen       uint64
+		// preDigest is the edit state found on disk before this batch's ops
+		// were applied; postDigest the state the batch left there.
+		preDigest, postDigest string
 	}
 
 	plans := make([]opPlan, len(ops))
@@ -829,6 +904,10 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		// ops around it and is never journaled.
 		if !opWellFormed(op) {
 			plans[i].outcome, plans[i].reason = "rejected", ReasonInvalidOp
+			continue
+		}
+		if stamp, err := hlc.Parse(op.HLC); err == nil && hlc.BeyondDrift(stamp, time.Now()) {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonClockSkew
 			continue
 		}
 		key := opKey{device: op.Device, hlc: op.HLC}
@@ -894,6 +973,15 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	}
 	sort.Strings(sortedAssetIDs)
 
+	// Each touched asset stays locked from before its sidecar is rewritten
+	// until the journal rows below are committed (see assetLock). Taking the
+	// locks in sorted order keeps two overlapping batches from deadlocking.
+	for _, aid := range sortedAssetIDs {
+		mu := idx.assetLock(aid)
+		mu.Lock()
+		defer mu.Unlock()
+	}
+
 	applyGroup := func(aid string) error {
 		g := groups[aid]
 		sizeCopy := g.asset.SizeBytes
@@ -904,6 +992,7 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 			&sizeCopy,
 			g.asset.ContentHash,
 			func(cur *sidecar.Sidecar) (bool, error) {
+				g.preDigest = sidecar.EditDigest(cur)
 				anyChanged := false
 				for _, idxPos := range g.opIndices {
 					opChanged, applyErr := sidecar.ApplyOp(cur, plans[idxPos].op)
@@ -913,10 +1002,16 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 						plans[idxPos].outcome, plans[idxPos].reason = "rejected", ReasonInvalidOp
 						continue
 					}
-					if opChanged {
+					switch {
+					case opChanged:
 						plans[idxPos].outcome = "applied"
 						anyChanged = true
-					} else {
+					case sidecar.HoldsOp(cur, plans[idxPos].op):
+						// A replay whose journal row is gone (the journal is
+						// bounded): the op is what is on disk, so it is
+						// applied, not a loser of last-writer-wins.
+						plans[idxPos].outcome = "applied"
+					default:
 						plans[idxPos].outcome = "stale"
 					}
 				}
@@ -929,6 +1024,10 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		g.sc = sc
 		g.changed = changed
 		g.gen = gen
+		g.postDigest = g.preDigest
+		if changed {
+			g.postDigest = sidecar.EditDigest(sc)
+		}
 		return nil
 	}
 
@@ -984,19 +1083,49 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var headSeq int64
 	pendingGen := make(map[string]uint64, len(sortedAssetIDs))
 	for _, aid := range sortedAssetIDs {
 		g := groups[aid]
-		if !g.changed || g.sc == nil {
+		if g.sc == nil {
 			continue
+		}
+		// The sidecar is read and merged before the ops are applied. If what
+		// was on disk is not what the journal last accounted for, another
+		// program edited the folder and this write absorbed its edit: say so
+		// ahead of the batch's own ops, or no client would ever hear of it.
+		st, err := readFeedStateTx(ctx, tx, aid)
+		if err != nil {
+			return nil, err
+		}
+		absorbed := st.have && st.digest != g.preDigest
+		if absorbed {
+			seq, err := journalObservedTx(ctx, tx, aid, FieldSidecar, idx.observedHLC(sidecar.LatestHLC(g.sc)))
+			if err != nil {
+				return nil, err
+			}
+			headSeq = max(headSeq, seq)
+		}
+		if !st.have || st.digest != g.postDigest {
+			thumb := st.thumb
+			if !st.have {
+				thumb = sidecar.EditThumbnailStamp(g.asset.SidecarRoot, g.asset.RelPath)
+			}
+			if err := writeFeedStateTx(ctx, tx, aid, g.postDigest, thumb); err != nil {
+				return nil, err
+			}
 		}
 		// Only apply SQLite projection if this sidecar generation is newer than
 		// the last committed generation for this asset.
-		if g.gen > idx.appliedGen[aid] {
+		if g.changed && g.gen > idx.appliedGen[aid] {
 			if err := syncAssetFromSidecarTx(ctx, tx, aid, g.sc); err != nil {
 				return nil, err
 			}
 			pendingGen[aid] = g.gen
+		} else if absorbed {
+			if err := syncAssetFromSidecarTx(ctx, tx, aid, g.sc); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1036,9 +1165,11 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 			return nil, err
 		}
 
-		if err := recordOpLogTx(ctx, tx, p.op, p.assetID, p.outcome); err != nil {
+		seq, err := recordOpLogTx(ctx, tx, p.op, p.assetID, p.outcome)
+		if err != nil {
 			return nil, err
 		}
+		headSeq = max(headSeq, seq)
 		receipts[i] = OpReceipt{
 			Device: p.op.Device,
 			HLC:    p.op.HLC,
@@ -1046,9 +1177,16 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		}
 	}
 
+	floor := idx.journalFloor
+	if headSeq > 0 {
+		if floor, err = idx.pruneJournalTx(ctx, tx, headSeq); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	idx.journalFloor = floor
 	for aid, gen := range pendingGen {
 		if gen > idx.appliedGen[aid] {
 			idx.appliedGen[aid] = gen
@@ -1083,18 +1221,22 @@ func opWellFormed(op sidecar.TruthOp) bool {
 	return op.Field == "import" || strings.TrimSpace(op.AssetKey) != "" || strings.TrimSpace(op.File) != ""
 }
 
-func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) error {
+// recordOpLogTx journals one op and returns its seq.
+func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) (int64, error) {
 	raw, err := json.Marshal(op)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	sum := sha256.Sum256(raw)
 	hash := hex.EncodeToString(sum[:8])
-	_, err = tx.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO ops_log(device, hlc, asset_id, field, payload_hash, outcome, op_json) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		op.Device, op.HLC, assetID, op.Field, hash, outcome, string(raw),
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 func syncAssetFromSidecarTx(ctx context.Context, tx *sql.Tx, assetID string, sc *sidecar.Sidecar) error {
@@ -1113,26 +1255,53 @@ func syncAssetFromSidecarTx(ctx context.Context, tx *sql.Tx, assetID string, sc 
 	return replaceKeywordsTx(ctx, tx, assetID, keywords)
 }
 
-// ChangesSince returns all applied journaled ops after sinceCursor and the
-// current state of affected assets for multi-device convergence.
+// ChangesSince returns the journal entries after sinceCursor (applied ops and
+// observed changes, oldest first) with the current state of the assets they
+// touch.
+//
+//   - "" starts at the oldest retained entry.
+//   - HeadCursor returns no entries and the head as NextCursor: the starting
+//     point of a client that has just listed the assets.
+//   - A cursor that is not a position in the retained journal (another
+//     journal's cursor, one ahead of the head, or one whose following entries
+//     were removed) returns SnapshotRequired with the head as NextCursor.
 func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit int) (*ChangesFeed, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	var sinceSeq int64
-	if sinceCursor != "" {
-		trimmed := strings.TrimPrefix(strings.TrimSpace(sinceCursor), "c")
-		if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil && n >= 0 {
-			sinceSeq = n
+	empty := func(head int64, snapshotRequired bool) *ChangesFeed {
+		return &ChangesFeed{
+			Ops:              []ChangeOp{},
+			Assets:           []Asset{},
+			NextCursor:       idx.formatCursor(head),
+			SnapshotRequired: snapshotRequired,
 		}
+	}
+
+	floor, head, err := idx.journalBounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var sinceSeq int64
+	switch cursor := strings.TrimSpace(sinceCursor); cursor {
+	case "":
+		sinceSeq = floor
+	case HeadCursor:
+		return empty(head, false), nil
+	default:
+		seq, ok := idx.parseCursor(cursor)
+		if !ok || seq < floor || seq > head {
+			return empty(head, true), nil
+		}
+		sinceSeq = seq
 	}
 
 	rows, err := idx.db.QueryContext(ctx, `
 		SELECT seq, device, hlc, asset_id, field, outcome, op_json
 		FROM ops_log
-		WHERE seq > ? AND outcome = 'applied'
+		WHERE seq > ? AND outcome IN (?, ?)
 		ORDER BY seq ASC
-		LIMIT ?`, sinceSeq, limit)
+		LIMIT ?`, sinceSeq, outcomeApplied, OutcomeObserved, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1157,36 +1326,35 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 				c.AssetKey = parsed.AssetKey
 			}
 			c.Value = parsed.Value
+			if c.Outcome == OutcomeObserved {
+				// The row's own device and hlc columns only key it.
+				c.Device, c.HLC = parsed.Device, parsed.HLC
+			}
 		}
 		ops = append(ops, c)
 		if c.AssetID != "" && c.AssetID != "@library" {
 			assetIDs[c.AssetID] = true
 		}
-		if c.Seq > lastSeq {
-			lastSeq = c.Seq
-		}
+		lastSeq = c.Seq
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// An empty page is either a bootstrap over a journal with no applied
-	// entries (anchor nextCursor at the journal head so callers hold a valid
-	// fence) or a cursor that is not a position in this journal at all.
-	snapshotRequired := false
-	if len(ops) == 0 {
-		var maxSeq sql.NullInt64
-		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err != nil {
-			return nil, fmt.Errorf("read journal head: %w", err)
-		}
-		head := maxSeq.Int64 // 0 when the journal is empty
-		switch {
-		case sinceSeq > head:
-			snapshotRequired = true
-			lastSeq = head
-		case sinceSeq == 0:
-			lastSeq = head
-		}
+	// Entries can be removed while a page is read. If that reached past the
+	// cursor the page may have a hole, so the client must take a snapshot.
+	floorNow, headNow, err := idx.journalBounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if sinceSeq < floorNow {
+		return empty(headNow, true), nil
+	}
+	// A page that is not full has read to the end: every later entry is one
+	// the feed does not carry (an op that lost last-writer-wins), so the
+	// cursor moves to the head instead of stopping before them forever.
+	if len(ops) < limit {
+		lastSeq = max(lastSeq, head)
 	}
 
 	ids := make([]string, 0, len(assetIDs))
@@ -1199,10 +1367,9 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 	}
 
 	return &ChangesFeed{
-		Ops:              ops,
-		Assets:           assets,
-		NextCursor:       fmt.Sprintf("c%d", lastSeq),
-		SnapshotRequired: snapshotRequired,
+		Ops:        ops,
+		Assets:     assets,
+		NextCursor: idx.formatCursor(lastSeq),
 	}, nil
 }
 
@@ -1262,16 +1429,23 @@ func (idx *Index) ResetIndex(ctx context.Context) error {
 	_, err1 := tx.ExecContext(ctx, `DELETE FROM asset_keywords`)
 	_, err2 := tx.ExecContext(ctx, `DELETE FROM assets`)
 	_, err3 := tx.ExecContext(ctx, `DELETE FROM ops_log`)
-	if err1 != nil || err2 != nil || err3 != nil {
+	_, err4 := tx.ExecContext(ctx, `DELETE FROM asset_feed_state`)
+	// Every cursor issued so far names a journal that no longer exists.
+	epoch := randomToken()
+	_, err5 := tx.ExecContext(ctx, `UPDATE journal_meta SET value = ? WHERE key = ?`, epoch, metaJournalEpoch)
+	if err := errors.Join(err1, err2, err3, err4, err5); err != nil {
 		_ = tx.Rollback()
 		idx.writeMu.Unlock()
-		return errors.Join(err1, err2, err3)
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		idx.writeMu.Unlock()
 		return err
 	}
 	clear(idx.appliedGen)
+	idx.mu.Lock()
+	idx.journalEpoch = epoch
+	idx.mu.Unlock()
 	idx.writeMu.Unlock()
 
 	return idx.ScanAll(ctx)
