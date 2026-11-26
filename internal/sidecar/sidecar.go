@@ -737,10 +737,10 @@ func variantFromOpValue(v any, opHLC string) (Variant, error) {
 	}
 	vr := Variant{ID: id, HLC: opHLC, Extra: map[string]any{}}
 	liftVariantMembers(&vr, m)
-	// An op states deletion or nothing: a falsy "tombstone" is not recorded.
-	if !variantTombstoned(vr) {
-		delete(vr.Extra, "tombstone")
-	}
+	// An op states deletion as the boolean true or not at all, whatever JSON
+	// type its "tombstone" member had.
+	vr.Tombstone = variantTombstoned(vr)
+	delete(vr.Extra, "tombstone")
 	return vr, nil
 }
 

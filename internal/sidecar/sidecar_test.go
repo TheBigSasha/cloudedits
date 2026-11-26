@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,6 +255,30 @@ func TestSafeJoinRelKeepsBackslashNamesDistinctOnPOSIX(t *testing.T) {
 	for _, rel := range []string{"../escape", "a/../../escape", `..\..\escape`, `a\..\..\escape`, "", ".", "/"} {
 		if got, err := SafeJoinRel(base, rel); err == nil && !strings.HasPrefix(got, base+string(filepath.Separator)) {
 			t.Fatalf("SafeJoinRel(%q) escaped to %s", rel, got)
+		}
+	}
+}
+
+// A variant op states deletion as the boolean true or not at all. A truthy
+// non-boolean "tombstone" is a deletion; a falsy one is not recorded.
+func TestVariantOpTombstoneIsNormalizedToBoolean(t *testing.T) {
+	for raw, wantTombstone := range map[string]bool{`"yes"`: true, `1`: true, `true`: true, `""`: false, `0`: false, `false`: false, `null`: false} {
+		sc := Empty("a.jpg", nil, "")
+		var op TruthOp
+		dec := json.NewDecoder(strings.NewReader(`{"hlc":"019a2f001000-0001-devA","device":"devA","assetKey":"a","field":"variant","value":{"id":"v1","tombstone":` + raw + `}}`))
+		dec.UseNumber()
+		if err := dec.Decode(&op); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ApplyOp(sc, op); err != nil {
+			t.Fatalf("ApplyOp tombstone=%s: %v", raw, err)
+		}
+		out, err := Serialize(sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(string(out), `"tombstone": true`); got != wantTombstone || strings.Count(string(out), "tombstone") > 1 || (!wantTombstone && strings.Contains(string(out), "tombstone")) {
+			t.Errorf("tombstone=%s serialized as:\n%s", raw, out)
 		}
 	}
 }

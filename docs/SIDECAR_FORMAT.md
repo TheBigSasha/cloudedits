@@ -103,9 +103,8 @@ The canonical bytes of a sidecar are exactly what `JSON.stringify(value, null, 2
 ### Known differences from the browser editor
 
 - A lone UTF-16 surrogate escape (`"\ud800"`) cannot be represented in a Go string and is read as `U+FFFD`.
-- A key named `__proto__` is preserved here; the browser editor drops it.
 - HLC strings are validated on read. A sidecar whose cell carries a malformed HLC is quarantined here, while the browser editor loads it and fails only when it next compares that cell.
-- A `variant` op keeps every member of its value (for example `snapshotKind`), not only `id`, `name`, `recipe`, and `tombstone`.
+- A `variant` op keeps every member of its value (for example `snapshotKind`), and keys named like `Object.prototype` members (`__proto__`, `constructor`, `toString`) are ordinary data. Browser editor builds that predate the reference vectors kept only `id`, `name`, `recipe`, and `tombstone` of a variant op and dropped or mangled those keys.
 
 ## Deterministic Merge Lattice
 
