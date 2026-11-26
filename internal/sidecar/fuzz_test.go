@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/thebigsasha/cloudedits/internal/jsjson"
 )
 
 func addGoldenEditsSeeds(f *testing.F) {
@@ -53,8 +55,22 @@ func FuzzParseSerialize(f *testing.F) {
 		if !json.Valid(first) {
 			t.Fatalf("Serialize emitted invalid JSON:\n%s", first)
 		}
-		if !bytes.HasPrefix(first, []byte("{\n  \"hdrt\": ")) || !bytes.HasSuffix(first, []byte("\n}\n")) {
+		if !bytes.HasPrefix(first, []byte("{\n  \"")) || !bytes.HasSuffix(first, []byte("\n}\n")) {
 			t.Fatalf("Serialize output is not canonical framed:\n%s", first)
+		}
+		// "hdrt" leads every top-level key except array-index keys, which an
+		// ECMAScript engine always enumerates first.
+		for _, line := range bytes.Split(first, []byte("\n"))[1:] {
+			if !bytes.HasPrefix(line, []byte("  \"")) || bytes.HasPrefix(line, []byte("   ")) {
+				continue
+			}
+			key, _, _ := bytes.Cut(line[3:], []byte("\": "))
+			if string(key) == "hdrt" {
+				break
+			}
+			if _, isIndex := jsjson.ArrayIndex(string(key)); !isIndex {
+				t.Fatalf("top-level key %q precedes hdrt:\n%s", key, first)
+			}
 		}
 		sc2, err := Parse(first)
 		if err != nil {
