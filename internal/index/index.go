@@ -1433,7 +1433,8 @@ func (idx *Index) ResetIndex(ctx context.Context) error {
 	// Every cursor issued so far names a journal that no longer exists.
 	epoch := randomToken()
 	_, err5 := tx.ExecContext(ctx, `UPDATE journal_meta SET value = ? WHERE key = ?`, epoch, metaJournalEpoch)
-	if err := errors.Join(err1, err2, err3, err4, err5); err != nil {
+	_, err6 := tx.ExecContext(ctx, `UPDATE journal_meta SET value = '0' WHERE key = ?`, metaJournalFloor)
+	if err := errors.Join(err1, err2, err3, err4, err5, err6); err != nil {
 		_ = tx.Rollback()
 		idx.writeMu.Unlock()
 		return err
@@ -1446,6 +1447,7 @@ func (idx *Index) ResetIndex(ctx context.Context) error {
 	idx.mu.Lock()
 	idx.journalEpoch = epoch
 	idx.mu.Unlock()
+	idx.journalFloor = 0
 	idx.writeMu.Unlock()
 
 	return idx.ScanAll(ctx)

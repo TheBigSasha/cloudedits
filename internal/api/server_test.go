@@ -412,19 +412,19 @@ func TestHeadersLawRangeOpsEditThumbnailAndHandoff(t *testing.T) {
 		t.Fatalf("expected tombstoned v1 when includeTombstones=true, got %+v", varAllBody.Variants)
 	}
 
-	// POST /auth/session issues session + blobToken that work for authenticated reads.
+	// POST /auth/session issues a session bearer token and no library-wide blobToken (O4).
 	sesResp, err := http.Post(ts.URL+"/auth/session", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sesBody struct {
-		Token     string `json:"token"`
-		BlobToken string `json:"blobToken"`
-	}
+	var sesBody map[string]any
 	_ = json.NewDecoder(sesResp.Body).Decode(&sesBody)
 	_ = sesResp.Body.Close()
-	if sesBody.Token == "" || sesBody.BlobToken == "" {
-		t.Fatalf("expected session token and blobToken, got %+v", sesBody)
+	if tok, _ := sesBody["token"].(string); tok == "" {
+		t.Fatalf("expected session token, got %+v", sesBody)
+	}
+	if _, hasBlob := sesBody["blobToken"]; hasBlob {
+		t.Fatalf("POST /auth/session must not mint unused blobToken, got %+v", sesBody)
 	}
 }
 

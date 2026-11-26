@@ -392,6 +392,23 @@ paths:
       responses:
         "200":
           description: Issued session token and expiry
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, subject, expiresAt, permissions]
+                properties:
+                  token:
+                    type: string
+                  subject:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  permissions:
+                    type: array
+                    items:
+                      type: string
         "401":
           description: Unauthorized
   /assets/count:
@@ -490,10 +507,6 @@ paths:
           schema:
             type: string
             enum: [original, t0, t1, t2, thumb, preview]
-        - name: bt
-          in: query
-          schema:
-            type: string
       responses:
         "200":
           description: Full media bytes

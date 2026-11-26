@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/thebigsasha/cloudedits/internal/auth"
 )
@@ -423,14 +422,27 @@ func TestAuxChannelCORSOriginAndPermissions(t *testing.T) {
 		t.Fatalf("Access-Control-Expose-Headers=%q missing X-HDRT-Aux-Channel", putRec.Header().Get("Access-Control-Expose-Headers"))
 	}
 
-	// 3. ?bt= blob token grants asset:read (GET succeeds) but NOT media:write (PUT/DELETE -> 403).
-	bt := srv.sessions.SignBlobToken("tailnet:alice", assetID, 5*time.Minute)
-	getReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target+"?bt="+bt, nil)
+	// 3. Read-only session token (asset:read only) grants GET but NOT media:write (PUT/DELETE -> 403),
+	// and ?bt= query parameter credentials are rejected (401).
+	readTok, _ := srv.sessions.Issue(&auth.Principal{
+		Subject: "tailnet:alice",
+		Scopes:  map[auth.Permission]bool{auth.PermAssetRead: true},
+	})
+	getReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target, nil)
 	getReq.RemoteAddr = "203.0.113.7:50000"
+	getReq.Header.Set("Authorization", "Bearer "+readTok)
 	getRec := httptest.NewRecorder()
 	srv.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusOK {
-		t.Fatalf("GET with blob token status=%d, want 200", getRec.Code)
+		t.Fatalf("GET with read-only session token status=%d, want 200", getRec.Code)
+	}
+
+	btReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target+"?bt="+readTok, nil)
+	btReq.RemoteAddr = "203.0.113.7:50000"
+	btRec := httptest.NewRecorder()
+	srv.ServeHTTP(btRec, btReq)
+	if btRec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET with ?bt= query token status=%d, want 401", btRec.Code)
 	}
 
 	for _, method := range []string{http.MethodPut, http.MethodDelete} {
@@ -438,12 +450,13 @@ func TestAuxChannelCORSOriginAndPermissions(t *testing.T) {
 		if method == http.MethodPut {
 			body = bytes.NewReader(validPNG)
 		}
-		req := httptest.NewRequest(method, "http://library.example"+target+"?bt="+bt, body)
+		req := httptest.NewRequest(method, "http://library.example"+target, body)
 		req.RemoteAddr = "203.0.113.7:50000"
+		req.Header.Set("Authorization", "Bearer "+readTok)
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("%s with read-only blob token status=%d, want 403", method, rec.Code)
+			t.Fatalf("%s with read-only session token status=%d, want 403", method, rec.Code)
 		}
 	}
 

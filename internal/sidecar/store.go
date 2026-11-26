@@ -195,7 +195,7 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 		inFolder     *Sidecar
 		canonicalRaw []byte
 	)
-	if data, _, err := safefile.ReadRegular(canonical, MaxSidecarBytes); err == nil {
+	if data, err := readRegularUnderRoot(sidecarRoot, canonical, MaxSidecarBytes); err == nil {
 		sc, parseErr := Parse(data)
 		if parseErr != nil {
 			qPath, qErr := quarantineFile(sidecarRoot, relPosix, canonical)
@@ -288,13 +288,24 @@ func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
 
 // EditThumbnailStamp identifies the current content of an asset's edited
 // preview by modification time and size, or 0 when there is none. It changes
-// whenever the preview is replaced.
+// whenever the preview is replaced. Uses os.Root + Lstat so symbolic links
+// (either the file itself or a parent directory escaping sidecarRoot) report 0,
+// matching EditThumbnailStamps and thumb.Service.
 func EditThumbnailStamp(sidecarRoot, relPosix string) int64 {
 	target, err := EditThumbnailPath(sidecarRoot, relPosix)
 	if err != nil {
 		return 0
 	}
-	info, err := os.Stat(target)
+	rel, err := relWithinRoot(sidecarRoot, target)
+	if err != nil {
+		return 0
+	}
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = root.Close() }()
+	info, err := root.Lstat(rel)
 	if err != nil {
 		return 0
 	}
@@ -386,19 +397,96 @@ func syncDirectory(dir string) error {
 	return closeErr
 }
 
-// ensureDir creates dir (and parents) once per process. When it actually had
-// to create something under a durable write, the new directory entries are
-// flushed up to and including stopAt's parent.
-func ensureDir(dir, stopAt string, durable bool) error {
-	if _, ok := ensuredDirs.Load(dir); ok {
+// openSidecarRoot opens sidecarRoot as an os.Root so every write, rename,
+// remove, and read beneath it is confined to the sidecar tree and cannot
+// follow symlinked directories outside sidecarRoot. A sidecarRoot that is
+// itself a symbolic link is refused.
+func openSidecarRoot(sidecarRoot string, create, durable bool) (*os.Root, error) {
+	info, err := os.Lstat(sidecarRoot)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("sidecar root %q must not be a symbolic link", sidecarRoot)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("sidecar root %q is not a directory", sidecarRoot)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		if !create {
+			return nil, err
+		}
+		if err := os.MkdirAll(sidecarRoot, 0o755); err != nil {
+			return nil, err
+		}
+		if durable {
+			if err := syncDir(filepath.Dir(sidecarRoot)); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, err
+	}
+	return os.OpenRoot(sidecarRoot)
+}
+
+// relWithinRoot returns targetPath relative to sidecarRoot and rejects any
+// path that does not stay strictly beneath sidecarRoot.
+func relWithinRoot(sidecarRoot, targetPath string) (string, error) {
+	absRoot, err := filepath.Abs(sidecarRoot)
+	if err != nil {
+		return "", err
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absRoot, absTarget)
+	if err != nil {
+		return "", err
+	}
+	if rel == "" || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path %q escapes sidecar root %q", targetPath, sidecarRoot)
+	}
+	return rel, nil
+}
+
+// readRegularUnderRoot reads targetPath strictly beneath sidecarRoot using os.Root.
+func readRegularUnderRoot(sidecarRoot, targetPath string, limit int64) ([]byte, error) {
+	rel, err := relWithinRoot(sidecarRoot, targetPath)
+	if err != nil {
+		return nil, err
+	}
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	data, _, err := safefile.ReadRegularInRoot(root, rel, limit)
+	return data, err
+}
+
+// ensureDirInRoot creates relDir (and missing parents) strictly inside root.
+// When it had to create directories under a durable write, the newly created
+// parent directory entries are flushed up to sidecarRoot.
+func ensureDirInRoot(root *os.Root, sidecarRoot, relDir string, durable bool) error {
+	if relDir == "" || relDir == "." {
 		return nil
 	}
-	_, statErr := os.Stat(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	fullDir := filepath.Join(sidecarRoot, relDir)
+	_, statErr := root.Stat(relDir)
+	if statErr == nil {
+		ensuredDirs.Store(fullDir, struct{}{})
+		return nil
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		// Propagate root-escape or permission errors instead of masking them.
+		return statErr
+	}
+	if err := root.MkdirAll(relDir, 0o755); err != nil {
 		return err
 	}
-	if statErr != nil && durable {
-		for p := dir; ; p = filepath.Dir(p) {
+	if durable {
+		for p := fullDir; ; p = filepath.Dir(p) {
 			parent := filepath.Dir(p)
 			if parent == p {
 				break
@@ -406,20 +494,25 @@ func ensureDir(dir, stopAt string, durable bool) error {
 			if err := syncDir(parent); err != nil {
 				return err
 			}
-			if p == stopAt {
+			if p == sidecarRoot {
 				break
 			}
 		}
 	}
-	ensuredDirs.Store(dir, struct{}{})
+	ensuredDirs.Store(fullDir, struct{}{})
 	return nil
 }
 
-// sweepStaleStaging removes staging files orphaned by a process that died
+// sweepStaleStagingInRoot removes staging files orphaned by a process that died
 // between creating one and renaming it into place. Only this server's own
 // "<32 hex>.tmp" names are considered, and only once they are old.
-func sweepStaleStaging(tmpDir string) {
-	entries, err := os.ReadDir(tmpDir)
+func sweepStaleStagingInRoot(root *os.Root) {
+	d, err := root.Open(".tmp")
+	if err != nil {
+		return
+	}
+	entries, err := d.ReadDir(-1)
+	_ = d.Close()
 	if err != nil {
 		return
 	}
@@ -433,7 +526,7 @@ func sweepStaleStaging(tmpDir string) {
 			continue
 		}
 		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
-			_ = os.Remove(filepath.Join(tmpDir, name))
+			_ = root.Remove(filepath.Join(".tmp", name))
 		}
 	}
 }
@@ -441,7 +534,9 @@ func sweepStaleStaging(tmpDir string) {
 // WriteAtomic durably replaces targetPath with data: stage in
 // <sidecarRoot>/.tmp/<uuid>, write, fsync, close, rename, fsync the target
 // directory. A reader sees the old bytes or the new bytes, never a mixture,
-// and once WriteAtomic returns the new bytes survive power loss.
+// and once WriteAtomic returns the new bytes survive power loss. All directory
+// creation, staging, and renaming happen through os.Root so symlinked
+// directories inside sidecarRoot cannot escape it.
 func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 	return writeAtomic(sidecarRoot, targetPath, data, durableWrites)
 }
@@ -454,40 +549,50 @@ func writeAtomic(sidecarRoot, targetPath string, data []byte, durable bool) erro
 // after the bytes are staged and flushed, immediately before the rename. When
 // it returns an error nothing is replaced and that error is returned.
 func writeAtomicGuarded(sidecarRoot, targetPath string, data []byte, durable bool, precommit func() error) error {
+	relTarget, err := relWithinRoot(sidecarRoot, targetPath)
+	if err != nil {
+		return err
+	}
+	root, err := openSidecarRoot(sidecarRoot, true, durable)
+	if err != nil {
+		return fmt.Errorf("open sidecar root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+
 	tmpDir := filepath.Join(sidecarRoot, ".tmp")
 	if _, known := ensuredDirs.Load(tmpDir); !known {
-		sweepStaleStaging(tmpDir)
+		sweepStaleStagingInRoot(root)
 	}
-	if err := ensureDir(tmpDir, sidecarRoot, durable); err != nil {
+	if err := ensureDirInRoot(root, sidecarRoot, ".tmp", durable); err != nil {
 		return fmt.Errorf("create .tmp dir: %w", err)
 	}
-	targetDir := filepath.Dir(targetPath)
-	if err := ensureDir(targetDir, sidecarRoot, durable); err != nil {
+	relTargetDir := filepath.Dir(relTarget)
+	if err := ensureDirInRoot(root, sidecarRoot, relTargetDir, durable); err != nil {
 		return fmt.Errorf("create target dir: %w", err)
 	}
 
-	tmpPath := filepath.Join(tmpDir, randomHex(16)+".tmp")
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
+	tmpRel := filepath.Join(".tmp", randomHex(16)+".tmp")
+	f, err := root.OpenFile(tmpRel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil && errors.Is(err, os.ErrNotExist) {
 		// Directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(tmpDir)
-		ensuredDirs.Delete(targetDir)
-		if mkErr := ensureDir(tmpDir, sidecarRoot, durable); mkErr != nil {
+		ensuredDirs.Delete(filepath.Join(sidecarRoot, relTargetDir))
+		if mkErr := ensureDirInRoot(root, sidecarRoot, ".tmp", durable); mkErr != nil {
 			return fmt.Errorf("create .tmp dir: %w", mkErr)
 		}
-		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
+		if mkErr := ensureDirInRoot(root, sidecarRoot, relTargetDir, durable); mkErr != nil {
 			return fmt.Errorf("create target dir: %w", mkErr)
 		}
-		f, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err != nil {
-			return fmt.Errorf("create staging file: %w", err)
-		}
+		f, err = root.OpenFile(tmpRel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	}
+	if err != nil {
+		return fmt.Errorf("create staging file: %w", err)
 	}
 
 	renamed := false
 	defer func() {
 		if !renamed {
-			_ = os.Remove(tmpPath)
+			_ = root.Remove(tmpRel)
 		}
 	}()
 
@@ -510,19 +615,23 @@ func writeAtomicGuarded(sidecarRoot, targetPath string, data []byte, durable boo
 			return err
 		}
 	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		// Target parent directory may have been removed externally; recreate and retry once.
-		ensuredDirs.Delete(targetDir)
-		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
-			return fmt.Errorf("atomic rename: %w", err)
-		}
-		if err2 := os.Rename(tmpPath, targetPath); err2 != nil {
+	if err := root.Rename(tmpRel, relTarget); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Target parent directory may have been removed externally; recreate and retry once.
+			ensuredDirs.Delete(filepath.Join(sidecarRoot, relTargetDir))
+			if mkErr := ensureDirInRoot(root, sidecarRoot, relTargetDir, durable); mkErr != nil {
+				return fmt.Errorf("atomic rename: %w", mkErr)
+			}
+			if err2 := root.Rename(tmpRel, relTarget); err2 != nil {
+				return fmt.Errorf("atomic rename: %w", err2)
+			}
+		} else {
 			return fmt.Errorf("atomic rename: %w", err)
 		}
 	}
 	renamed = true
 	if durable {
-		if err := syncDir(targetDir); err != nil {
+		if err := syncDir(filepath.Join(sidecarRoot, relTargetDir)); err != nil {
 			return fmt.Errorf("fsync target directory: %w", err)
 		}
 	}
@@ -611,7 +720,7 @@ func (s *Store) UpdateWithGen(
 			return nil, false, 0, fmt.Errorf("%w: %s would be %d bytes (limit %d)", ErrSidecarTooLarge, canonical, len(payload), MaxSidecarBytes)
 		}
 		err = writeAtomicGuarded(sidecarRoot, canonical, payload, durableWrites, func() error {
-			return canonicalStillHolds(canonical, res.canonicalRaw)
+			return canonicalStillHolds(sidecarRoot, canonical, res.canonicalRaw)
 		})
 		if errors.Is(err, errCanonicalMoved) {
 			if attempt < maxCommitAttempts {
@@ -640,8 +749,8 @@ var errCanonicalMoved = errors.New("canonical sidecar changed since it was read"
 
 // canonicalStillHolds reports errCanonicalMoved unless the canonical sidecar
 // still has exactly the content seen (nil: it did not exist).
-func canonicalStillHolds(canonical string, seen []byte) error {
-	now, _, err := safefile.ReadRegular(canonical, MaxSidecarBytes)
+func canonicalStillHolds(sidecarRoot, canonical string, seen []byte) error {
+	now, err := readRegularUnderRoot(sidecarRoot, canonical, MaxSidecarBytes)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if seen == nil {
@@ -692,7 +801,7 @@ func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if data, err := readAuxChannelFile(canonical); err == nil {
+	if data, err := readAuxChannelFileUnderRoot(sidecarRoot, canonical); err == nil {
 		return data, canonical, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
@@ -708,6 +817,23 @@ func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string
 		}
 	}
 	return nil, "", os.ErrNotExist
+}
+
+// readAuxChannelFileUnderRoot reads an auxiliary channel file strictly beneath
+// sidecarRoot via os.Root, rejecting symlinked directories escaping sidecarRoot
+// as well as non-regular, oversized, or non-PNG files.
+func readAuxChannelFileUnderRoot(sidecarRoot, targetPath string) ([]byte, error) {
+	data, err := readRegularUnderRoot(sidecarRoot, targetPath, MaxAuxChannelBytes)
+	if errors.Is(err, safefile.ErrNotRegular) || errors.Is(err, safefile.ErrTooLarge) {
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !formats.IsPNGMagic(data) {
+		return nil, os.ErrNotExist
+	}
+	return data, nil
 }
 
 // readAuxChannelFile returns an auxiliary channel file only if it is something
@@ -762,14 +888,27 @@ func (s *Store) DeleteAuxChannel(sidecarRoot, relPosix, channel string) (bool, e
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if err := os.Remove(target); err != nil {
+	relTarget, err := relWithinRoot(sidecarRoot, target)
+	if err != nil {
+		return false, err
+	}
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() { _ = root.Close() }()
+
+	if err := root.Remove(relTarget); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		return false, err
 	}
 	if durableWrites {
-		if err := syncDir(filepath.Dir(target)); err != nil {
+		if err := syncDir(filepath.Join(sidecarRoot, filepath.Dir(relTarget))); err != nil {
 			return true, fmt.Errorf("fsync target directory after delete: %w", err)
 		}
 	}
@@ -813,21 +952,39 @@ func (s *Store) SaveRender(sidecarRoot, relPosix, renderID, variantID, mimeType 
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if info, err := os.Stat(target); err == nil {
-		return &RenderEntry{
-			RenderID:  cleanID,
-			VariantID: variantID,
-			FileName:  filepath.Base(target),
-			MIME:      mimeType,
-			SizeBytes: info.Size(),
-			UpdatedAt: info.ModTime().UTC().Format(time.RFC3339),
-		}, false, nil
+	relWithin, err := relWithinRoot(sidecarRoot, target)
+	if err != nil {
+		return nil, false, err
+	}
+	if root, rerr := openSidecarRoot(sidecarRoot, false, false); rerr == nil {
+		info, serr := root.Stat(relWithin)
+		_ = root.Close()
+		if serr == nil {
+			return &RenderEntry{
+				RenderID:  cleanID,
+				VariantID: variantID,
+				FileName:  filepath.Base(target),
+				MIME:      mimeType,
+				SizeBytes: info.Size(),
+				UpdatedAt: info.ModTime().UTC().Format(time.RFC3339),
+			}, false, nil
+		}
+		if !errors.Is(serr, os.ErrNotExist) {
+			return nil, false, serr
+		}
+	} else if !errors.Is(rerr, os.ErrNotExist) {
+		return nil, false, rerr
 	}
 
 	if err := WriteAtomic(sidecarRoot, target, data); err != nil {
 		return nil, false, err
 	}
-	info, err := os.Stat(target)
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return nil, false, err
+	}
+	info, err := root.Stat(relWithin)
+	_ = root.Close()
 	if err != nil {
 		return nil, false, err
 	}
@@ -847,10 +1004,27 @@ func (s *Store) ListRenders(sidecarRoot, relPosix string) ([]RenderEntry, error)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(dir)
+	relDir, err := relWithinRoot(sidecarRoot, dir)
+	if err != nil {
+		return nil, err
+	}
+	root, err := openSidecarRoot(sidecarRoot, false, false)
 	if errors.Is(err, os.ErrNotExist) {
 		return []RenderEntry{}, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	d, err := root.Open(relDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return []RenderEntry{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	entries, err := d.ReadDir(-1)
+	_ = d.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -894,10 +1068,23 @@ func quarantineFile(sidecarRoot, relPosix, srcPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+	srcRel, err := relWithinRoot(sidecarRoot, srcPath)
+	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(srcPath, dstPath); err != nil {
+	dstRel, err := relWithinRoot(sidecarRoot, dstPath)
+	if err != nil {
+		return "", err
+	}
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.MkdirAll(".quarantine", 0o755); err != nil {
+		return "", err
+	}
+	if err := root.Rename(srcRel, dstRel); err != nil {
 		return "", err
 	}
 	return dstPath, nil

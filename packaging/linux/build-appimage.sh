@@ -38,19 +38,52 @@ cd "$ROOT_DIR"
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
 
-USE_APPIMAGETOOL=0
-if [[ "$HOST_OS" == "Linux" ]]; then
-  if [[ "$HOST_ARCH" != "x86_64" && "$HOST_ARCH" != "aarch64" ]]; then
-    echo "ERROR: unsupported Linux build host arch: $HOST_ARCH" >&2
+# Pinned release tags and SHA-256 digests (never fetch unverified rolling
+# `continuous` releases).
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256_x86_64="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+APPIMAGETOOL_SHA256_aarch64="f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+
+TYPE2_RUNTIME_VERSION="20251108"
+TYPE2_RUNTIME_SHA256_x86_64="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+TYPE2_RUNTIME_SHA256_aarch64="00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444"
+
+verify_sha256() {
+  local file="$1"
+  local expected="$2"
+  local actual
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    echo "ERROR: sha256sum or shasum is required to verify downloaded AppImage tooling" >&2
     exit 1
   fi
+  if [[ "$actual" != "$expected" ]]; then
+    echo "ERROR: SHA-256 mismatch for $file: got $actual, expected $expected" >&2
+    exit 1
+  fi
+}
+
+USE_APPIMAGETOOL=0
+if [[ "$HOST_OS" == "Linux" ]]; then
+  case "$HOST_ARCH" in
+    x86_64)  APPIMAGETOOL_SHA256="$APPIMAGETOOL_SHA256_x86_64" ;;
+    aarch64) APPIMAGETOOL_SHA256="$APPIMAGETOOL_SHA256_aarch64" ;;
+    *)
+      echo "ERROR: unsupported Linux build host arch: $HOST_ARCH" >&2
+      exit 1
+      ;;
+  esac
   USE_APPIMAGETOOL=1
   APPIMAGETOOL="$WORK/appimagetool.AppImage"
   if command -v appimagetool >/dev/null 2>&1; then
     APPIMAGETOOL_CMD=(appimagetool)
   else
-    echo "==> Downloading appimagetool (${HOST_ARCH})"
-    curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${HOST_ARCH}.AppImage" -o "$APPIMAGETOOL"
+    echo "==> Downloading appimagetool ${APPIMAGETOOL_VERSION} (${HOST_ARCH})"
+    curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${HOST_ARCH}.AppImage" -o "$APPIMAGETOOL"
+    verify_sha256 "$APPIMAGETOOL" "$APPIMAGETOOL_SHA256"
     chmod +x "$APPIMAGETOOL"
     APPIMAGETOOL_CMD=("$APPIMAGETOOL" --appimage-extract-and-run)
   fi
@@ -89,9 +122,19 @@ build_one() {
   ln -sf cloudedits.png "$appdir/.DirIcon"
 
   local runtime_file="$WORK/runtime-${app_arch}"
+  local runtime_sha256
+  case "$app_arch" in
+    x86_64)  runtime_sha256="$TYPE2_RUNTIME_SHA256_x86_64" ;;
+    aarch64) runtime_sha256="$TYPE2_RUNTIME_SHA256_aarch64" ;;
+    *)
+      echo "ERROR: unsupported AppImage runtime arch: $app_arch" >&2
+      exit 1
+      ;;
+  esac
   if [[ ! -f "$runtime_file" ]]; then
-    echo "==> Downloading AppImage type2 runtime (${app_arch})"
-    curl -fsSL "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-${app_arch}" -o "$runtime_file"
+    echo "==> Downloading AppImage type2 runtime ${TYPE2_RUNTIME_VERSION} (${app_arch})"
+    curl -fsSL "https://github.com/AppImage/type2-runtime/releases/download/${TYPE2_RUNTIME_VERSION}/runtime-${app_arch}" -o "$runtime_file"
+    verify_sha256 "$runtime_file" "$runtime_sha256"
   fi
 
   rm -f "$out_path"
