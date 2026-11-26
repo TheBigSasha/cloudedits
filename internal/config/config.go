@@ -23,14 +23,19 @@ type FolderConfig struct {
 
 // Config is persisted in <dataDir>/config.json.
 type Config struct {
-	LibraryID    string         `json:"libraryId"`
-	LibraryName  string         `json:"libraryName"`
-	Hostname     string         `json:"hostname"`
-	DataDir      string         `json:"dataDir"`
-	SidecarDir   string         `json:"sidecarDir,omitempty"`
-	AuthMode     string         `json:"authMode"` // "tailnet" | "token" | "loopback"
-	BearerToken  string         `json:"bearerToken,omitempty"`
-	ListenAddr   string         `json:"listenAddr,omitempty"`
+	LibraryID   string `json:"libraryId"`
+	LibraryName string `json:"libraryName"`
+	Hostname    string `json:"hostname"`
+	DataDir     string `json:"dataDir"`
+	SidecarDir  string `json:"sidecarDir,omitempty"`
+	AuthMode    string `json:"authMode"` // "tailnet" | "token" | "loopback"
+	BearerToken string `json:"bearerToken,omitempty"`
+	ListenAddr  string `json:"listenAddr,omitempty"`
+	// PublicURL and TailscaleIP are the tailnet address of the enrolled node,
+	// recorded when it last came up so commands that do not start the node
+	// (qr, status, the setup wizard) can show where the library is reachable.
+	PublicURL    string         `json:"publicUrl,omitempty"`
+	TailscaleIP  string         `json:"tailscaleIp,omitempty"`
 	Folders      []FolderConfig `json:"folders"`
 	AllowedHosts []string       `json:"allowedOrigins,omitempty"`
 }

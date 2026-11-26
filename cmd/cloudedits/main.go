@@ -195,6 +195,9 @@ func cmdSetup(args []string) int {
 			fqdn = node.FQDN()
 			tailscaleIP = node.TailscaleIP()
 			_ = node.Close()
+			if recErr := recordNodeIdentity(cfg.DataDir, fqdn, tailscaleIP); recErr != nil {
+				return failOut(*jsonOut, exitStorage, "save node address failed", recErr)
+			}
 		}
 		if errors.Is(err, tsnetnode.ErrHTTPSNotEnabled) {
 			actionRequired = "Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns"
@@ -331,6 +334,9 @@ func cmdServe(args []string) int {
 		tsNode = node
 		defer func() { _ = tsNode.Close() }()
 		authenticator.WhoIs = tsNode.WhoIs
+		if recErr := recordNodeIdentity(cfg.DataDir, tsNode.FQDN(), tsNode.TailscaleIP()); recErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not record node address: %v\n", recErr)
+		}
 		if pubURL == "" && tsNode.FQDN() != "" {
 			pubURL = "https://" + tsNode.FQDN()
 		}
@@ -489,6 +495,8 @@ func cmdStatus(args []string) int {
 		"sidecarDir":   cfg.SidecarDir,
 		"folders":      cfg.Folders,
 		"indexedCount": indexed,
+		"url":          cfg.PublicURL,
+		"tailscaleIp":  cfg.TailscaleIP,
 	}
 	emitOutput(*jsonOut, out, fmt.Sprintf("cloudedits %s | %s | %d folder(s) | %d indexed | sidecars: %s",
 		version, cfg.LibraryName, len(cfg.Folders), indexed, sidecarMode))
@@ -649,6 +657,26 @@ func cmdFolders(args []string) int {
 	}
 }
 
+// recordNodeIdentity stores the enrolled node's tailnet address in the config
+// on disk. It reloads the stored config rather than saving the caller's
+// in-memory copy, so per-invocation overrides (serve --folder, --name, ...)
+// are never persisted as a side effect. An empty fqdn records nothing.
+func recordNodeIdentity(dataDir, fqdn, tailscaleIP string) error {
+	if fqdn == "" {
+		return nil
+	}
+	stored, err := config.Load(dataDir)
+	if err != nil {
+		return err
+	}
+	url := "https://" + fqdn
+	if stored.PublicURL == url && stored.TailscaleIP == tailscaleIP {
+		return nil
+	}
+	stored.PublicURL, stored.TailscaleIP = url, tailscaleIP
+	return config.Save(stored)
+}
+
 // parseInterspersed parses flags that may appear before, between or after
 // positional arguments (the standard flag package stops at the first
 // positional) and returns the positionals in order.
@@ -679,9 +707,12 @@ func cmdQR(args []string) int {
 	cfg, _ := config.Load(*dataDir)
 	target := strings.TrimRight(strings.TrimSpace(*baseURL), "/")
 	if target == "" {
-		if cfg != nil && cfg.ListenAddr != "" {
+		switch {
+		case cfg != nil && cfg.PublicURL != "":
+			target = cfg.PublicURL
+		case cfg != nil && cfg.ListenAddr != "":
 			target = "http://" + cfg.ListenAddr
-		} else {
+		default:
 			target = "http://127.0.0.1:8787"
 		}
 	}

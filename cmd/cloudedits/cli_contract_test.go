@@ -101,3 +101,58 @@ func TestFoldersFlagsAfterThePathAreHonored(t *testing.T) {
 		t.Fatalf("folders remove: code=%d out=%v", code, out)
 	}
 }
+
+func writeConfigJSON(t *testing.T, dataDir, body string) {
+	t.Helper()
+	if err := os.WriteFile(config.ConfigPath(dataDir), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestQRAndStatusUseTheEnrolledTailnetURL pins that once the node has been
+// enrolled, `qr` encodes its tailnet URL (a phone cannot reach a loopback
+// address) and `status` reports the URL and Tailscale IP.
+func TestQRAndStatusUseTheEnrolledTailnetURL(t *testing.T) {
+	isolateDefaultDataDir(t)
+	dataDir := t.TempDir()
+	writeConfigJSON(t, dataDir, `{"libraryId":"lib-1","hostname":"photos","listenAddr":"127.0.0.1:8787",
+		"publicUrl":"https://photos.example.ts.net","tailscaleIp":"100.64.0.7","folders":[]}`)
+
+	if _, out := runJSON(t, "qr", "--data-dir", dataDir, "--json"); out["url"] != "https://photos.example.ts.net" {
+		t.Errorf("qr url = %v, want the enrolled tailnet URL", out["url"])
+	}
+	if _, out := runJSON(t, "qr", "--data-dir", dataDir, "--asset", "abc", "--json"); out["url"] != "https://photos.example.ts.net/open?a=abc" {
+		t.Errorf("qr asset url = %v", out["url"])
+	}
+	_, status := runJSON(t, "status", "--data-dir", dataDir, "--json")
+	if status["url"] != "https://photos.example.ts.net" || status["tailscaleIp"] != "100.64.0.7" {
+		t.Errorf("status url=%v tailscaleIp=%v, want the enrolled identity", status["url"], status["tailscaleIp"])
+	}
+}
+
+// TestRecordNodeIdentityPersistsOnlyTheIdentity pins that recording the
+// enrolled node's address updates the stored config without persisting
+// anything else the running command changed in memory.
+func TestRecordNodeIdentityPersistsOnlyTheIdentity(t *testing.T) {
+	isolateDefaultDataDir(t)
+	dataDir := t.TempDir()
+	writeConfigJSON(t, dataDir, `{"libraryId":"lib-1","hostname":"photos","folders":[]}`)
+
+	if err := recordNodeIdentity(dataDir, "photos.example.ts.net", "100.64.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PublicURL != "https://photos.example.ts.net" || cfg.TailscaleIP != "100.64.0.7" || cfg.Hostname != "photos" || len(cfg.Folders) != 0 {
+		t.Errorf("stored config = %+v", cfg)
+	}
+	// An empty FQDN (enrollment did not complete) must not erase a known URL.
+	if err := recordNodeIdentity(dataDir, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ = config.Load(dataDir); cfg.PublicURL != "https://photos.example.ts.net" {
+		t.Errorf("empty identity erased the stored URL: %q", cfg.PublicURL)
+	}
+}
