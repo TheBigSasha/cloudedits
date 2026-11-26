@@ -251,6 +251,7 @@ func cmdServe(args []string) int {
 	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
 	var allowOrigins stringSliceFlag
 	fs.Var(&allowOrigins, "allow-origin", "additional browser origin allowed to call the API, e.g. https://preview.example or https://*.example.com (repeatable; the hdr.toys editor and this server's own URL are always allowed)")
+	allowDevNetwork := fs.Bool("allow-dev-apis-on-network", false, "permit a dev_apis test build to listen beyond loopback")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -319,6 +320,11 @@ func cmdServe(args []string) int {
 	)
 
 	if *useTsnet {
+		// Fail before joining the tailnet rather than after.
+		if err := checkTestBuildExposure(api.HasTestRoutes(), nil, *allowDevNetwork); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			return exitUsage
+		}
 		node, err := tsnetnode.Start(ctx, tsnetnode.Options{
 			Hostname: cfg.Hostname,
 			StateDir: tsnetnode.StateDir(cfg.DataDir),
@@ -362,6 +368,11 @@ func cmdServe(args []string) int {
 		if pubURL == "" {
 			pubURL = "http://" + ln.Addr().String()
 		}
+	}
+	defer func() { _ = ln.Close() }()
+	if err := checkTestBuildExposure(api.HasTestRoutes(), ln.Addr(), *allowDevNetwork); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return exitUsage
 	}
 
 	apiSrv, err := api.New(api.Options{
@@ -786,6 +797,26 @@ func openBrowser(rawURL string) error {
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// checkTestBuildExposure refuses to serve a dev_apis test build beyond loopback
+// unless the operator opts in. Such builds carry /__dev/reset, which deletes
+// the sidecar directory, and must never be reachable from a network by
+// accident (for example a test binary started with --tsnet or 0.0.0.0).
+func checkTestBuildExposure(testBuild bool, addr net.Addr, allowNetwork bool) error {
+	if !testBuild || allowNetwork {
+		return nil
+	}
+	// Only a plain TCP listener bound to a loopback IP is local; a tailnet
+	// listener reports a non-TCP or non-loopback address.
+	if tcp, ok := addr.(*net.TCPAddr); ok && tcp.IP.IsLoopback() {
+		return nil
+	}
+	where := "the tailnet"
+	if addr != nil {
+		where = addr.String()
+	}
+	return fmt.Errorf("this is a dev_apis test build with destructive /__dev/* endpoints; refusing to listen on %s (not loopback). Use a release build, or pass --allow-dev-apis-on-network", where)
 }
 
 func emitOutput(asJSON bool, payload any, human string) {
