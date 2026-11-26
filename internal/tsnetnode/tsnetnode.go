@@ -34,10 +34,12 @@ type Options struct {
 	// handed to tsnet in memory and never written anywhere by this package.
 	AuthKey string
 
-	// ControlURL and Logf exist for tests that run a node against an
-	// in-process coordination server. No command-line flag sets them.
+	// ControlURL, Logf and CertPair exist for tests that run a node against
+	// an in-process coordination server, which cannot issue certificates.
+	// No command-line flag sets them.
 	ControlURL string
 	Logf       logger.Logf
+	CertPair   func(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error)
 }
 
 // Enrolled reports whether stateDir holds a node identity from an earlier
@@ -96,8 +98,9 @@ func Start(ctx context.Context, opts Options) (*Node, error) {
 	}
 
 	n := &Node{
-		srv: srv,
-		lc:  lc,
+		srv:      srv,
+		lc:       lc,
+		certPair: opts.CertPair,
 	}
 
 	if status != nil {

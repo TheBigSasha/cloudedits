@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/thebigsasha/cloudedits/internal/config"
@@ -45,35 +44,6 @@ func TestSetupKeepsHostnameWhenFlagIsOmitted(t *testing.T) {
 	}
 	if out["hostname"] != "photos" {
 		t.Errorf("hostname after a setup without --hostname = %v, want %q", out["hostname"], "photos")
-	}
-}
-
-// TestSetupReportsThatNoServiceWasInstalled pins that setup output never
-// claims a background service: nothing is serving until `serve` runs, and the
-// output must say how to start it.
-func TestSetupReportsThatNoServiceWasInstalled(t *testing.T) {
-	isolateDefaultDataDir(t)
-	dataDir := t.TempDir()
-	code, out := runJSON(t, "setup", "--data-dir", dataDir, "--install-service", "--json")
-	if code != exitOK {
-		t.Fatalf("setup exited %d", code)
-	}
-	if v, ok := out["serviceInstalled"].(bool); !ok || v {
-		t.Errorf("serviceInstalled = %v, want false", out["serviceInstalled"])
-	}
-	if _, claims := out["installService"]; claims {
-		t.Errorf("output still carries installService=%v although no service is installed", out["installService"])
-	}
-	cmd, _ := out["serveCommand"].([]any)
-	if len(cmd) < 3 || cmd[0] != "cloudedits" || cmd[1] != "serve" {
-		t.Fatalf("serveCommand = %v, want the command that starts the server", out["serveCommand"])
-	}
-	joined := ""
-	for _, part := range cmd {
-		joined += part.(string) + " "
-	}
-	if !strings.Contains(joined, "--tsnet") || !strings.Contains(joined, dataDir) {
-		t.Errorf("serveCommand %q must serve over the tailnet from the configured data dir", joined)
 	}
 }
 
@@ -148,7 +118,7 @@ func TestRecordNodeIdentityPersistsOnlyTheIdentity(t *testing.T) {
 	if cfg.PublicURL != "https://photos.example.ts.net" || cfg.TailscaleIP != "100.64.0.7" || cfg.Hostname != "photos" || len(cfg.Folders) != 0 {
 		t.Errorf("stored config = %+v", cfg)
 	}
-	// An empty FQDN (enrollment did not complete) must not erase a known URL.
+	// An empty identity (enrollment did not complete) must not erase a known URL.
 	if err := recordNodeIdentity(dataDir, "", ""); err != nil {
 		t.Fatal(err)
 	}

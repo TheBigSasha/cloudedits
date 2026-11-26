@@ -117,6 +117,9 @@ type Status struct {
 	ExitCode    int       `json:"exitCode,omitempty"`
 	StartedAt   time.Time `json:"startedAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
+	// IndexedAssets is the asset count when the server started listening
+	// and again after each full scan.
+	IndexedAssets int `json:"indexedAssets"`
 	// MagicDNS is whether the node's own tailnet resolver answers for FQDN
 	// with the node's address (what other tailnet devices will resolve).
 	MagicDNS *Check `json:"magicDns,omitempty"`
