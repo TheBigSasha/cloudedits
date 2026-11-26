@@ -16,7 +16,7 @@ Responses to a request whose `Origin` is allowed additionally include:
 - `Access-Control-Allow-Origin: <that origin>` (never `*`, never an origin that is not on the allowlist)
 - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
 - `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id, X-HDRToys-Render-Id, X-HDRToys-Variant-Id, X-HDRToys-Channel, X-HDRToys-Filename, X-HDRToys-Schema-Version`
-- `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing`
+- `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, X-HDRT-Aux-Channel, Server-Timing`
 - `Access-Control-Allow-Private-Network: true` on a preflight that asks for it
 
 ## Origin Law
@@ -46,6 +46,15 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 3. Otherwise extract embedded JPEG preview from RAW/EXIF/TIFF/CR3/RAF (never full RAW decode) or generate a bounded raster downscale (<= 640 px long edge, JPEG q82).
 4. Emit strong `ETag`, support `If-None-Match` -> `304 Not Modified`, and set `Cache-Control: private, max-age=3600, stale-while-revalidate=86400`.
 
+## Auxiliary Channels (`/assets/{id}/aux/{channel}`)
+
+Auxiliary channels store disposable, pre-transform derived image buffers alongside an asset's `.edits` sidecar so editors can reuse expensive computed maps (starting with `depth`) across reloads and devices. Servers advertise support with `caps.auxiliaryChannels: true` and `limits.maxAuxChannelBytes: 16777216` in `GET /capabilities`.
+
+- **Channel names:** Strictly validated against `^[a-z][a-z0-9_-]{0,31}$` and an explicit recognized channel allowlist (`depth` -> `.depth.png`). Unknown, malformed, or traversal names are rejected with `400`.
+- **Upload (`PUT`):** Capped at `limits.maxAuxChannelBytes` (16 MiB, `413` `payload-too-large` if exceeded), verified against the 8-byte PNG signature (`\x89PNG\r\n\x1a\n`, `415` `unsupported-media-type` on mismatch), and committed atomically to `<sidecarRoot>/<rel>.<channel>.png`. Responds `200 OK` with `{ ok: true, assetId, channel, bytes, contentType: "image/png", etag }`.
+- **Fetch (`GET`):** Reads `<sidecarRoot>/<rel>.<channel>.png` first, falling back to a read-only colocated `<photoFolder>/<rel>.<channel>.png`. Serves raw PNG bytes with `Content-Type: image/png`, strong quoted `ETag`, `Cache-Control: private, max-age=3600`, `X-HDRT-Aux-Channel: <channel>`, `If-None-Match` -> `304 Not Modified`, and `404` when absent.
+- **Delete (`DELETE`):** Removes only the disposable sidecar under `<sidecarRoot>/<rel>.<channel>.png` and returns `200 OK` `{ ok: true, assetId, channel, deleted }`. Original media and colocated files in the source folder are never modified or removed.
+
 ## Endpoints
 
 | Method | Path | Auth | Permission | Purpose |
@@ -68,6 +77,9 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 | `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint (accepts raw `[op, ...]` or `{ "ops": [...] }`; returns `{ durable, applied, duplicates, stale, receipts }`) |
 | `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<cursor>&limit=<n<=500>` -> `{ ops[], assets[], nextCursor, snapshotRequired? }` |
 | `PUT` | `/assets/{id}/edit-thumbnail` | Authenticated | `media:write` | Persist edited JPEG preview (<= 4 MiB, `FF D8` verified) |
+| `GET` | `/assets/{id}/aux/{channel}` | Authenticated | `asset:read` | Fetch auxiliary channel PNG sidecar (e.g. `depth`) with strong `ETag`, `If-None-Match` (`304`), and `X-HDRT-Aux-Channel` |
+| `PUT` | `/assets/{id}/aux/{channel}` | Authenticated | `media:write` | Persist auxiliary channel PNG sidecar atomically (<= 16 MiB, PNG signature verified) |
+| `DELETE` | `/assets/{id}/aux/{channel}` | Authenticated | `media:write` | Remove disposable auxiliary channel sidecar under `.hdrtoys/` (never touches original media) |
 | `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` header or `renderId` query; owning variant from `variantId` query or `X-HDRToys-Variant-Id` header) |
 | `GET` | `/assets/{id}/renders` | Authenticated | `asset:read` | List stored rendered exports for an asset |
 | `DELETE` | `/assets/{id}/variants/{variantId}` | Authenticated | `variants:write` | Append a tombstone op for a variant |

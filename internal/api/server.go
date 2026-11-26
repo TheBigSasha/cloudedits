@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,10 +32,12 @@ const (
 	maxRangeLimit         = 500
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
-	maxRenderBytes        = 64 * 1024 * 1024
-	maxHandoffBytes       = 64 * 1024
-	maxSmallJSONBytes     = 64 * 1024
-	maxConcurrentStreams  = 16
+	// MaxAuxChannelBytes caps uploaded auxiliary channel sidecars (16 MiB).
+	MaxAuxChannelBytes   = 16 * 1024 * 1024
+	maxRenderBytes       = 64 * 1024 * 1024
+	maxHandoffBytes      = 64 * 1024
+	maxSmallJSONBytes    = 64 * 1024
+	maxConcurrentStreams = 16
 
 	// corsAllowHeaders lists every non-safelisted request header a browser
 	// client may attach. A header missing here fails the CORS preflight, so
@@ -201,6 +204,9 @@ func (s *Server) coreRoutes() []RouteSpec {
 		{Method: http.MethodGet, Pattern: "/assets/{id}/variants/{variantId}/recipe", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 30, Handler: s.handleVariantRecipe},
 		{Method: http.MethodDelete, Pattern: "/assets/{id}/variants/{variantId}", Auth: auth.AuthAuthenticated, Permission: auth.PermVariantsWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 50, Handler: s.handleDeleteVariant},
 		{Method: http.MethodPut, Pattern: "/assets/{id}/edit-thumbnail", Auth: auth.AuthAuthenticated, Permission: auth.PermMediaWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 80, Handler: s.handlePutEditThumbnail},
+		{Method: http.MethodGet, Pattern: "/assets/{id}/aux/{channel}", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 60, Handler: s.handleGetAuxChannel},
+		{Method: http.MethodPut, Pattern: "/assets/{id}/aux/{channel}", Auth: auth.AuthAuthenticated, Permission: auth.PermMediaWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 120, Handler: s.handlePutAuxChannel},
+		{Method: http.MethodDelete, Pattern: "/assets/{id}/aux/{channel}", Auth: auth.AuthAuthenticated, Permission: auth.PermMediaWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 60, Handler: s.handleDeleteAuxChannel},
 		{Method: http.MethodPost, Pattern: "/assets/{id}/renders", Auth: auth.AuthAuthenticated, Permission: auth.PermVariantsWrite, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 150, Handler: s.handlePostRender},
 		{Method: http.MethodGet, Pattern: "/assets/{id}/renders", Auth: auth.AuthAuthenticated, Permission: auth.PermAssetRead, ResourceScope: auth.ScopeAsset, SLOBudgetMs: 40, Handler: s.handleListRenders},
 
@@ -276,7 +282,7 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", corsAllowHeaders)
-			h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
+			h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, X-HDRT-Aux-Channel, Server-Timing")
 		}
 
 		if r.Method == http.MethodOptions {
@@ -433,22 +439,23 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	caps := map[string]any{
-		"thumbnails":     "server",
-		"editThumbnails": "server",
-		"ratings":        true,
-		"colorLabels":    true,
-		"keywords":       true,
-		"variants":       true,
-		"ops":            true,
-		"changes":        true,
-		"changeFeed":     true,
-		"rangeQueries":   true,
-		"writeBack":      true,
-		"originals":      "ranged",
-		"handoff":        true,
-		"acceptsRenders": true,
-		"blobs":          []string{"t0", "t1", "t2", "original"},
-		"search":         []string{"q", "rating", "flag", "label", "keyword", "kind", "folder"},
+		"thumbnails":        "server",
+		"editThumbnails":    "server",
+		"auxiliaryChannels": true,
+		"ratings":           true,
+		"colorLabels":       true,
+		"keywords":          true,
+		"variants":          true,
+		"ops":               true,
+		"changes":           true,
+		"changeFeed":        true,
+		"rangeQueries":      true,
+		"writeBack":         true,
+		"originals":         "ranged",
+		"handoff":           true,
+		"acceptsRenders":    true,
+		"blobs":             []string{"t0", "t1", "t2", "original"},
+		"search":            []string{"q", "rating", "flag", "label", "keyword", "kind", "folder"},
 	}
 	s.extraCaps(caps)
 
@@ -476,6 +483,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			"maxRangeLimit":         maxRangeLimit,
 			"maxCursorLimit":        maxCursorLimit,
 			"maxEditThumbnailBytes": maxEditThumbnailBytes,
+			"maxAuxChannelBytes":    MaxAuxChannelBytes,
 			"maxRenderBytes":        maxRenderBytes,
 		},
 		"library": lib,
@@ -1130,6 +1138,157 @@ func (s *Server) handlePutEditThumbnail(w http.ResponseWriter, r *http.Request) 
 		"assetId":    asset.ID,
 		"tierSource": "edit-thumbnail",
 		"sizeBytes":  len(data),
+	})
+}
+
+func auxChannelETag(data []byte) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf(`"sha256-%x"`, sum[:16])
+}
+
+func ifNoneMatchMatches(header, etag string) bool {
+	if strings.TrimSpace(header) == "" {
+		return false
+	}
+	for _, part := range strings.Split(header, ",") {
+		tag := strings.TrimSpace(part)
+		if tag == "*" || tag == etag {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleGetAuxChannel(w http.ResponseWriter, r *http.Request) {
+	channel := r.PathValue("channel")
+	if _, err := sidecar.ValidateAuxChannel(channel); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+		return
+	}
+	asset, err := s.idx.GetAsset(r.Context(), r.PathValue("id"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	data, _, err := s.idx.Sidecars().ReadAuxChannel(asset.FolderRoot, asset.SidecarRoot, asset.RelPath, channel)
+	if errors.Is(err, sidecar.ErrInvalidAuxChannel) {
+		writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "auxiliary channel not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	etag := auxChannelETag(data)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("X-HDRT-Aux-Channel", channel)
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handlePutAuxChannel(w http.ResponseWriter, r *http.Request) {
+	channel := r.PathValue("channel")
+	if _, err := sidecar.ValidateAuxChannel(channel); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+		return
+	}
+	asset, err := s.idx.GetAsset(r.Context(), r.PathValue("id"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, MaxAuxChannelBytes)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("auxiliary channel exceeds %d bytes", MaxAuxChannelBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "read body failed")
+		return
+	}
+	if !formats.IsPNGMagic(data) {
+		writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid PNG")
+		return
+	}
+
+	if _, err := s.idx.Sidecars().WriteAuxChannel(asset.SidecarRoot, asset.RelPath, channel, data); err != nil {
+		if errors.Is(err, sidecar.ErrInvalidAuxChannel) {
+			writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	etag := auxChannelETag(data)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("X-HDRT-Aux-Channel", channel)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"assetId":     asset.ID,
+		"channel":     channel,
+		"bytes":       len(data),
+		"contentType": "image/png",
+		"etag":        etag,
+	})
+}
+
+func (s *Server) handleDeleteAuxChannel(w http.ResponseWriter, r *http.Request) {
+	channel := r.PathValue("channel")
+	if _, err := sidecar.ValidateAuxChannel(channel); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+		return
+	}
+	asset, err := s.idx.GetAsset(r.Context(), r.PathValue("id"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	deleted, err := s.idx.Sidecars().DeleteAuxChannel(asset.SidecarRoot, asset.RelPath, channel)
+	if errors.Is(err, sidecar.ErrInvalidAuxChannel) {
+		writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"assetId": asset.ID,
+		"channel": channel,
+		"deleted": deleted,
 	})
 }
 

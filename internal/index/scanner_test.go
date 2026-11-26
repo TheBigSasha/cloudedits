@@ -161,6 +161,70 @@ func TestScanContinuesPastAnUnavailableFolder(t *testing.T) {
 	}
 }
 
+// TestScanExcludesColocatedAuxChannelSidecars proves that auxiliary channel
+// PNG sidecars (such as colocated IMG_0001.JPG.depth.png) are never scanned or
+// indexed as standalone photo assets, while real PNGs including a photo named
+// depth.png remain indexed.
+func TestScanExcludesColocatedAuxChannelSidecars(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	dataDir := t.TempDir()
+
+	writeTestJPEG(t, filepath.Join(photoDir, "IMG_0001.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "DCIM", "IMG_0002.JPG"))
+
+	pngBytes := []byte{
+		0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n',
+		0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R',
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+	}
+	for _, rel := range []string{
+		"IMG_0001.JPG.depth.png",
+		"IMG_0001.ARW.DEPTH.PNG",
+		filepath.Join("DCIM", "IMG_0002.JPG.depth.png"),
+		filepath.Join(".hdrtoys", "IMG_0001.JPG.depth.png"),
+		"depth.png",
+		"normal.png",
+	} {
+		full := filepath.Join(photoDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, pngBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	idx, err := Open(filepath.Join(dataDir, "index.db"), "", []config.FolderConfig{
+		{ID: "main", Path: photoDir, Label: "Main"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	items, total, err := idx.Range(ctx, Filter{Sort: "name", Dir: "asc"}, 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 || len(items) != 4 {
+		var names []string
+		for _, it := range items {
+			names = append(names, it.RelPath)
+		}
+		t.Fatalf("indexed %d assets %v, want 4 (IMG_0001.JPG, DCIM/IMG_0002.JPG, depth.png, normal.png)", total, names)
+	}
+	for _, it := range items {
+		if it.Name == "IMG_0001.JPG.depth.png" || it.Name == "IMG_0001.ARW.DEPTH.PNG" || it.Name == "IMG_0002.JPG.depth.png" {
+			t.Errorf("auxiliary sidecar %q was indexed as an asset", it.RelPath)
+		}
+	}
+}
+
 func BenchmarkRescanUnchanged2000(b *testing.B) {
 	idx, _ := openScanned(b, 2000)
 	ctx := context.Background()

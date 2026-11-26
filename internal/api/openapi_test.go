@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"image/color"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -120,7 +122,7 @@ func TestLiveResponsesMatchOpenAPI(t *testing.T) {
 		if method != http.MethodGet {
 			continue
 		}
-		target := strings.NewReplacer("{id}", assetID, "{variantId}", "no-such-variant").Replace(path)
+		target := strings.NewReplacer("{id}", assetID, "{variantId}", "no-such-variant", "{channel}", "depth").Replace(path)
 		rec := do(method, target)
 		if code := rec.Result().Status[:3]; !doc.ops[key][code] {
 			t.Errorf("%s -> %s, documented codes are %v", key, code, sortedKeys(doc.ops[key]))
@@ -153,4 +155,14 @@ func TestLiveResponsesMatchOpenAPI(t *testing.T) {
 		t.Fatalf("grid page: %v (%d assets)", err, len(page.Assets))
 	}
 	requireProps("GET /assets/range?fields=grid item", page.Assets[0], "GridAsset")
+
+	putAuxReq := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/assets/"+assetID+"/aux/depth", bytes.NewReader(samplePNG(t, 4, 4, color.RGBA{1, 2, 3, 255})))
+	putAuxReq.RemoteAddr = "127.0.0.1:50000"
+	putAuxRec := httptest.NewRecorder()
+	srv.ServeHTTP(putAuxRec, putAuxReq)
+	if putAuxRec.Code != http.StatusOK {
+		t.Fatalf("PUT /assets/{id}/aux/depth: status=%d body=%s", putAuxRec.Code, putAuxRec.Body.String())
+	}
+	requireProps("PUT /assets/{id}/aux/depth", putAuxRec.Body.Bytes(), "AuxChannelUploadResponse")
+	requireProps("DELETE /assets/{id}/aux/depth", do(http.MethodDelete, "/assets/"+assetID+"/aux/depth").Body.Bytes(), "AuxChannelDeleteResponse")
 }
