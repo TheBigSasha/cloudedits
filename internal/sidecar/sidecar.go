@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -1227,14 +1228,21 @@ func ExtractVerdicts(s *Sidecar) (rating int, flag, colorLabel string, keywords 
 func parseNonNegInt(v any) (int, error) {
 	switch n := v.(type) {
 	case json.Number:
-		i, err := n.Int64()
-		if err != nil || i < 0 {
+		if i, err := n.Int64(); err == nil {
+			if i < 0 {
+				return 0, errors.New("negative")
+			}
+			return int(i), nil
+		}
+		// Integer-valued literals from non-browser encoders ("5.0", "5e0").
+		f, err := n.Float64()
+		if err != nil {
 			return 0, errors.New("invalid int")
 		}
-		return int(i), nil
+		return parseNonNegInt(f)
 	case float64:
-		if n < 0 {
-			return 0, errors.New("negative")
+		if n < 0 || n > 1<<31 || n != math.Trunc(n) {
+			return 0, errors.New("not a non-negative integer")
 		}
 		return int(n), nil
 	case int:

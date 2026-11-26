@@ -213,3 +213,17 @@ func TestStoreAtomicWriteLegacyPrecedenceAndQuarantine(t *testing.T) {
 		t.Fatalf("expected quarantined file to exist: %v", err)
 	}
 }
+
+// A non-browser client may post a rating as the literal 5.0. The file is
+// rewritten as 5, so the index projection must read the same value.
+func TestExtractVerdictsAcceptsIntegerValuedRatingLiterals(t *testing.T) {
+	for literal, want := range map[string]int{"5": 5, "5.0": 5, "5e0": 5, "0.0": 0, "4.5": 0, "-1": 0, "1e999": 0} {
+		sc, err := Parse([]byte(`{"hdrt":1,"document":{"role":"truth"},"asset":{"file":"a.jpg"},"fields":{"rating":{"hlc":"019a2f0012ab-0001-devA","v":` + literal + `}}}`))
+		if err != nil {
+			t.Fatalf("parse rating %s: %v", literal, err)
+		}
+		if rating, _, _, _, _ := ExtractVerdicts(sc); rating != want {
+			t.Errorf("rating literal %s projected as %d, want %d", literal, rating, want)
+		}
+	}
+}
