@@ -210,17 +210,45 @@ func NewSessionManager(ttl time.Duration) *SessionManager {
 	}
 }
 
+// maxSessions caps live session tokens. Expired tokens are otherwise removed
+// only when presented again, so a caller looping on POST /auth/session would
+// grow the table without bound.
+const maxSessions = 4096
+
 // Issue creates a short-lived session bearer token for p.
 func (sm *SessionManager) Issue(p *Principal) (token string, expiresAt time.Time) {
 	b := make([]byte, 24)
 	_, _ = rand.Read(b)
 	token = "ses_" + hex.EncodeToString(b)
-	expiresAt = time.Now().UTC().Add(sm.ttl)
+	now := time.Now().UTC()
+	expiresAt = now.Add(sm.ttl)
 
 	sm.mu.Lock()
+	if len(sm.sessions) >= maxSessions {
+		sm.evictLocked(now)
+	}
 	sm.sessions[token] = sessionRecord{principal: p, expiresAt: expiresAt}
 	sm.mu.Unlock()
 	return token, expiresAt
+}
+
+// evictLocked drops every expired session and, if the table is still full,
+// the session closest to expiry.
+func (sm *SessionManager) evictLocked(now time.Time) {
+	var oldest string
+	var oldestExp time.Time
+	for tok, rec := range sm.sessions {
+		if now.After(rec.expiresAt) {
+			delete(sm.sessions, tok)
+			continue
+		}
+		if oldest == "" || rec.expiresAt.Before(oldestExp) {
+			oldest, oldestExp = tok, rec.expiresAt
+		}
+	}
+	if len(sm.sessions) >= maxSessions && oldest != "" {
+		delete(sm.sessions, oldest)
+	}
 }
 
 // Validate checks a session bearer token and returns its Principal.
