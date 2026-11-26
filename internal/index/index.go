@@ -925,6 +925,19 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	return receipts, nil
 }
 
+// LastOpHLC returns the HLC of the most recently journaled op from device, or
+// "" when that device has journaled none.
+func (idx *Index) LastOpHLC(ctx context.Context, device string) (string, error) {
+	var last string
+	err := idx.db.QueryRowContext(ctx,
+		`SELECT hlc FROM ops_log WHERE device = ? ORDER BY seq DESC LIMIT 1`, device,
+	).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return last, err
+}
+
 func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) error {
 	raw, err := json.Marshal(op)
 	if err != nil {

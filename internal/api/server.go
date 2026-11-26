@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,7 @@ type Server struct {
 	sessions      *auth.SessionManager
 	clock         *hlc.Clock
 	v1Clock       *hlc.Clock
+	v1Seed        sync.Once
 	streamSem     chan struct{}
 	activeStreams atomic.Int64
 	routes        []RouteSpec
@@ -741,6 +743,10 @@ func (s *Server) handleAssetRecipe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// legacyRatingDevice is the op device of writes made through the non-HLC
+// POST /assets/{id}/rating endpoint.
+const legacyRatingDevice = "cloudedits-v1"
+
 func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
 	var req struct {
@@ -758,18 +764,40 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	// Legacy v1 non-HLC rating write: use the monotonic v1 clock when no modern
 	// HLC has touched this asset's rating yet so real HLC sync clients with
 	// slight clock skew remain authoritative; otherwise advance the server clock.
-	writeHLC := s.v1Clock.Tick()
+	//
+	// The v1 clock's wall time is pinned, so only its counter orders v1 writes,
+	// and that counter restarts at zero with the process. It is therefore
+	// advanced past the last v1 op this library journaled and past the cell
+	// already on disk before it ticks; otherwise a write after a restart reuses
+	// a journaled (device, hlc) and is discarded as a duplicate, or loses
+	// last-writer-wins to the older cell.
+	s.v1Seed.Do(func() {
+		if last, lerr := s.idx.LastOpHLC(r.Context(), legacyRatingDevice); lerr == nil && last != "" {
+			_ = s.v1Clock.Observe(last)
+		}
+	})
+	useServerClock := false
 	if asset, aerr := s.idx.GetAsset(r.Context(), assetID); aerr == nil {
 		if res, rerr := s.idx.Sidecars().Read(asset.FolderRoot, asset.SidecarRoot, asset.RelPath); rerr == nil && res.Sidecar != nil {
-			if cell, ok := res.Sidecar.Fields["rating"]; ok && !strings.HasSuffix(cell.HLC, "-v1") {
-				_ = s.clock.Observe(cell.HLC)
-				writeHLC = s.clock.Tick()
+			if cell, ok := res.Sidecar.Fields["rating"]; ok {
+				if strings.HasSuffix(cell.HLC, "-v1") {
+					_ = s.v1Clock.Observe(cell.HLC)
+				} else {
+					_ = s.clock.Observe(cell.HLC)
+					useServerClock = true
+				}
 			}
 		}
 	}
+	var writeHLC string
+	if useServerClock {
+		writeHLC = s.clock.Tick()
+	} else {
+		writeHLC = s.v1Clock.Tick()
+	}
 	op := sidecar.TruthOp{
 		HLC:      writeHLC,
-		Device:   "cloudedits-v1",
+		Device:   legacyRatingDevice,
 		AssetKey: assetID,
 		Field:    "rating",
 		Value:    rating,
