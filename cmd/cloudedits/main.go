@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -786,6 +787,7 @@ func openBrowser(rawURL string) error {
 		return nil
 	}
 	cmd := exec.Command(name, args...)
+	cmd.Env = withoutSecrets(os.Environ())
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -824,6 +826,22 @@ func checkTestBuildExposure(testBuild bool, addr net.Addr, allowNetwork bool) er
 		where = addr.String()
 	}
 	return fmt.Errorf("this is a dev_apis test build with destructive /__dev/* endpoints; refusing to listen on %s (not loopback). Use a release build, or pass --allow-dev-apis-on-network", where)
+}
+
+// secretEnvVars are credentials cloudedits reads from its environment that a
+// helper process such as the desktop browser must not inherit.
+var secretEnvVars = []string{"TS_AUTHKEY", "TS_AUTH_KEY", "CLOUDEDITS_TOKEN"}
+
+func withoutSecrets(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.ContainsFunc(secretEnvVars, func(s string) bool { return strings.EqualFold(s, name) }) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 func emitOutput(asJSON bool, payload any, human string) {
