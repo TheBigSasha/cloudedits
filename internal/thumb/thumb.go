@@ -814,6 +814,14 @@ func ProbeImageHeader(filePath string) (width, height int, hasGainMap bool) {
 		return 0, 0, false
 	}
 	defer func() { _ = f.Close() }()
+	// The library scan probes every file on the caller's goroutine. A decoder
+	// panic on one malformed file must not take the whole server down (and
+	// keep taking it down on every restart): report unknown dimensions.
+	defer func() {
+		if r := recover(); r != nil {
+			width, height = 0, 0
+		}
+	}()
 
 	// Read initial 64 KiB for UltraHDR XMP/ISO 21496-1 markers.
 	hdr := make([]byte, 64*1024)
