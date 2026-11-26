@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thebigsasha/cloudedits/internal/config"
@@ -81,6 +82,49 @@ func TestFilterAcceptsEditorWireForms(t *testing.T) {
 		}
 		if got := names(list); !equalStrings(got, tc.want) || total != len(tc.want) {
 			t.Errorf("%s: got %v (total=%d), want %v", tc.name, got, total, tc.want)
+		}
+	}
+}
+
+// queryPlan returns SQLite's plan for the list query a filter produces.
+func queryPlan(t *testing.T, idx *Index, f Filter) string {
+	t.Helper()
+	where, args := buildWhere(f)
+	rows, err := idx.db.Query(`EXPLAIN QUERY PLAN SELECT `+assetColumns+` FROM assets a`+where+buildOrderBy(f)+` LIMIT 200 OFFSET 0`, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	return strings.Join(plan, " | ")
+}
+
+// TestEverySortOrderIsIndexBacked pins that no sort order the API exposes
+// makes SQLite sort the whole table per request: an unfiltered window must
+// walk an index in order. A full sort grows with the library and breaks the
+// range-query latency budget well before 100,000 assets.
+func TestEverySortOrderIsIndexBacked(t *testing.T) {
+	idx, _ := openScanned(t, 3)
+	for _, sort := range []string{"captured", "imported", "edited", "name", "rating"} {
+		for _, dir := range []string{"asc", "desc"} {
+			plan := queryPlan(t, idx, Filter{Sort: sort, Dir: dir})
+			if !strings.Contains(plan, "USING INDEX") && !strings.Contains(plan, "USING COVERING INDEX") {
+				t.Errorf("sort=%s dir=%s scans without an index: %s", sort, dir, plan)
+			}
+			if strings.Contains(plan, "USE TEMP B-TREE FOR ORDER BY") {
+				t.Errorf("sort=%s dir=%s sorts the whole result per request: %s", sort, dir, plan)
+			}
+			if sort == "name" && strings.Contains(plan, "TEMP B-TREE") {
+				t.Errorf("sort=name dir=%s needs a sorter although idx_assets_name covers it: %s", dir, plan)
+			}
 		}
 	}
 }

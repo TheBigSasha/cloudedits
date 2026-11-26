@@ -362,6 +362,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_flag ON assets(flag, captured_at DESC, id)
 CREATE INDEX IF NOT EXISTS idx_assets_label ON assets(color_label, captured_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_assets_edited ON assets(edited_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_assets_folder_rel ON assets(folder_id, rel_path);
+CREATE INDEX IF NOT EXISTS idx_assets_imported ON assets(imported_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_assets_name ON assets(LOWER(name), id);
+CREATE INDEX IF NOT EXISTS idx_assets_rating_desc ON assets(rating DESC, captured_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_keywords_kw ON asset_keywords(keyword, asset_id);
 `
 	_, err := db.Exec(ddl)
@@ -508,7 +511,9 @@ func buildOrderBy(f Filter) string {
 	case "edited":
 		return fmt.Sprintf(" ORDER BY a.edited_at %s, a.id ASC", dir)
 	case "name":
-		return fmt.Sprintf(" ORDER BY LOWER(a.name) %s, a.id ASC", dir)
+		// The id tiebreak runs in the same direction as the name so either
+		// direction is a plain walk of idx_assets_name.
+		return fmt.Sprintf(" ORDER BY LOWER(a.name) %s, a.id %s", dir, dir)
 	case "rating":
 		return fmt.Sprintf(" ORDER BY a.rating %s, a.captured_at DESC, a.id ASC", dir)
 	default:

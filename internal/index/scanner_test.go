@@ -187,3 +187,15 @@ func BenchmarkScanCold2000(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkRangeSortByNameDeep3000(b *testing.B) {
+	idx, _ := openScanned(b, 3000)
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		list, _, err := idx.Range(ctx, Filter{Sort: "name", Dir: "asc"}, 2700, 200)
+		if err != nil || len(list) != 200 {
+			b.Fatalf("len=%d err=%v", len(list), err)
+		}
+	}
+}
