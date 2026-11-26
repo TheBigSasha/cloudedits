@@ -454,6 +454,10 @@ func findBestEmbeddedJPEGForTarget(data []byte, minLongEdge int) (best []byte, a
 			break
 		}
 		start := pos + idx
+		if start+3 >= len(data) {
+			// SOI at the very end of the scan window: no marker byte follows.
+			break
+		}
 		// Validate 4th byte is a valid JPEG marker (APP0..APP15, DQT, DHT, SOF0..SOF2, COM).
 		m := data[start+3]
 		if !isPlausibleJPEGStartMarker(m) {
