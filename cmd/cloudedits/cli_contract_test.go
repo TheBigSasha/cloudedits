@@ -156,3 +156,33 @@ func TestRecordNodeIdentityPersistsOnlyTheIdentity(t *testing.T) {
 		t.Errorf("empty identity erased the stored URL: %q", cfg.PublicURL)
 	}
 }
+
+// TestGUIStateTracksTheConfigOnDisk pins that the setup wizard reports the
+// library's tailnet URL only once the node is enrolled, and picks it up when
+// enrollment happens in another process while the wizard is open.
+func TestGUIStateTracksTheConfigOnDisk(t *testing.T) {
+	isolateDefaultDataDir(t)
+	dataDir := t.TempDir()
+	writeConfigJSON(t, dataDir, `{"libraryId":"lib-1","hostname":"photos","folders":[]}`)
+	state := &guiState{dataDir: dataDir}
+
+	if got := state.PublicURL(); got != "" {
+		t.Errorf("PublicURL before enrollment = %q, want empty", got)
+	}
+	if err := recordNodeIdentity(dataDir, "photos.example.ts.net", "100.64.0.7"); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.PublicURL(); got != "https://photos.example.ts.net" {
+		t.Errorf("PublicURL after enrollment = %q", got)
+	}
+
+	// Saving a wizard edit must not erase what the other process recorded.
+	cfg := state.GetConfig()
+	cfg.Hostname = "renamed"
+	if err := state.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.PublicURL(); got != "https://photos.example.ts.net" {
+		t.Errorf("PublicURL after a wizard save = %q, want it kept", got)
+	}
+}

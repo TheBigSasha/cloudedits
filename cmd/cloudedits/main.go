@@ -755,39 +755,40 @@ func cmdDockerInit(args []string) int {
 	return exitOK
 }
 
+// guiState backs the setup wizard with the config on disk. It reloads on
+// every read so the page follows changes made by other commands while it is
+// open (for example `setup` enrolling the node), and a wizard save starts
+// from the stored config instead of overwriting it with a stale copy.
 type guiState struct {
-	mu      sync.RWMutex
-	cfg     *config.Config
-	pubURL  string
+	mu      sync.Mutex
+	dataDir string
 	indexed int
 }
 
 func (g *guiState) GetConfig() *config.Config {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	cp := *g.cfg
-	return &cp
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cfg, err := config.Load(g.dataDir)
+	if err != nil {
+		return config.Default(g.dataDir)
+	}
+	return cfg
 }
 
 func (g *guiState) SaveConfig(cfg *config.Config) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := config.Save(cfg); err != nil {
-		return err
-	}
-	g.cfg = cfg
-	return nil
+	return config.Save(cfg)
 }
 
+// PublicURL is the library's tailnet URL, or "" until the node is enrolled.
 func (g *guiState) PublicURL() string {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.pubURL
+	return g.GetConfig().PublicURL
 }
 
 func (g *guiState) IndexedCount() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	return g.indexed
 }
 
@@ -813,21 +814,12 @@ func cmdGUI(args []string) int {
 			_ = idx.Close()
 		}
 	}
-	listenAddr := cfg.ListenAddr
-	if listenAddr == "" {
-		listenAddr = "127.0.0.1:8787"
-	}
-
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "listen %s: %v\n", *listen, err)
 		return exitStorage
 	}
-	state := &guiState{
-		cfg:     cfg,
-		pubURL:  "http://" + listenAddr,
-		indexed: indexed,
-	}
+	state := &guiState{dataDir: cfg.DataDir, indexed: indexed}
 	srv := &http.Server{
 		Handler:           setupui.Handler(state),
 		ReadHeaderTimeout: 10 * time.Second,
