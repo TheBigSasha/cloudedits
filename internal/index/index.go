@@ -116,10 +116,10 @@ type Filter struct {
 	Flag          string
 	Label         string
 	Keywords      []string
-	Kind          string
+	Kind          string // comma-separated OR list: raw | image | photo | <extension>
 	Folder        string
-	Sort          string // captured | imported | edited | name | rating
-	Dir           string // asc | desc
+	Sort          string // captured | imported | edited | name | rating, optionally suffixed _asc | _desc
+	Dir           string // asc | desc (overrides a Sort suffix)
 }
 
 // OpReceipt reports the durable outcome of one op in POST /ops.
@@ -381,21 +381,13 @@ func buildWhere(f Filter) (clause string, args []any) {
 		conds = append(conds, `a.rating >= ?`)
 		args = append(args, *f.RatingGte)
 	}
-	if fl := strings.TrimSpace(f.Flag); fl != "" {
-		if fl == "none" {
-			conds = append(conds, `a.flag = ''`)
-		} else {
-			conds = append(conds, `a.flag = ?`)
-			args = append(args, fl)
-		}
+	if c, a, ok := enumCond("a.flag", f.Flag); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
-	if lb := strings.TrimSpace(f.Label); lb != "" {
-		if lb == "none" {
-			conds = append(conds, `a.color_label = ''`)
-		} else {
-			conds = append(conds, `a.color_label = ?`)
-			args = append(args, lb)
-		}
+	if c, a, ok := enumCond("a.color_label", f.Label); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
 	for _, kw := range f.Keywords {
 		kw = strings.TrimSpace(kw)
@@ -405,18 +397,9 @@ func buildWhere(f Filter) (clause string, args []any) {
 		conds = append(conds, `EXISTS (SELECT 1 FROM asset_keywords ak WHERE ak.asset_id = a.id AND LOWER(ak.keyword) = LOWER(?))`)
 		args = append(args, kw)
 	}
-	if k := strings.ToLower(strings.TrimSpace(f.Kind)); k != "" {
-		if k == "raw" || k == "image" {
-			conds = append(conds, `a.kind = ?`)
-			args = append(args, k)
-		} else {
-			ext := k
-			if !strings.HasPrefix(ext, ".") {
-				ext = "." + ext
-			}
-			conds = append(conds, `LOWER(a.name) LIKE ?`)
-			args = append(args, "%"+ext)
-		}
+	if c, a, ok := kindCond(f.Kind); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
 	if fl := strings.TrimSpace(f.Folder); fl != "" {
 		conds = append(conds, `(a.folder_id = ? OR EXISTS (SELECT 1 FROM folders fo WHERE fo.folder_id = a.folder_id AND fo.label = ?))`)
@@ -429,12 +412,93 @@ func buildWhere(f Filter) (clause string, args []any) {
 	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
-func buildOrderBy(f Filter) string {
-	dir := "DESC"
-	if strings.EqualFold(f.Dir, "asc") {
-		dir = "ASC"
+// enumCond builds the predicate for a single-valued verdict column (flag or
+// color label): "none" matches unset, "any" matches every set value, anything
+// else is an exact match.
+func enumCond(column, value string) (cond string, args []any, ok bool) {
+	switch v := strings.TrimSpace(value); v {
+	case "":
+		return "", nil, false
+	case "none":
+		return column + ` = ''`, nil, true
+	case "any":
+		return column + ` != ''`, nil, true
+	default:
+		return column + ` = ?`, []any{v}, true
 	}
-	switch strings.ToLower(strings.TrimSpace(f.Sort)) {
+}
+
+// kindExtAliases maps a kind token to the file extensions it covers when the
+// token names a format family rather than a single extension.
+var kindExtAliases = map[string][]string{
+	"jpeg": {".jpg", ".jpeg"},
+	"jpg":  {".jpg", ".jpeg"},
+	"tiff": {".tif", ".tiff"},
+	"tif":  {".tif", ".tiff"},
+	"heif": {".heic", ".heif", ".hif"},
+}
+
+// kindCond builds the predicate for the kind filter. The value is a
+// comma-separated list (the repeatable query parameter joined by the API
+// layer) matched with logical OR. "raw" and "image" match the stored kind,
+// "photo" is every non-RAW asset, and any other token is a file extension or
+// extension family.
+func kindCond(value string) (cond string, args []any, ok bool) {
+	var ors []string
+	for _, k := range strings.Split(strings.ToLower(value), ",") {
+		k = strings.TrimPrefix(strings.TrimSpace(k), ".")
+		switch k {
+		case "":
+			continue
+		case "raw", "image":
+			ors = append(ors, `a.kind = ?`)
+			args = append(args, k)
+		case "photo":
+			ors = append(ors, `a.kind != 'raw'`)
+		default:
+			exts, alias := kindExtAliases[k]
+			if !alias {
+				exts = []string{"." + k}
+			}
+			for _, ext := range exts {
+				ors = append(ors, `LOWER(a.name) LIKE ? ESCAPE '\'`)
+				args = append(args, "%"+escapeLike(ext))
+			}
+		}
+	}
+	if len(ors) == 0 {
+		return "", nil, false
+	}
+	return "(" + strings.Join(ors, " OR ") + ")", args, true
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// sortSpec resolves the sort field and direction. Besides the explicit
+// sort=<field>&dir=<asc|desc> pair it accepts the "<field>_<asc|desc>" token
+// form; an explicit dir always wins over the token suffix.
+func sortSpec(f Filter) (field, dir string) {
+	field = strings.ToLower(strings.TrimSpace(f.Sort))
+	dir = "DESC"
+	if base, ok := strings.CutSuffix(field, "_asc"); ok {
+		field, dir = base, "ASC"
+	} else if base, ok := strings.CutSuffix(field, "_desc"); ok {
+		field = base
+	}
+	switch strings.ToLower(strings.TrimSpace(f.Dir)) {
+	case "asc":
+		dir = "ASC"
+	case "desc":
+		dir = "DESC"
+	}
+	return field, dir
+}
+
+func buildOrderBy(f Filter) string {
+	field, dir := sortSpec(f)
+	switch field {
 	case "imported":
 		return fmt.Sprintf(" ORDER BY a.imported_at %s, a.id ASC", dir)
 	case "edited":

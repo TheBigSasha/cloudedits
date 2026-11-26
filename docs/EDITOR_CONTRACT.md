@@ -65,13 +65,13 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 - `q`: case-insensitive substring match against filename, relative path, or keywords
 - `rating`: exact integer rating (`0`–`5`)
 - `rating_gte`: minimum integer rating (`0`–`5`)
-- `flag`: `pick`, `reject`, or `none`
-- `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`, `none`)
+- `flag`: `pick`, `reject`, `any` (any flagged), or `none`
+- `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`), `any` (any labeled), or `none`
 - `keyword`: repeatable (`&keyword=tokyo&keyword=night`), matched with logical AND
-- `kind`: `image` or `raw` (or file extension)
+- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image`, `photo` (every non-RAW asset), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
 - `folder`: folder ID or folder label filter
-- `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`)
-- `dir`: `asc` or `desc` (default `desc`)
+- `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`); the single-token forms `<field>_asc` / `<field>_desc` (for example `name_asc`, `rating_desc`) are accepted as well
+- `dir`: `asc` or `desc` (default `desc`; overrides a `sort` token suffix)
 - `fields`: `grid` (compact) or `full`
 
 ## Batch Operations (`POST /ops`)

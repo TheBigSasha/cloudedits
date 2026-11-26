@@ -474,7 +474,7 @@ func parseFilter(r *http.Request) index.Filter {
 		Flag:     q.Get("flag"),
 		Label:    q.Get("label"),
 		Keywords: q["keyword"],
-		Kind:     q.Get("kind"),
+		Kind:     strings.Join(q["kind"], ","),
 		Folder:   q.Get("folder"),
 		Sort:     q.Get("sort"),
 		Dir:      q.Get("dir"),
