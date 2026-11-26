@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -21,14 +22,19 @@ import (
 
 // ScanAll performs a read-only walk of all configured folders, indexing media
 // files and their .hdrtoys/**/*.edits sidecars, and pruning deleted entries.
+// A folder that cannot be scanned does not stop the others; their errors are
+// returned joined.
 func (idx *Index) ScanAll(ctx context.Context) error {
-	folders := idx.Folders()
-	for _, f := range folders {
+	var errs []error
+	for _, f := range idx.Folders() {
 		if err := idx.ScanFolder(ctx, f); err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // fileStamp is the cheap identity of an indexed file: when all three values
@@ -72,6 +78,14 @@ const scanBatchSize = 64
 // per-file statements. New and changed files are written in batches.
 func (idx *Index) ScanFolder(ctx context.Context, fc config.FolderConfig) error {
 	sidecarRoot := sidecar.SidecarRoot(fc.Path, fc.ID, idx.sidecarDir)
+
+	// An unreadable root (unmounted drive or share) must not be mistaken for
+	// an empty folder: that would prune every asset the folder holds.
+	if info, err := os.Stat(fc.Path); err != nil {
+		return fmt.Errorf("folder %q unavailable: %w", fc.ID, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("folder %q unavailable: %s is not a directory", fc.ID, fc.Path)
+	}
 
 	known, err := idx.knownStamps(ctx, fc.ID)
 	if err != nil {
