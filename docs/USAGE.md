@@ -80,7 +80,9 @@ volumes:
   cloudedits_data:
 ```
 
-If `/library/photos` must be mounted `:ro`, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`).
+The image's default command is `serve --tsnet --folder /library/photos`, so the mount above needs no `command:`. The container runs as UID `10001`: that user must be able to create `/library/photos/.hdrtoys/`, or sidecar writes fail.
+
+If `/library/photos` must be mounted `:ro`, or UID `10001` cannot write to it, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`).
 
 ## Tailscale Troubleshooting & Security Posture
 
