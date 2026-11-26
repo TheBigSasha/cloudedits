@@ -247,7 +247,7 @@ func cmdServe(args []string) int {
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory (keeps source folders strictly read-only)")
 	scratchName := fs.String("scratch-name", "", "optional scratch library label advertised in /capabilities")
 	requireToken := fs.Bool("require-token", false, "require Authorization: Bearer token on authenticated endpoints")
-	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token")
+	token := fs.String("token", strings.TrimSpace(os.Getenv("CLOUDEDITS_TOKEN")), "static bearer token (prefer the CLOUDEDITS_TOKEN environment variable: flags are visible to other local users)")
 	publicURL := fs.String("public-url", "", "override public base URL for redirects and handoff links")
 	noWatch := fs.Bool("no-watch", false, "disable fsnotify directory watcher")
 	var allowOrigins stringSliceFlag
@@ -307,10 +307,11 @@ func cmdServe(args []string) int {
 	}
 
 	sessions := auth.NewSessionManager(30 * time.Minute)
+	staticToken, mustUseToken := resolveTokenAuth(cfg, *token, *requireToken)
 	authenticator := &auth.CompositeAuthenticator{
 		Sessions:      sessions,
-		StaticToken:   *token,
-		RequireToken:  *requireToken,
+		StaticToken:   staticToken,
+		RequireToken:  mustUseToken,
 		AllowLoopback: !*useTsnet,
 	}
 
@@ -806,6 +807,17 @@ func newHTTPServer(h http.Handler) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+}
+
+// resolveTokenAuth merges the token settings from config.json with the
+// command line: an explicit flag or environment token wins, and token mode is
+// required when either the flag or the persisted authMode asks for it.
+func resolveTokenAuth(cfg *config.Config, flagToken string, flagRequire bool) (token string, require bool) {
+	token = strings.TrimSpace(flagToken)
+	if token == "" {
+		token = strings.TrimSpace(cfg.BearerToken)
+	}
+	return token, flagRequire || strings.EqualFold(strings.TrimSpace(cfg.AuthMode), "token")
 }
 
 // checkTestBuildExposure refuses to serve a dev_apis test build beyond loopback
