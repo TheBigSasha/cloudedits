@@ -1,5 +1,5 @@
 // Package index maintains the strictly rebuildable SQLite WAL index and
-// read-only folder scanner + fsnotify watcher for cloudedits.
+// read-only folder scanner + change watcher for cloudedits.
 // Deleting index.db and restarting reconstructs 100% of library state losslessly
 // from source files and .hdrtoys/**/*.edits sidecars.
 package index
@@ -116,19 +116,31 @@ type Filter struct {
 	Flag          string
 	Label         string
 	Keywords      []string
-	Kind          string
+	Kind          string // comma-separated OR list: raw | image | photo | <extension>
 	Folder        string
-	Sort          string // captured | imported | edited | name | rating
-	Dir           string // asc | desc
+	Sort          string // captured | imported | edited | name | rating, optionally suffixed _asc | _desc
+	Dir           string // asc | desc (overrides a Sort suffix)
 }
 
 // OpReceipt reports the durable outcome of one op in POST /ops.
 type OpReceipt struct {
 	Device         string `json:"device"`
 	HLC            string `json:"hlc"`
-	Status         string `json:"status"` // "applied" | "duplicate" | "stale"
+	Status         string `json:"status"` // "applied" | "duplicate" | "stale" | "rejected"
 	OriginalStatus string `json:"originalStatus,omitempty"`
+	// Reason says why an op was rejected: ReasonAssetNotFound or ReasonInvalidOp.
+	Reason string `json:"reason,omitempty"`
 }
+
+// Rejection reasons carried by an OpReceipt whose Status is "rejected".
+const (
+	// ReasonAssetNotFound: the op's assetKey (and file hint) resolve to no
+	// indexed asset, or to more than one. A retry can succeed after a rescan.
+	ReasonAssetNotFound = "asset-not-found"
+	// ReasonInvalidOp: the op is malformed (missing device/field/assetKey,
+	// malformed HLC, or a value its field cannot hold). A retry cannot succeed.
+	ReasonInvalidOp = "invalid-op"
+)
 
 // ChangeOp represents one journaled op returned by GET /changes.
 type ChangeOp struct {
@@ -148,6 +160,10 @@ type ChangesFeed struct {
 	Ops        []ChangeOp `json:"ops"`
 	Assets     []Asset    `json:"assets"`
 	NextCursor string     `json:"nextCursor"`
+	// SnapshotRequired tells a client its cursor is not a position in this
+	// journal (the rebuildable index was re-created since the cursor was
+	// issued), so it must re-run its initial sync and resume from NextCursor.
+	SnapshotRequired bool `json:"snapshotRequired,omitempty"`
 }
 
 // Index owns the SQLite WAL database, configured folders, and sidecar store.
@@ -170,7 +186,7 @@ func MakeAssetID(folderID, relPosix string) string {
 
 // Open initializes or opens the rebuildable SQLite WAL index at dbPath.
 func Open(dbPath, customSidecarDir string, folders []config.FolderConfig, sidecars *sidecar.Store) (*Index, error) {
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create index dir: %w", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
@@ -358,6 +374,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_flag ON assets(flag, captured_at DESC, id)
 CREATE INDEX IF NOT EXISTS idx_assets_label ON assets(color_label, captured_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_assets_edited ON assets(edited_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_assets_folder_rel ON assets(folder_id, rel_path);
+CREATE INDEX IF NOT EXISTS idx_assets_imported ON assets(imported_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_assets_name ON assets(LOWER(name), id);
+CREATE INDEX IF NOT EXISTS idx_assets_rating_desc ON assets(rating DESC, captured_at DESC, id);
 CREATE INDEX IF NOT EXISTS idx_keywords_kw ON asset_keywords(keyword, asset_id);
 `
 	_, err := db.Exec(ddl)
@@ -381,21 +400,13 @@ func buildWhere(f Filter) (clause string, args []any) {
 		conds = append(conds, `a.rating >= ?`)
 		args = append(args, *f.RatingGte)
 	}
-	if fl := strings.TrimSpace(f.Flag); fl != "" {
-		if fl == "none" {
-			conds = append(conds, `a.flag = ''`)
-		} else {
-			conds = append(conds, `a.flag = ?`)
-			args = append(args, fl)
-		}
+	if c, a, ok := enumCond("a.flag", f.Flag); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
-	if lb := strings.TrimSpace(f.Label); lb != "" {
-		if lb == "none" {
-			conds = append(conds, `a.color_label = ''`)
-		} else {
-			conds = append(conds, `a.color_label = ?`)
-			args = append(args, lb)
-		}
+	if c, a, ok := enumCond("a.color_label", f.Label); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
 	for _, kw := range f.Keywords {
 		kw = strings.TrimSpace(kw)
@@ -405,18 +416,9 @@ func buildWhere(f Filter) (clause string, args []any) {
 		conds = append(conds, `EXISTS (SELECT 1 FROM asset_keywords ak WHERE ak.asset_id = a.id AND LOWER(ak.keyword) = LOWER(?))`)
 		args = append(args, kw)
 	}
-	if k := strings.ToLower(strings.TrimSpace(f.Kind)); k != "" {
-		if k == "raw" || k == "image" {
-			conds = append(conds, `a.kind = ?`)
-			args = append(args, k)
-		} else {
-			ext := k
-			if !strings.HasPrefix(ext, ".") {
-				ext = "." + ext
-			}
-			conds = append(conds, `LOWER(a.name) LIKE ?`)
-			args = append(args, "%"+ext)
-		}
+	if c, a, ok := kindCond(f.Kind); ok {
+		conds = append(conds, c)
+		args = append(args, a...)
 	}
 	if fl := strings.TrimSpace(f.Folder); fl != "" {
 		conds = append(conds, `(a.folder_id = ? OR EXISTS (SELECT 1 FROM folders fo WHERE fo.folder_id = a.folder_id AND fo.label = ?))`)
@@ -429,24 +431,114 @@ func buildWhere(f Filter) (clause string, args []any) {
 	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
-func buildOrderBy(f Filter) string {
-	dir := "DESC"
-	if strings.EqualFold(f.Dir, "asc") {
-		dir = "ASC"
+// enumCond builds the predicate for a single-valued verdict column (flag or
+// color label): "none" matches unset, "any" matches every set value, anything
+// else is an exact match.
+func enumCond(column, value string) (cond string, args []any, ok bool) {
+	switch v := strings.TrimSpace(value); v {
+	case "":
+		return "", nil, false
+	case "none":
+		return column + ` = ''`, nil, true
+	case "any":
+		return column + ` != ''`, nil, true
+	default:
+		return column + ` = ?`, []any{v}, true
 	}
-	switch strings.ToLower(strings.TrimSpace(f.Sort)) {
+}
+
+// kindExtAliases maps a kind token to the file extensions it covers when the
+// token names a format family rather than a single extension.
+var kindExtAliases = map[string][]string{
+	"jpeg": {".jpg", ".jpeg"},
+	"jpg":  {".jpg", ".jpeg"},
+	"tiff": {".tif", ".tiff"},
+	"tif":  {".tif", ".tiff"},
+	"heif": {".heic", ".heif", ".hif"},
+}
+
+// kindCond builds the predicate for the kind filter. The value is a
+// comma-separated list (the repeatable query parameter joined by the API
+// layer) matched with logical OR. "raw" and "image" match the stored kind,
+// "photo" is every non-RAW asset, and any other token is a file extension or
+// extension family.
+func kindCond(value string) (cond string, args []any, ok bool) {
+	var ors []string
+	for _, k := range strings.Split(strings.ToLower(value), ",") {
+		k = strings.TrimPrefix(strings.TrimSpace(k), ".")
+		switch k {
+		case "":
+			continue
+		case "raw", "image":
+			ors = append(ors, `a.kind = ?`)
+			args = append(args, k)
+		case "photo":
+			ors = append(ors, `a.kind != 'raw'`)
+		default:
+			exts, alias := kindExtAliases[k]
+			if !alias {
+				exts = []string{"." + k}
+			}
+			for _, ext := range exts {
+				ors = append(ors, `LOWER(a.name) LIKE ? ESCAPE '\'`)
+				args = append(args, "%"+escapeLike(ext))
+			}
+		}
+	}
+	if len(ors) == 0 {
+		return "", nil, false
+	}
+	return "(" + strings.Join(ors, " OR ") + ")", args, true
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// sortSpec resolves the sort field and direction. Besides the explicit
+// sort=<field>&dir=<asc|desc> pair it accepts the "<field>_<asc|desc>" token
+// form; an explicit dir always wins over the token suffix.
+func sortSpec(f Filter) (field, dir string) {
+	field = strings.ToLower(strings.TrimSpace(f.Sort))
+	dir = "DESC"
+	if base, ok := strings.CutSuffix(field, "_asc"); ok {
+		field, dir = base, "ASC"
+	} else if base, ok := strings.CutSuffix(field, "_desc"); ok {
+		field = base
+	}
+	switch strings.ToLower(strings.TrimSpace(f.Dir)) {
+	case "asc":
+		dir = "ASC"
+	case "desc":
+		dir = "DESC"
+	}
+	return field, dir
+}
+
+func buildOrderBy(f Filter) string {
+	field, dir := sortSpec(f)
+	switch field {
 	case "imported":
 		return fmt.Sprintf(" ORDER BY a.imported_at %s, a.id ASC", dir)
 	case "edited":
 		return fmt.Sprintf(" ORDER BY a.edited_at %s, a.id ASC", dir)
 	case "name":
-		return fmt.Sprintf(" ORDER BY LOWER(a.name) %s, a.id ASC", dir)
+		// The id tiebreak runs in the same direction as the name so either
+		// direction is a plain walk of idx_assets_name.
+		return fmt.Sprintf(" ORDER BY LOWER(a.name) %s, a.id %s", dir, dir)
 	case "rating":
 		return fmt.Sprintf(" ORDER BY a.rating %s, a.captured_at DESC, a.id ASC", dir)
 	default:
 		return fmt.Sprintf(" ORDER BY a.captured_at %s, a.id ASC", dir)
 	}
 }
+
+// assetColumns is the one column list every asset SELECT uses; scanAssets
+// reads rows in exactly this order.
+const assetColumns = `a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
+	a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
+	a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
+	a.color_label, a.edited_by_hdrtoys, a.exif_json`
 
 // Count returns the number of assets matching f.
 func (idx *Index) Count(ctx context.Context, f Filter) (int, error) {
@@ -473,11 +565,7 @@ func (idx *Index) Range(ctx context.Context, f Filter, offset, limit int) ([]Ass
 	}
 	where, args := buildWhere(f)
 	order := buildOrderBy(f)
-	q := `SELECT a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
-	             a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
-	             a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
-	             a.color_label, a.edited_by_hdrtoys, a.exif_json
-	      FROM assets a` + where + order + ` LIMIT ? OFFSET ?`
+	q := `SELECT ` + assetColumns + ` FROM assets a` + where + order + ` LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 
 	rows, err := idx.db.QueryContext(ctx, q, args...)
@@ -522,12 +610,7 @@ func (idx *Index) ListCursor(ctx context.Context, f Filter, cursor string, limit
 
 // GetAsset fetches one asset by its opaque ID.
 func (idx *Index) GetAsset(ctx context.Context, id string) (*Asset, error) {
-	rows, err := idx.db.QueryContext(ctx, `
-		SELECT a.id, a.folder_id, a.rel_path, a.name, a.kind, a.mime_type, a.size_bytes,
-		       a.mtime_ns, a.content_hash, a.source_revision, a.width, a.height, a.orientation,
-		       a.has_gain_map, a.captured_at, a.imported_at, a.edited_at, a.rating, a.flag,
-		       a.color_label, a.edited_by_hdrtoys, a.exif_json
-		FROM assets a WHERE a.id = ? LIMIT 1`, id)
+	rows, err := idx.db.QueryContext(ctx, `SELECT `+assetColumns+` FROM assets a WHERE a.id = ? LIMIT 1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -543,6 +626,26 @@ func (idx *Index) GetAsset(ctx context.Context, id string) (*Asset, error) {
 	return &list[0], nil
 }
 
+// assetsByIDs loads the given assets in one query, ordered by ID. IDs that no
+// longer exist in the index are skipped.
+func (idx *Index) assetsByIDs(ctx context.Context, ids []string) ([]Asset, error) {
+	if len(ids) == 0 {
+		return []Asset{}, nil
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	rows, err := idx.db.QueryContext(ctx,
+		`SELECT `+assetColumns+` FROM assets a WHERE a.id IN (`+placeholders+`) ORDER BY a.id ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return idx.scanAssets(ctx, rows)
+}
+
 // ResolveAsset locates an asset by opaque ID, content_hash, or relative path / filename hint.
 func (idx *Index) ResolveAsset(ctx context.Context, assetKey, fileHint string) (*Asset, error) {
 	if assetKey != "" {
@@ -554,19 +657,46 @@ func (idx *Index) ResolveAsset(ctx context.Context, assetKey, fileHint string) (
 		if err == nil && id != "" {
 			return idx.GetAsset(ctx, id)
 		}
-		err = idx.db.QueryRowContext(ctx, `SELECT id FROM assets WHERE rel_path = ? OR name = ? LIMIT 1`, assetKey, assetKey).Scan(&id)
-		if err == nil && id != "" {
+		if id, ok := idx.uniqueAssetByPathOrName(ctx, assetKey); ok {
 			return idx.GetAsset(ctx, id)
 		}
 	}
 	if fileHint != "" {
-		var id string
-		err := idx.db.QueryRowContext(ctx, `SELECT id FROM assets WHERE rel_path = ? OR name = ? LIMIT 1`, fileHint, fileHint).Scan(&id)
-		if err == nil && id != "" {
+		if id, ok := idx.uniqueAssetByPathOrName(ctx, fileHint); ok {
 			return idx.GetAsset(ctx, id)
 		}
 	}
 	return nil, os.ErrNotExist
+}
+
+// uniqueAssetByPathOrName rebinds a relative path or bare filename to an asset
+// only when exactly one asset carries it. Filenames repeat across folders
+// (camera counters wrap), and applying an edit to whichever match the database
+// returns first would put it on a photo the op never named.
+func (idx *Index) uniqueAssetByPathOrName(ctx context.Context, key string) (string, bool) {
+	for _, column := range []string{"rel_path", "name"} {
+		rows, err := idx.db.QueryContext(ctx, `SELECT id FROM assets WHERE `+column+` = ? LIMIT 2`, key)
+		if err != nil {
+			return "", false
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				ids = append(ids, id)
+			}
+		}
+		_ = rows.Close()
+		switch len(ids) {
+		case 0:
+			continue
+		case 1:
+			return ids[0], true
+		default:
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func (idx *Index) scanAssets(ctx context.Context, rows *sql.Rows) ([]Asset, error) {
@@ -665,22 +795,6 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	if len(ops) == 0 {
 		return []OpReceipt{}, nil
 	}
-	// 1. Pre-validate every op in the batch before mutating anything.
-	for i, op := range ops {
-		if strings.TrimSpace(op.Device) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing device", i)
-		}
-		if _, err := hlc.Parse(op.HLC); err != nil {
-			return nil, fmt.Errorf("ops[%d]: %w", i, err)
-		}
-		if strings.TrimSpace(op.Field) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing field", i)
-		}
-		if op.Field != "import" && strings.TrimSpace(op.AssetKey) == "" && strings.TrimSpace(op.File) == "" {
-			return nil, fmt.Errorf("ops[%d]: missing assetKey", i)
-		}
-	}
-
 	type opKey struct {
 		device string
 		hlc    string
@@ -691,6 +805,7 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		assetID     string
 		outcome     string
 		origStatus  string
+		reason      string
 		isDuplicate bool
 		isImport    bool
 	}
@@ -710,6 +825,12 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	// 2. Read-only duplicate pre-check & asset resolution (no global writeMu held).
 	for i, op := range ops {
 		plans[i].op = op
+		// A malformed op is rejected on its own receipt; it never fails the
+		// ops around it and is never journaled.
+		if !opWellFormed(op) {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonInvalidOp
+			continue
+		}
 		key := opKey{device: op.Device, hlc: op.HLC}
 		if prevIdx, seen := batchSeen[key]; seen {
 			plans[i].isDuplicate = true
@@ -744,10 +865,14 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 		asset, ok := resolvedCache[cacheKey]
 		if !ok {
 			asset, err = idx.ResolveAsset(ctx, op.AssetKey, op.File)
-			if err != nil {
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("resolve asset %q: %w", op.AssetKey, err)
 			}
 			resolvedCache[cacheKey] = asset
+		}
+		if asset == nil {
+			plans[i].outcome, plans[i].reason = "rejected", ReasonAssetNotFound
+			continue
 		}
 		plans[i].asset = asset
 		plans[i].assetID = asset.ID
@@ -783,7 +908,10 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 				for _, idxPos := range g.opIndices {
 					opChanged, applyErr := sidecar.ApplyOp(cur, plans[idxPos].op)
 					if applyErr != nil {
-						return false, applyErr
+						// ApplyOp validates before it mutates, so the sidecar
+						// is untouched and the rest of the group proceeds.
+						plans[idxPos].outcome, plans[idxPos].reason = "rejected", ReasonInvalidOp
+						continue
 					}
 					if opChanged {
 						plans[idxPos].outcome = "applied"
@@ -884,6 +1012,11 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 			continue
 		}
 
+		if p.outcome == "rejected" {
+			receipts[i] = OpReceipt{Device: p.op.Device, HLC: p.op.HLC, Status: "rejected", Reason: p.reason}
+			continue
+		}
+
 		// Re-check ops_log inside the transaction to handle concurrent identical (device, hlc).
 		var existingOutcome string
 		err := tx.QueryRowContext(ctx,
@@ -925,6 +1058,31 @@ func (idx *Index) ApplyOpsBatch(ctx context.Context, ops []sidecar.TruthOp) ([]O
 	return receipts, nil
 }
 
+// LastOpHLC returns the HLC of the most recently journaled op from device, or
+// "" when that device has journaled none.
+func (idx *Index) LastOpHLC(ctx context.Context, device string) (string, error) {
+	var last string
+	err := idx.db.QueryRowContext(ctx,
+		`SELECT hlc FROM ops_log WHERE device = ? ORDER BY seq DESC LIMIT 1`, device,
+	).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return last, err
+}
+
+// opWellFormed reports whether an op carries everything needed to identify and
+// route it.
+func opWellFormed(op sidecar.TruthOp) bool {
+	if strings.TrimSpace(op.Device) == "" || strings.TrimSpace(op.Field) == "" {
+		return false
+	}
+	if _, err := hlc.Parse(op.HLC); err != nil {
+		return false
+	}
+	return op.Field == "import" || strings.TrimSpace(op.AssetKey) != "" || strings.TrimSpace(op.File) != ""
+}
+
 func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID, outcome string) error {
 	raw, err := json.Marshal(op)
 	if err != nil {
@@ -941,38 +1099,18 @@ func recordOpLogTx(ctx context.Context, tx *sql.Tx, op sidecar.TruthOp, assetID,
 
 func syncAssetFromSidecarTx(ctx context.Context, tx *sql.Tx, assetID string, sc *sidecar.Sidecar) error {
 	rating, flag, label, keywords, edited := sidecar.ExtractVerdicts(sc)
-	editedInt := 0
-	editedAt := ""
-	if edited {
-		editedInt = 1
-	}
-	if latest := sidecar.LatestHLC(sc); latest != "" {
-		if p, err := hlc.Parse(latest); err == nil {
-			editedAt = time.UnixMilli(int64(p.Millis)).UTC().Format(time.RFC3339Nano)
-		}
-	}
+	editedAt := editedAtOf(sc)
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE assets
 		SET rating = ?, flag = ?, color_label = ?, edited_by_hdrtoys = ?,
 		    edited_at = CASE WHEN ? != '' THEN ? ELSE edited_at END
 		WHERE id = ?`,
-		rating, flag, label, editedInt, editedAt, editedAt, assetID,
+		rating, flag, label, boolInt(edited), editedAt, editedAt, assetID,
 	); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM asset_keywords WHERE asset_id = ?`, assetID); err != nil {
-		return err
-	}
-	for _, kw := range keywords {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO asset_keywords(asset_id, keyword) VALUES(?, ?)`,
-			assetID, kw,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	return replaceKeywordsTx(ctx, tx, assetID, keywords)
 }
 
 // ChangesSince returns all applied journaled ops after sinceCursor and the
@@ -1032,27 +1170,39 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 		return nil, err
 	}
 
-	// On bootstrap (empty feed), anchor nextCursor at the current max seq so
-	// callers have a valid fence even when ops_log is empty or had stale entries.
-	if len(ops) == 0 && sinceSeq == 0 {
+	// An empty page is either a bootstrap over a journal with no applied
+	// entries (anchor nextCursor at the journal head so callers hold a valid
+	// fence) or a cursor that is not a position in this journal at all.
+	snapshotRequired := false
+	if len(ops) == 0 {
 		var maxSeq sql.NullInt64
-		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err == nil && maxSeq.Valid && maxSeq.Int64 > lastSeq {
-			lastSeq = maxSeq.Int64
+		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err != nil {
+			return nil, fmt.Errorf("read journal head: %w", err)
+		}
+		head := maxSeq.Int64 // 0 when the journal is empty
+		switch {
+		case sinceSeq > head:
+			snapshotRequired = true
+			lastSeq = head
+		case sinceSeq == 0:
+			lastSeq = head
 		}
 	}
 
-	assets := make([]Asset, 0, len(assetIDs))
+	ids := make([]string, 0, len(assetIDs))
 	for aid := range assetIDs {
-		if a, err := idx.GetAsset(ctx, aid); err == nil {
-			assets = append(assets, *a)
-		}
+		ids = append(ids, aid)
 	}
-	sort.Slice(assets, func(i, j int) bool { return assets[i].ID < assets[j].ID })
+	assets, err := idx.assetsByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load changed assets: %w", err)
+	}
 
 	return &ChangesFeed{
-		Ops:        ops,
-		Assets:     assets,
-		NextCursor: fmt.Sprintf("c%d", lastSeq),
+		Ops:              ops,
+		Assets:           assets,
+		NextCursor:       fmt.Sprintf("c%d", lastSeq),
+		SnapshotRequired: snapshotRequired,
 	}, nil
 }
 

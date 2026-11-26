@@ -1,0 +1,52 @@
+{
+  "hdrt": 1,
+  "asset": {
+    "bytes": 195,
+    "file": "IMG_0002.JPG"
+  },
+  "document": {
+    "role": "truth"
+  },
+  "fields": {
+    "colorLabel": {
+      "hlc": "019a2f200000-0000-d-old",
+      "v": "red"
+    },
+    "flag": {
+      "hlc": "019a2f100000-0001-d-chrome",
+      "v": "pick"
+    },
+    "rating": {
+      "hlc": "019a2f100000-0000-d-chrome",
+      "v": 5
+    }
+  },
+  "recipe": {
+    "hlc": "019a2f100000-0002-d-chrome",
+    "v": {
+      "exposure": 1.2,
+      "version": 1
+    }
+  },
+  "variants": [
+    {
+      "hlc": "019a2f000000-0001-d-old",
+      "id": "conflict-019a2f000000-0001-d-old-36484af9c85f4ee1e07370dbf54b3cf5",
+      "name": "Merged edit · from .hdrtoys",
+      "recipe": {
+        "exposure": -0.5,
+        "version": 1
+      },
+      "snapshotKind": "manual"
+    },
+    {
+      "hlc": "019a2f100000-0003-d-chrome",
+      "id": "v-019a2f100000-0003-d-chrome",
+      "name": "Warm",
+      "recipe": {
+        "exposure": 0.3,
+        "version": 1
+      }
+    }
+  ]
+}

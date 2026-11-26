@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /src
 
 RUN apk add --no-cache ca-certificates tzdata
@@ -34,5 +34,7 @@ ENV CLOUDEDITS_HOSTNAME=library
 VOLUME ["/data", "/library"]
 
 # Pure userspace networking via tsnet — no NET_ADMIN, no /dev/net/tun, no root required.
+# The default command serves the documented /library/photos mount over the
+# tailnet; a bare `serve` would bind loopback inside the container.
 ENTRYPOINT ["/usr/local/bin/cloudedits"]
-CMD ["serve"]
+CMD ["serve", "--tsnet", "--folder", "/library/photos"]

@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.26"
           cache: true
 
       - name: Go vet (release and dev_apis)
@@ -38,12 +38,13 @@ jobs:
         with:
           version: v2.15.0
 
-      - name: Verify release binary strips all dev_apis symbols
+      - name: Verify release binary contains no dev_apis code
         run: |
+          # Check the shipped (stripped) form as well as an unstripped build:
+          # `go tool nm` sees nothing in a -s -w binary, so the script's
+          # string scan is what covers it.
           go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-release ./cmd/cloudedits
-          if go tool nm /tmp/cloudedits-release 2>/dev/null | grep -E 'devapi|registerDevRoutesImpl|handleDev(Reset|Fault|Stats)'; then
-            echo "ERROR: dev_apis symbol leaked into release binary" >&2
-            exit 1
-          fi
+          go build -trimpath -o /tmp/cloudedits-release-symbols ./cmd/cloudedits
+          ./packaging/scripts/check-release-symbols.sh /tmp/cloudedits-release /tmp/cloudedits-release-symbols
           ls -lh /tmp/cloudedits-release
-          rm -f /tmp/cloudedits-release
+          rm -f /tmp/cloudedits-release /tmp/cloudedits-release-symbols

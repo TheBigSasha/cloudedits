@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,5 +212,73 @@ func TestStoreAtomicWriteLegacyPrecedenceAndQuarantine(t *testing.T) {
 	}
 	if _, err := os.Stat(qRes.Quarantined); err != nil {
 		t.Fatalf("expected quarantined file to exist: %v", err)
+	}
+}
+
+// A non-browser client may post a rating as the literal 5.0. The file is
+// rewritten as 5, so the index projection must read the same value.
+func TestExtractVerdictsAcceptsIntegerValuedRatingLiterals(t *testing.T) {
+	for literal, want := range map[string]int{"5": 5, "5.0": 5, "5e0": 5, "0.0": 0, "4.5": 0, "-1": 0, "1e999": 0} {
+		sc, err := Parse([]byte(`{"hdrt":1,"document":{"role":"truth"},"asset":{"file":"a.jpg"},"fields":{"rating":{"hlc":"019a2f0012ab-0001-devA","v":` + literal + `}}}`))
+		if err != nil {
+			t.Fatalf("parse rating %s: %v", literal, err)
+		}
+		if rating, _, _, _, _ := ExtractVerdicts(sc); rating != want {
+			t.Errorf("rating literal %s projected as %d, want %d", literal, rating, want)
+		}
+	}
+}
+
+// On POSIX filesystems a backslash is an ordinary filename character. Mapping
+// it to "/" made `x\y.jpg` and `x/y.jpg` share one sidecar (and resolved the
+// former's bytes to the latter's file).
+func TestSafeJoinRelKeepsBackslashNamesDistinctOnPOSIX(t *testing.T) {
+	if filepath.Separator != '/' {
+		t.Skip("backslash is a path separator on this platform")
+	}
+	base := t.TempDir()
+	flat, err := SafeJoinRel(base, `x\y.jpg`)
+	if err != nil {
+		t.Fatalf("SafeJoinRel backslash name: %v", err)
+	}
+	nested, err := SafeJoinRel(base, "x/y.jpg")
+	if err != nil {
+		t.Fatalf("SafeJoinRel nested name: %v", err)
+	}
+	if flat == nested {
+		t.Fatalf(`x\y.jpg and x/y.jpg both map to %s`, flat)
+	}
+	if want := filepath.Join(base, `x\y.jpg`); flat != want {
+		t.Fatalf("backslash name mapped to %s, want %s", flat, want)
+	}
+	// Neither separator style may ever resolve outside the base directory.
+	for _, rel := range []string{"../escape", "a/../../escape", `..\..\escape`, `a\..\..\escape`, "", ".", "/"} {
+		if got, err := SafeJoinRel(base, rel); err == nil && !strings.HasPrefix(got, base+string(filepath.Separator)) {
+			t.Fatalf("SafeJoinRel(%q) escaped to %s", rel, got)
+		}
+	}
+}
+
+// A variant op states deletion as the boolean true or not at all. A truthy
+// non-boolean "tombstone" is a deletion; a falsy one is not recorded.
+func TestVariantOpTombstoneIsNormalizedToBoolean(t *testing.T) {
+	for raw, wantTombstone := range map[string]bool{`"yes"`: true, `1`: true, `true`: true, `""`: false, `0`: false, `false`: false, `null`: false} {
+		sc := Empty("a.jpg", nil, "")
+		var op TruthOp
+		dec := json.NewDecoder(strings.NewReader(`{"hlc":"019a2f001000-0001-devA","device":"devA","assetKey":"a","field":"variant","value":{"id":"v1","tombstone":` + raw + `}}`))
+		dec.UseNumber()
+		if err := dec.Decode(&op); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ApplyOp(sc, op); err != nil {
+			t.Fatalf("ApplyOp tombstone=%s: %v", raw, err)
+		}
+		out, err := Serialize(sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(string(out), `"tombstone": true`); got != wantTombstone || strings.Count(string(out), "tombstone") > 1 || (!wantTombstone && strings.Contains(string(out), "tombstone")) {
+			t.Errorf("tombstone=%s serialized as:\n%s", raw, out)
+		}
 	}
 }

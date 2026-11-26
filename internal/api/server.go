@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +27,21 @@ import (
 const (
 	remoteLibraryProfile  = "chrome-local-parity/1"
 	maxOpsBatch           = 100
+	maxOpsBodyBytes       = 4 * 1024 * 1024
 	maxRangeLimit         = 500
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	maxRenderBytes        = 64 * 1024 * 1024
 	maxHandoffBytes       = 64 * 1024
+	maxSmallJSONBytes     = 64 * 1024
 	maxConcurrentStreams  = 16
+
+	// corsAllowHeaders lists every non-safelisted request header a browser
+	// client may attach. A header missing here fails the CORS preflight, so
+	// the request never reaches its handler.
+	corsAllowHeaders = "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, " +
+		"X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id, X-HDRToys-Render-Id, " +
+		"X-HDRToys-Variant-Id, X-HDRToys-Channel, X-HDRToys-Filename, X-HDRToys-Schema-Version"
 )
 
 // Options configures a Remote Library HTTP API Server.
@@ -41,13 +51,16 @@ type Options struct {
 	ScratchName   string
 	PublicBaseURL string
 	EditorBaseURL string
-	Index         *index.Index
-	Thumbs        *thumb.Service
-	Handoffs      *handoff.Store
-	Auth          auth.Authenticator
-	Authorizer    auth.Authorizer
-	Sessions      *auth.SessionManager
-	Clock         *hlc.Clock
+	// AllowedOrigins lists additional browser origins permitted to call the
+	// API besides EditorBaseURL and PublicBaseURL (see newOriginPolicy).
+	AllowedOrigins []string
+	Index          *index.Index
+	Thumbs         *thumb.Service
+	Handoffs       *handoff.Store
+	Auth           auth.Authenticator
+	Authorizer     auth.Authorizer
+	Sessions       *auth.SessionManager
+	Clock          *hlc.Clock
 }
 
 // Server serves the hdr.toys Remote Library HTTP API v1.
@@ -61,9 +74,12 @@ type Server struct {
 	sessions      *auth.SessionManager
 	clock         *hlc.Clock
 	v1Clock       *hlc.Clock
+	v1Seed        sync.Once
+	origins       *originPolicy
 	streamSem     chan struct{}
 	activeStreams atomic.Int64
 	routes        []RouteSpec
+	mux           *http.ServeMux
 	handler       http.Handler
 }
 
@@ -104,8 +120,14 @@ func New(opts Options) (*Server, error) {
 		opts.Clock = hlc.NewClock("cloudedits", nil)
 	}
 
+	origins, err := newOriginPolicy(append([]string{opts.EditorBaseURL, opts.PublicBaseURL}, opts.AllowedOrigins...)...)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		opts:      opts,
+		origins:   origins,
 		idx:       opts.Index,
 		thumbs:    opts.Thumbs,
 		handoffs:  opts.Handoffs,
@@ -130,6 +152,7 @@ func New(opts Options) (*Server, error) {
 		mux.HandleFunc(specCopy.Method+" "+specCopy.Pattern, s.wrapRoute(specCopy))
 	}
 	mux.HandleFunc("/", s.handleFallback)
+	s.mux = mux
 	s.handler = s.withHeadersLaw(mux)
 	return s, nil
 }
@@ -141,6 +164,10 @@ func (s *Server) handleFallback(w http.ResponseWriter, r *http.Request) {
 	}
 	writeAPIError(w, http.StatusNotImplemented, "unsupported-capability", "unsupported capability")
 }
+
+// HasTestRoutes reports whether this binary was compiled with the dev_apis
+// build tag and therefore serves the destructive /__dev/* test endpoints.
+func HasTestRoutes() bool { return extraModeEnabled }
 
 // Routes returns a copy of the registered declarative RouteSpecs.
 func (s *Server) Routes() []RouteSpec {
@@ -215,7 +242,7 @@ func (s *Server) wrapRoute(spec RouteSpec) http.HandlerFunc {
 			spec.Handler(w, r)
 			return
 		case auth.AuthDevOnly:
-			if !auth.IsLoopbackRemoteAddr(r.RemoteAddr) {
+			if !auth.IsTrustedLoopbackRequest(r) {
 				writeError(w, http.StatusForbidden, "loopback only")
 				return
 			}
@@ -231,21 +258,31 @@ func (s *Server) withHeadersLaw(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		// Headers Law: apply CORP + CORS on EVERY response (including 206/304/4xx/5xx/OPTIONS).
+		// Headers Law: apply CORP + nosniff on EVERY response (including
+		// 206/304/4xx/5xx/OPTIONS), and CORS to every allowed origin.
 		h := w.Header()
 		h.Set("Cross-Origin-Resource-Policy", "cross-origin")
-		origin := r.Header.Get("Origin")
-		if origin != "" {
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Add("Vary", "Origin")
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if !s.origins.allows(r, origin) {
+				// Refuse before routing or authentication: callers are
+				// authenticated by network position, so a foreign page must
+				// not be able to borrow it (nor trigger preflight-free writes).
+				h.Set("Server-Timing", formatServerTiming(start))
+				writeAPIError(w, http.StatusForbidden, "origin-not-allowed", "origin not allowed")
+				return
+			}
 			h.Set("Access-Control-Allow-Origin", origin)
-			h.Add("Vary", "Origin")
-		} else {
-			h.Set("Access-Control-Allow-Origin", "*")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", corsAllowHeaders)
+			h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 		}
-		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id")
-		h.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing")
 
 		if r.Method == http.MethodOptions {
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				h.Set("Access-Control-Allow-Private-Network", "true")
+			}
 			h.Set("Access-Control-Max-Age", "600")
 			h.Set("Server-Timing", formatServerTiming(start))
 			w.WriteHeader(http.StatusNoContent)
@@ -435,6 +472,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"permissions": perms,
 		"limits": map[string]any{
 			"maxOpsBatch":           maxOpsBatch,
+			"maxOpsBodyBytes":       maxOpsBodyBytes,
 			"maxRangeLimit":         maxRangeLimit,
 			"maxCursorLimit":        maxCursorLimit,
 			"maxEditThumbnailBytes": maxEditThumbnailBytes,
@@ -474,7 +512,7 @@ func parseFilter(r *http.Request) index.Filter {
 		Flag:     q.Get("flag"),
 		Label:    q.Get("label"),
 		Keywords: q["keyword"],
-		Kind:     q.Get("kind"),
+		Kind:     strings.Join(q["kind"], ","),
 		Folder:   q.Get("folder"),
 		Sort:     q.Get("sort"),
 		Dir:      q.Get("dir"),
@@ -741,11 +779,16 @@ func (s *Server) handleAssetRecipe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// legacyRatingDevice is the op device of writes made through the non-HLC
+// POST /assets/{id}/rating endpoint.
+const legacyRatingDevice = "cloudedits-v1"
+
 func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
 	var req struct {
 		Rating *int `json:"rating"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxSmallJSONBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == nil {
 		writeError(w, http.StatusBadRequest, "invalid rating payload")
 		return
@@ -758,18 +801,40 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	// Legacy v1 non-HLC rating write: use the monotonic v1 clock when no modern
 	// HLC has touched this asset's rating yet so real HLC sync clients with
 	// slight clock skew remain authoritative; otherwise advance the server clock.
-	writeHLC := s.v1Clock.Tick()
+	//
+	// The v1 clock's wall time is pinned, so only its counter orders v1 writes,
+	// and that counter restarts at zero with the process. It is therefore
+	// advanced past the last v1 op this library journaled and past the cell
+	// already on disk before it ticks; otherwise a write after a restart reuses
+	// a journaled (device, hlc) and is discarded as a duplicate, or loses
+	// last-writer-wins to the older cell.
+	s.v1Seed.Do(func() {
+		if last, lerr := s.idx.LastOpHLC(r.Context(), legacyRatingDevice); lerr == nil && last != "" {
+			_ = s.v1Clock.Observe(last)
+		}
+	})
+	useServerClock := false
 	if asset, aerr := s.idx.GetAsset(r.Context(), assetID); aerr == nil {
 		if res, rerr := s.idx.Sidecars().Read(asset.FolderRoot, asset.SidecarRoot, asset.RelPath); rerr == nil && res.Sidecar != nil {
-			if cell, ok := res.Sidecar.Fields["rating"]; ok && !strings.HasSuffix(cell.HLC, "-v1") {
-				_ = s.clock.Observe(cell.HLC)
-				writeHLC = s.clock.Tick()
+			if cell, ok := res.Sidecar.Fields["rating"]; ok {
+				if strings.HasSuffix(cell.HLC, "-v1") {
+					_ = s.v1Clock.Observe(cell.HLC)
+				} else {
+					_ = s.clock.Observe(cell.HLC)
+					useServerClock = true
+				}
 			}
 		}
 	}
+	var writeHLC string
+	if useServerClock {
+		writeHLC = s.clock.Tick()
+	} else {
+		writeHLC = s.v1Clock.Tick()
+	}
 	op := sidecar.TruthOp{
 		HLC:      writeHLC,
-		Device:   "cloudedits-v1",
+		Device:   legacyRatingDevice,
 		AssetKey: assetID,
 		Field:    "rating",
 		Value:    rating,
@@ -781,6 +846,10 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if status, message, rejected := singleOpRejection(receipts); rejected {
+		writeError(w, status, message)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -898,16 +967,38 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if status, message, rejected := singleOpRejection(receipts); rejected {
+		writeError(w, status, message)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"durable":  true,
 		"receipts": receipts,
 	})
 }
 
+// singleOpRejection maps the receipt of a one-op endpoint onto an HTTP error:
+// those endpoints address exactly one asset, so a rejected op is the request's
+// own failure rather than one receipt among many.
+func singleOpRejection(receipts []index.OpReceipt) (status int, message string, rejected bool) {
+	if len(receipts) != 1 || receipts[0].Status != "rejected" {
+		return 0, "", false
+	}
+	if receipts[0].Reason == index.ReasonAssetNotFound {
+		return http.StatusNotFound, "asset not found", true
+	}
+	return http.StatusBadRequest, "invalid operation", true
+}
+
 func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, maxOpsBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("ops body exceeds %d bytes", maxOpsBodyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "failed to read ops body")
 		return
 	}
@@ -966,7 +1057,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	applied, duplicates, stale := 0, 0, 0
+	applied, duplicates, stale, rejected := 0, 0, 0, 0
 	for _, rc := range receipts {
 		switch rc.Status {
 		case "applied":
@@ -975,6 +1066,8 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 			duplicates++
 		case "stale":
 			stale++
+		case "rejected":
+			rejected++
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -982,6 +1075,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		"applied":    applied,
 		"duplicates": duplicates,
 		"stale":      stale,
+		"rejected":   rejected,
 		"receipts":   receipts,
 	})
 }
@@ -1055,6 +1149,9 @@ func (s *Server) handlePostRender(w http.ResponseWriter, r *http.Request) {
 		renderID = strings.TrimSpace(r.URL.Query().Get("renderId"))
 	}
 	variantID := strings.TrimSpace(r.URL.Query().Get("variantId"))
+	if variantID == "" {
+		variantID = strings.TrimSpace(r.Header.Get("X-HDRToys-Variant-Id"))
+	}
 	mimeType := strings.TrimSpace(r.Header.Get("Content-Type"))
 	if mimeType == "" {
 		mimeType = "image/jpeg"

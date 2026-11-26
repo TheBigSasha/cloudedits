@@ -1,0 +1,27 @@
+{
+  "hdrt": 1,
+  "document": {
+    "role": "truth"
+  },
+  "asset": {
+    "bytes": 195,
+    "file": "IMG_0002.JPG"
+  },
+  "fields": {
+    "rating": {
+      "hlc": "019a2f000000-0000-d-old",
+      "v": 2
+    },
+    "colorLabel": {
+      "hlc": "019a2f200000-0000-d-old",
+      "v": "red"
+    }
+  },
+  "recipe": {
+    "hlc": "019a2f000000-0001-d-old",
+    "v": {
+      "version": 1,
+      "exposure": -0.5
+    }
+  }
+}

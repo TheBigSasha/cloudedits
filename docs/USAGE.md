@@ -11,10 +11,10 @@ cloudedits gui
 ```
 
 Opens a loopback setup wizard in your default browser:
-1. Choose one or more photo folders (source files are strictly read-only; edits save under `.hdrtoys/`).
-2. Choose your Tailscale hostname (default `library` -> MagicDNS `https://library.<tailnet>.ts.net` and Tailscale IP `100.x.y.z`) and paste a pre-approved one-time auth token from `https://login.tailscale.com/admin/settings/keys`.
-3. Verify MagicDNS + HTTPS readiness (if disabled, enable both at `https://login.tailscale.com/admin/dns`).
-4. Scan the QR code from your phone or click **Open in hdr.toys**.
+1. Add one or more photo folders by path (source files are strictly read-only; edits save under `.hdrtoys/`).
+2. Choose your Tailscale hostname (default `library` -> MagicDNS `https://library.<tailnet>.ts.net` and Tailscale IP `100.x.y.z`). The wizard links to `https://login.tailscale.com/admin/settings/keys` for a pre-approved one-time auth key and to `https://login.tailscale.com/admin/dns` for MagicDNS + HTTPS; the key itself is entered in a terminal with the `cloudedits setup --tailscale-auth-key-stdin` command the wizard shows.
+3. Once the node is enrolled the wizard shows the library's tailnet URL, its QR code, and **Open in hdr.toys**; until then it shows none of them, because no other device can reach the library yet.
+4. Start the server with `cloudedits serve --tsnet`. The wizard configures the library; it does not run it.
 
 ## Mode 2: Headless CLI (Automation & Agents)
 
@@ -40,8 +40,11 @@ cloudedits serve --tsnet
 # Run foreground server on local HTTP (loopback/LAN)
 cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures
 
-# Require explicit bearer token
-cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures --require-token --token "$TOKEN"
+# Require explicit bearer token (read from the environment; flags are visible in the process list)
+CLOUDEDITS_TOKEN="$TOKEN" cloudedits serve --listen 127.0.0.1:8787 --folder ~/Pictures --require-token
+
+# Allow an additional editor origin (repeatable; https://hdr.toys is always allowed)
+cloudedits serve --tsnet --allow-origin https://preview.example.com
 
 # Check status and run diagnostics
 cloudedits status --json
@@ -80,7 +83,9 @@ volumes:
   cloudedits_data:
 ```
 
-If `/library/photos` must be mounted `:ro`, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`).
+The image's default command is `serve --tsnet --folder /library/photos`, so the mount above needs no `command:`. The container runs as UID `10001`: that user must be able to create `/library/photos/.hdrtoys/`, or sidecar writes fail.
+
+If `/library/photos` must be mounted `:ro`, or UID `10001` cannot write to it, add `CLOUDEDITS_SIDECAR_DIR: /data/sidecars` (or `--sidecar-dir /data/sidecars`).
 
 ## Tailscale Troubleshooting & Security Posture
 

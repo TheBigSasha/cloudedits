@@ -27,7 +27,7 @@ Never decode a 60 MP camera RAW on the server just to draw a 640 px grid thumbna
 
 ## 6. Atomic `.edits` Durability
 
-Never overwrite `.hdrtoys/<rel>.edits` in place (`os.WriteFile`). A crash, power loss, or concurrent local editor read can observe truncated JSON. Always stage into `<sidecarRoot>/.tmp/<uuid>`, `Sync()`, `Close()`, and `os.Rename()` on the same filesystem. If a file on disk is corrupt, quarantine it to `.hdrtoys/.quarantine/` instead of silently discarding user edits.
+Never overwrite `.hdrtoys/<rel>.edits` in place (`os.WriteFile`). A crash, power loss, or concurrent local editor read can observe truncated JSON. Always stage into `<sidecarRoot>/.tmp/<uuid>`, `Sync()`, `Close()`, `os.Rename()` on the same filesystem, and then `Sync()` the target directory: without the first flush a power loss can leave a zero-length file under the final name, and without the second the rename itself can be lost after the client was told the write is durable. If a file on disk is corrupt, quarantine it to `.hdrtoys/.quarantine/` instead of silently discarding user edits.
 
 ## 7. Numeric HLC Ordering
 

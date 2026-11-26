@@ -5,13 +5,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -65,8 +68,15 @@ func SidecarRoot(folderRoot, folderID, customSidecarDir string) string {
 
 // SafeJoinRel validates a POSIX relative path and joins it under baseDir,
 // preventing any path traversal outside baseDir.
+//
+// A backslash separates path components only where the host filesystem says
+// so (Windows). Elsewhere it is an ordinary filename character: rewriting it
+// to "/" would map the file `x\y.jpg` onto `x/y.jpg`.
 func SafeJoinRel(baseDir, relPosix string) (string, error) {
-	cleaned := path.Clean("/" + strings.ReplaceAll(relPosix, "\\", "/"))
+	if filepath.Separator == '\\' {
+		relPosix = strings.ReplaceAll(relPosix, "\\", "/")
+	}
+	cleaned := path.Clean("/" + relPosix)
 	cleaned = strings.TrimPrefix(cleaned, "/")
 	if cleaned == "" || cleaned == "." || strings.HasPrefix(cleaned, "..") {
 		return "", fmt.Errorf("invalid relative path %q", relPosix)
@@ -98,23 +108,36 @@ func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
 
 // ReadResult describes a sidecar read outcome.
 type ReadResult struct {
-	Sidecar     *Sidecar
+	Sidecar *Sidecar
+	// SourcePath is the file the state came from: the canonical sidecar when
+	// it exists, otherwise the copy beside the photo.
 	SourcePath  string
 	Quarantined string
+	// MergedFrom is the beside-the-photo copy that was joined into the
+	// canonical sidecar, when both layouts hold truth for the asset.
+	MergedFrom string
 }
 
-// Read loads an asset's sidecar following legacy read precedence:
-//  1. <sidecarRoot>/<rel>.edits (canonical)
-//  2. <folderRoot>/<rel>.edits (colocated legacy)
-//  3. <folderRoot>/<rel>.hdrt.json (legacy JSON)
+// Read loads an asset's truth from both on-disk layouts and joins them:
+//
+//   - <sidecarRoot>/<rel>.edits, the canonical sidecar this server writes
+//   - beside the photo: <folderRoot>/<rel>.edits, else <folderRoot>/<rel>.hdrt.json
+//
+// A browser editor can be configured to keep sidecars beside the photos, and
+// older ones always did, so a folder may hold a copy in each layout. Reading
+// only the canonical one would show stale state whenever the other is newer.
+// The join is Merge with conflict rescue, exactly what the browser editor
+// computes for the same two files, so both tools show identical state. The
+// copy beside the photo is never written, moved, or removed.
 //
 // If the canonical .edits file exists on disk but fails parsing, it is moved
-// to <sidecarRoot>/.quarantine/ and NOT silently masked by a legacy fallback.
+// to <sidecarRoot>/.quarantine/ and NOT silently masked by the other copy.
 func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, error) {
 	canonical, err := CanonicalEditsPath(sidecarRoot, relPosix)
 	if err != nil {
 		return nil, err
 	}
+	var inFolder *Sidecar
 	if data, err := os.ReadFile(canonical); err == nil {
 		sc, parseErr := Parse(data)
 		if parseErr != nil {
@@ -124,76 +147,210 @@ func (s *Store) Read(folderRoot, sidecarRoot, relPosix string) (*ReadResult, err
 			}
 			return &ReadResult{Quarantined: qPath}, nil
 		}
-		return &ReadResult{Sidecar: sc, SourcePath: canonical}, nil
+		inFolder = sc
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
-	// Legacy read-only fallbacks (never written to).
-	colocated, err := SafeJoinRel(folderRoot, relPosix+".edits")
-	if err == nil {
-		if data, rerr := os.ReadFile(colocated); rerr == nil {
-			if sc, perr := Parse(data); perr == nil {
-				return &ReadResult{Sidecar: sc, SourcePath: colocated}, nil
-			}
-		}
+	beside, besidePath := readBesidePhoto(folderRoot, relPosix)
+	switch {
+	case inFolder == nil && beside == nil:
+		return &ReadResult{}, nil
+	case inFolder == nil:
+		return &ReadResult{Sidecar: beside, SourcePath: besidePath}, nil
+	case beside == nil:
+		return &ReadResult{Sidecar: inFolder, SourcePath: canonical}, nil
 	}
-	legacyJSON, err := SafeJoinRel(folderRoot, relPosix+".hdrt.json")
-	if err == nil {
-		if data, rerr := os.ReadFile(legacyJSON); rerr == nil {
-			if sc, perr := Parse(data); perr == nil {
-				if sc.Document == nil {
-					sc.Document = &DocumentMeta{Role: "truth"}
-				}
-				return &ReadResult{Sidecar: sc, SourcePath: legacyJSON}, nil
-			}
-		}
+	merged, err := Merge(inFolder, beside, MergeOptions{
+		RescueConflictingRecipes: true,
+		OriginA:                  OriginSidecarFolder,
+		OriginB:                  OriginBesidePhoto,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("merge %s with %s: %w", canonical, besidePath, err)
 	}
-
-	return &ReadResult{}, nil
+	return &ReadResult{Sidecar: merged, SourcePath: canonical, MergedFrom: besidePath}, nil
 }
 
+// besidePhotoCandidates lists the read-only sidecar names beside a photo, in
+// precedence order.
+func besidePhotoCandidates(folderRoot, relPosix string) []string {
+	var out []string
+	for _, suffix := range []string{".edits", ".hdrt.json"} {
+		if p, err := SafeJoinRel(folderRoot, relPosix+suffix); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// readBesidePhoto returns the first readable truth sidecar beside the photo.
+// These files are never written to. A portable document (an explicitly shared
+// edit file that happens to sit there) is not folder truth and is skipped.
+func readBesidePhoto(folderRoot, relPosix string) (*Sidecar, string) {
+	for _, p := range besidePhotoCandidates(folderRoot, relPosix) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		sc, err := Parse(data)
+		if err != nil {
+			continue
+		}
+		if sc.Document == nil {
+			sc.Document = &DocumentMeta{Role: "truth"}
+		}
+		if sc.Document.Role != "truth" {
+			continue
+		}
+		return sc, p
+	}
+	return nil, ""
+}
+
+// ChangeStamp summarizes the modification state of every file Read consults
+// for an asset, so an index can tell when its projection is stale. It equals
+// the canonical sidecar's mtime (0 when absent) while no copy exists beside
+// the photo.
+func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
+	var stamp uint64
+	if canonical, err := CanonicalEditsPath(sidecarRoot, relPosix); err == nil {
+		if info, err := os.Stat(canonical); err == nil {
+			stamp = uint64(info.ModTime().UTC().UnixNano())
+		}
+	}
+	for i, p := range besidePhotoCandidates(folderRoot, relPosix) {
+		if info, err := os.Stat(p); err == nil {
+			// Odd-forced so a present file always perturbs the stamp.
+			mixed := (uint64(info.ModTime().UTC().UnixNano()) ^ (uint64(info.Size()) * 0x9e3779b97f4a7c15)) | 1
+			stamp ^= bits.RotateLeft64(mixed, 7*(i+1))
+		}
+	}
+	return int64(stamp)
+}
+
+// staleStagingAge is how old an orphaned staging file must be before it is
+// swept. It is far longer than any single write, so a file another process is
+// still writing is never touched.
+const staleStagingAge = 15 * time.Minute
+
 var (
-	strictFsync = strings.TrimSpace(os.Getenv("CLOUDEDITS_FSYNC")) == "1"
-	ensuredDirs sync.Map
+	// durableWrites flushes every sidecar and render write to stable storage
+	// before it is acknowledged. CLOUDEDITS_FSYNC=0 trades that guarantee for
+	// latency: writes stay atomic against crashes of this process, but an OS
+	// crash or power loss can lose or truncate an acknowledged write.
+	durableWrites = strings.TrimSpace(os.Getenv("CLOUDEDITS_FSYNC")) != "0"
+	ensuredDirs   sync.Map
+
+	// Seams so tests can observe the flush sequence.
+	syncFile = func(f *os.File) error { return f.Sync() }
+	syncDir  = syncDirectory
 )
 
-func ensureDir(dir string) error {
+// syncDirectory flushes a directory's entries (a completed rename or a newly
+// created child) to stable storage.
+func syncDirectory(dir string) error {
+	if runtime.GOOS == "windows" {
+		// A directory handle cannot be flushed on Windows; NTFS journals the
+		// rename as part of the metadata transaction.
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	// Some network and FUSE filesystems do not implement directory fsync.
+	if syncErr != nil && !errors.Is(syncErr, syscall.EINVAL) && !errors.Is(syncErr, errors.ErrUnsupported) {
+		return syncErr
+	}
+	return closeErr
+}
+
+// ensureDir creates dir (and parents) once per process. When it actually had
+// to create something under a durable write, the new directory entries are
+// flushed up to and including stopAt's parent.
+func ensureDir(dir, stopAt string, durable bool) error {
 	if _, ok := ensuredDirs.Load(dir); ok {
 		return nil
 	}
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	if statErr != nil && durable {
+		for p := dir; ; p = filepath.Dir(p) {
+			parent := filepath.Dir(p)
+			if parent == p {
+				break
+			}
+			if err := syncDir(parent); err != nil {
+				return err
+			}
+			if p == stopAt {
+				break
+			}
+		}
 	}
 	ensuredDirs.Store(dir, struct{}{})
 	return nil
 }
 
-// WriteAtomic writes data atomically using <sidecarRoot>/.tmp/<uuid> -> write
-// -> close -> rename, creating parent directories as needed. Matches SQLite's
-// PRAGMA synchronous=NORMAL durability tier by default (100% atomic against
-// concurrent readers and process crashes); set CLOUDEDITS_FSYNC=1 to force a
-// per-write hardware fsync barrier before rename.
+// sweepStaleStaging removes staging files orphaned by a process that died
+// between creating one and renaming it into place. Only this server's own
+// "<32 hex>.tmp" names are considered, and only once they are old.
+func sweepStaleStaging(tmpDir string) {
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleStagingAge)
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || len(name) != 32+len(".tmp") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		if _, err := hex.DecodeString(strings.TrimSuffix(name, ".tmp")); err != nil {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(tmpDir, name))
+		}
+	}
+}
+
+// WriteAtomic durably replaces targetPath with data: stage in
+// <sidecarRoot>/.tmp/<uuid>, write, fsync, close, rename, fsync the target
+// directory. A reader sees the old bytes or the new bytes, never a mixture,
+// and once WriteAtomic returns the new bytes survive power loss.
 func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
+	return writeAtomic(sidecarRoot, targetPath, data, durableWrites)
+}
+
+func writeAtomic(sidecarRoot, targetPath string, data []byte, durable bool) error {
 	tmpDir := filepath.Join(sidecarRoot, ".tmp")
-	if err := ensureDir(tmpDir); err != nil {
+	if _, known := ensuredDirs.Load(tmpDir); !known {
+		sweepStaleStaging(tmpDir)
+	}
+	if err := ensureDir(tmpDir, sidecarRoot, durable); err != nil {
 		return fmt.Errorf("create .tmp dir: %w", err)
 	}
 	targetDir := filepath.Dir(targetPath)
-	if err := ensureDir(targetDir); err != nil {
+	if err := ensureDir(targetDir, sidecarRoot, durable); err != nil {
 		return fmt.Errorf("create target dir: %w", err)
 	}
 
 	tmpPath := filepath.Join(tmpDir, randomHex(16)+".tmp")
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		// Directory may have been removed externally; retry MkdirAll once.
+		// Directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(tmpDir)
 		ensuredDirs.Delete(targetDir)
-		if mkErr := os.MkdirAll(tmpDir, 0o755); mkErr != nil {
+		if mkErr := ensureDir(tmpDir, sidecarRoot, durable); mkErr != nil {
 			return fmt.Errorf("create .tmp dir: %w", mkErr)
 		}
-		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr != nil {
+		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
 			return fmt.Errorf("create target dir: %w", mkErr)
 		}
 		f, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -202,9 +359,9 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 		}
 	}
 
-	cleanup := true
+	renamed := false
 	defer func() {
-		if cleanup {
+		if !renamed {
 			_ = os.Remove(tmpPath)
 		}
 	}()
@@ -213,8 +370,8 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 		_ = f.Close()
 		return fmt.Errorf("write staging file: %w", err)
 	}
-	if strictFsync {
-		if err := f.Sync(); err != nil {
+	if durable {
+		if err := syncFile(f); err != nil {
 			_ = f.Close()
 			return fmt.Errorf("fsync staging file: %w", err)
 		}
@@ -224,17 +381,21 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
-		// Target parent directory may have been removed externally; ensure and retry once.
+		// Target parent directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(targetDir)
-		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr == nil {
-			if err2 := os.Rename(tmpPath, targetPath); err2 == nil {
-				cleanup = false
-				return nil
-			}
+		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
+			return fmt.Errorf("atomic rename: %w", err)
 		}
-		return fmt.Errorf("atomic rename: %w", err)
+		if err2 := os.Rename(tmpPath, targetPath); err2 != nil {
+			return fmt.Errorf("atomic rename: %w", err)
+		}
 	}
-	cleanup = false
+	renamed = true
+	if durable {
+		if err := syncDir(targetDir); err != nil {
+			return fmt.Errorf("fsync target directory: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -326,7 +487,8 @@ func (s *Store) WriteEditThumbnail(sidecarRoot, relPosix string, jpegBytes []byt
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if err := WriteAtomic(sidecarRoot, target, jpegBytes); err != nil {
+	// A disposable, rebuildable preview: atomic, but not worth a flush.
+	if err := writeAtomic(sidecarRoot, target, jpegBytes, false); err != nil {
 		return "", err
 	}
 	return target, nil

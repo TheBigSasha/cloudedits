@@ -65,10 +65,25 @@ func ShouldSkipName(name string) bool {
 	return false
 }
 
+// EditThumbnailSuffix names the edited-preview artifact of a photo:
+// "<photo filename>.edit_thumbnail.jpg".
+const EditThumbnailSuffix = ".edit_thumbnail.jpg"
+
+// IsEditThumbnailName reports whether name is an edited-preview artifact. An
+// editor that keeps its artifacts beside the photos writes these into the
+// photo folder itself, where they carry a .jpg extension but are a derived
+// preview of another asset, never a photo. The suffix match is
+// case-insensitive and requires a source filename in front of it.
+func IsEditThumbnailName(name string) bool {
+	base := filepath.Base(name)
+	return len(base) > len(EditThumbnailSuffix) && strings.EqualFold(base[len(base)-len(EditThumbnailSuffix):], EditThumbnailSuffix)
+}
+
 // IsSupportedFile returns true if filename has a supported image or RAW
-// extension and is not an excluded AppleDouble/hidden file.
+// extension and is not an excluded AppleDouble/hidden file or an
+// edited-preview artifact.
 func IsSupportedFile(name string) bool {
-	if ShouldSkipName(name) {
+	if ShouldSkipName(name) || IsEditThumbnailName(name) {
 		return false
 	}
 	ext := strings.ToLower(filepath.Ext(name))

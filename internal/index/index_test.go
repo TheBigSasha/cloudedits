@@ -18,6 +18,11 @@ import (
 
 func writeTestJPEG(t *testing.T, path string) {
 	t.Helper()
+	writeTestJPEGFile(t, path)
+}
+
+func writeTestJPEGFile(t testing.TB, path string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +217,147 @@ func TestConcurrentApplyOpsBatchRaceAndCoalescing(t *testing.T) {
 		}
 		if gotLabel != label {
 			t.Fatalf("asset %d SQLite label=%q != sidecar label=%q", i, gotLabel, label)
+		}
+	}
+}
+
+// An edit written beside the photo (by a browser editor configured for that
+// layout) must reach the index even though a canonical sidecar already exists
+// and did not change.
+func TestRescanPicksUpEditsWrittenBesideThePhoto(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "A.JPG"))
+
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aid := MakeAssetID("photos", "A.JPG")
+	if _, err := idx.ApplyOpsBatch(ctx, []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: aid, Field: "rating", Value: 2},
+	}); err != nil {
+		t.Fatalf("ApplyOpsBatch: %v", err)
+	}
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	beside := `{"hdrt":1,"document":{"role":"truth"},"asset":{"file":"A.JPG"},"fields":{"rating":{"hlc":"019a2f002000-0001-dev2","v":5},"flag":{"hlc":"019a2f002000-0002-dev2","v":"pick"}}}`
+	if err := os.WriteFile(filepath.Join(photoDir, "A.JPG.edits"), []byte(beside), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	asset, err := idx.GetAsset(ctx, aid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asset.Rating != 5 || asset.Flag == nil || *asset.Flag != "pick" {
+		t.Fatalf("index shows rating=%d flag=%v; the folder's joined truth is rating=5 flag=pick", asset.Rating, asset.Flag)
+	}
+}
+
+// One bad op must not hold every other op in its batch hostage. A client
+// replays its whole outbox in one POST; when a single op named a photo that
+// was removed, or carried a malformed value, the batch failed as a unit and
+// the client's valid edits were never acknowledged, on every retry.
+func TestApplyOpsBatchRejectsBadOpsWithoutFailingTheBatch(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "A.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "B.JPG"))
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	aidA, aidB := MakeAssetID("photos", "A.JPG"), MakeAssetID("photos", "B.JPG")
+	aidLater := MakeAssetID("photos", "LATER.JPG")
+
+	ops := []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: aidA, Field: "rating", Value: 4},
+		{HLC: "019a2f001000-0002-dev1", Device: "dev1", AssetKey: aidLater, Field: "rating", Value: 3},
+		{HLC: "019a2f001000-0003-dev1", Device: "dev1", AssetKey: aidB, Field: "variant", Value: "not-a-record"},
+		{HLC: "not-an-hlc", Device: "dev1", AssetKey: aidB, Field: "rating", Value: 1},
+		{HLC: "019a2f001000-0005-dev1", Device: "dev1", AssetKey: aidB, Field: "flag", Value: "pick"},
+	}
+	receipts, err := idx.ApplyOpsBatch(ctx, ops)
+	if err != nil {
+		t.Fatalf("ApplyOpsBatch failed the whole batch: %v", err)
+	}
+	want := []struct{ status, reason string }{
+		{"applied", ""}, {"rejected", "asset-not-found"}, {"rejected", "invalid-op"}, {"rejected", "invalid-op"}, {"applied", ""},
+	}
+	if len(receipts) != len(want) {
+		t.Fatalf("got %d receipts, want %d: %+v", len(receipts), len(want), receipts)
+	}
+	for i, w := range want {
+		if receipts[i].Status != w.status || receipts[i].Reason != w.reason || receipts[i].HLC != ops[i].HLC || receipts[i].Device != ops[i].Device {
+			t.Errorf("receipt %d = %+v, want status=%q reason=%q", i, receipts[i], w.status, w.reason)
+		}
+	}
+	if a, err := idx.GetAsset(ctx, aidA); err != nil || a.Rating != 4 {
+		t.Fatalf("valid op for A was not applied: %+v err=%v", a, err)
+	}
+	if b, err := idx.GetAsset(ctx, aidB); err != nil || b.Flag == nil || *b.Flag != "pick" {
+		t.Fatalf("valid op for B was not applied: %+v err=%v", b, err)
+	}
+
+	// A rejected op is not journaled: once the photo exists, the same op applies.
+	writeTestJPEG(t, filepath.Join(photoDir, "LATER.JPG"))
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := idx.ApplyOpsBatch(ctx, ops[1:2])
+	if err != nil || len(retry) != 1 || retry[0].Status != "applied" {
+		t.Fatalf("retry of a previously rejected op: %+v err=%v", retry, err)
+	}
+}
+
+// Camera counters wrap, so one library routinely holds several photos named
+// IMG_0001.JPG. An op whose asset key no longer resolves must not be applied
+// to whichever of them the database happens to return for its filename hint.
+func TestOpWithAmbiguousFileHintIsNotAppliedToAnArbitraryPhoto(t *testing.T) {
+	ctx := context.Background()
+	photoDir := t.TempDir()
+	writeTestJPEG(t, filepath.Join(photoDir, "100", "IMG_0001.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "101", "IMG_0001.JPG"))
+	writeTestJPEG(t, filepath.Join(photoDir, "101", "UNIQUE.JPG"))
+	idx, err := Open(filepath.Join(t.TempDir(), "index.db"), "", []config.FolderConfig{{ID: "photos", Path: photoDir}}, sidecar.NewStore())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = idx.Close() }()
+	if err := idx.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	receipts, err := idx.ApplyOpsBatch(ctx, []sidecar.TruthOp{
+		{HLC: "019a2f001000-0001-dev1", Device: "dev1", AssetKey: "stale-key", File: "IMG_0001.JPG", Field: "rating", Value: 5},
+		{HLC: "019a2f001000-0002-dev1", Device: "dev1", AssetKey: "stale-key", File: "UNIQUE.JPG", Field: "rating", Value: 2},
+		{HLC: "019a2f001000-0003-dev1", Device: "dev1", AssetKey: "stale-key", File: "100/IMG_0001.JPG", Field: "flag", Value: "pick"},
+	})
+	if err != nil {
+		t.Fatalf("ApplyOpsBatch: %v", err)
+	}
+	if receipts[0].Status != "rejected" || receipts[0].Reason != "asset-not-found" {
+		t.Errorf("ambiguous filename hint: receipt %+v, want rejected/asset-not-found", receipts[0])
+	}
+	if receipts[1].Status != "applied" || receipts[2].Status != "applied" {
+		t.Errorf("unambiguous hints must still rebind: %+v", receipts[1:])
+	}
+	for _, rel := range []string{"100/IMG_0001.JPG", "101/IMG_0001.JPG"} {
+		if a, err := idx.GetAsset(ctx, MakeAssetID("photos", rel)); err != nil || a.Rating != 0 {
+			t.Errorf("%s was rated %d by an op that did not name it (err=%v)", rel, a.Rating, err)
 		}
 	}
 }

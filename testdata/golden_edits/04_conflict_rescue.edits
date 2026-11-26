@@ -17,7 +17,7 @@
   "variants": [
     {
       "hlc": "019a2f001900-0001-devA",
-      "id": "conflict-019a2f001900-0001-devA-065caba0",
+      "id": "conflict-019a2f001900-0001-devA-83e709fa12f39e6c6321022d4e1170fe",
       "name": "Merged edit",
       "recipe": {
         "exposure": -0.5,

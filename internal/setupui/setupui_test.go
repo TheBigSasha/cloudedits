@@ -71,3 +71,39 @@ func TestSetupUIEndpoints(t *testing.T) {
 		t.Fatalf("unexpected setup UI state: %+v", payload)
 	}
 }
+
+type offlineState struct{ stubState }
+
+func (s *offlineState) PublicURL() string { return "" }
+
+// TestSetupUIOffersNoPhoneLinkBeforeTheNodeIsEnrolled pins that the wizard
+// does not hand out a QR code or an "open" link for an address other devices
+// cannot reach: until the library has a tailnet URL there is nothing to scan.
+func TestSetupUIOffersNoPhoneLinkBeforeTheNodeIsEnrolled(t *testing.T) {
+	st := &offlineState{stubState{cfg: config.Default(t.TempDir())}}
+	ts := httptest.NewServer(Handler(st))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if payload["publicUrl"] != "" || payload["qrSvg"] != "" {
+		t.Fatalf("state before enrollment: publicUrl=%q qrSvg set=%v, want both empty", payload["publicUrl"], payload["qrSvg"] != "")
+	}
+
+	page, err := http.Get(ts.URL + "/setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, _ := io.ReadAll(page.Body)
+	_ = page.Body.Close()
+	if strings.Contains(string(html), "127.0.0.1:8787") {
+		t.Errorf("setup page falls back to a loopback library URL, which a phone cannot open")
+	}
+}
