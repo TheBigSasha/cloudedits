@@ -148,6 +148,10 @@ type ChangesFeed struct {
 	Ops        []ChangeOp `json:"ops"`
 	Assets     []Asset    `json:"assets"`
 	NextCursor string     `json:"nextCursor"`
+	// SnapshotRequired tells a client its cursor is not a position in this
+	// journal (the rebuildable index was re-created since the cursor was
+	// issued), so it must re-run its initial sync and resume from NextCursor.
+	SnapshotRequired bool `json:"snapshotRequired,omitempty"`
 }
 
 // Index owns the SQLite WAL database, configured folders, and sidecar store.
@@ -1096,12 +1100,22 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 		return nil, err
 	}
 
-	// On bootstrap (empty feed), anchor nextCursor at the current max seq so
-	// callers have a valid fence even when ops_log is empty or had stale entries.
-	if len(ops) == 0 && sinceSeq == 0 {
+	// An empty page is either a bootstrap over a journal with no applied
+	// entries (anchor nextCursor at the journal head so callers hold a valid
+	// fence) or a cursor that is not a position in this journal at all.
+	snapshotRequired := false
+	if len(ops) == 0 {
 		var maxSeq sql.NullInt64
-		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err == nil && maxSeq.Valid && maxSeq.Int64 > lastSeq {
-			lastSeq = maxSeq.Int64
+		if err := idx.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM ops_log`).Scan(&maxSeq); err != nil {
+			return nil, fmt.Errorf("read journal head: %w", err)
+		}
+		head := maxSeq.Int64 // 0 when the journal is empty
+		switch {
+		case sinceSeq > head:
+			snapshotRequired = true
+			lastSeq = head
+		case sinceSeq == 0:
+			lastSeq = head
 		}
 	}
 
@@ -1114,9 +1128,10 @@ func (idx *Index) ChangesSince(ctx context.Context, sinceCursor string, limit in
 	sort.Slice(assets, func(i, j int) bool { return assets[i].ID < assets[j].ID })
 
 	return &ChangesFeed{
-		Ops:        ops,
-		Assets:     assets,
-		NextCursor: fmt.Sprintf("c%d", lastSeq),
+		Ops:              ops,
+		Assets:           assets,
+		NextCursor:       fmt.Sprintf("c%d", lastSeq),
+		SnapshotRequired: snapshotRequired,
 	}, nil
 }
 

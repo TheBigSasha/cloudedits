@@ -18,6 +18,11 @@ import (
 
 func writeTestJPEG(t *testing.T, path string) {
 	t.Helper()
+	writeTestJPEGFile(t, path)
+}
+
+func writeTestJPEGFile(t testing.TB, path string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}

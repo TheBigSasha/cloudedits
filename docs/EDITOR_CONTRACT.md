@@ -50,7 +50,7 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 | `GET` | `/assets/{id}/variants` | Authenticated | `asset:read` | Active immutable variants (`{ id, name, hlc, recipeUrl, recipe }`; pass `?includeTombstones=true` for deleted entries) |
 | `GET` | `/assets/{id}/variants/{variantId}/recipe` | Authenticated | `asset:read` | Fetch one variant's recipe JSON |
 | `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint (accepts raw `[op, ...]` or `{ "ops": [...] }`; returns `{ durable, applied, duplicates, stale, receipts }`) |
-| `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<seq>` |
+| `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<cursor>&limit=<n<=500>` -> `{ ops[], assets[], nextCursor, snapshotRequired? }` |
 | `PUT` | `/assets/{id}/edit-thumbnail` | Authenticated | `media:write` | Persist edited JPEG preview (<= 4 MiB, `FF D8` verified) |
 | `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` header or `renderId` query; owning variant from `variantId` query or `X-HDRToys-Variant-Id` header) |
 | `GET` | `/assets/{id}/renders` | Authenticated | `asset:read` | List stored rendered exports for an asset |
@@ -73,6 +73,12 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 - `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`); the single-token forms `<field>_asc` / `<field>_desc` (for example `name_asc`, `rating_desc`) are accepted as well
 - `dir`: `asc` or `desc` (default `desc`; overrides a `sort` token suffix)
 - `fields`: `grid` (compact) or `full`
+
+## Change Feed (`GET /changes`)
+
+- `since` is the opaque `nextCursor` of the previous page; omit it to bootstrap from the start of the journal.
+- Each page carries the applied ops after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array with an unchanged `nextCursor` means the client is caught up.
+- `snapshotRequired: true` means the cursor is not a position in this server's journal — the rebuildable index was re-created after the cursor was issued. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
 
 ## Batch Operations (`POST /ops`)
 
