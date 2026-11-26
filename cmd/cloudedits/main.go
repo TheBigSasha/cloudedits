@@ -139,7 +139,7 @@ func cmdSetup(args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	var folders stringSliceFlag
 	fs.Var(&folders, "folder", "photo folder path (repeatable)")
-	hostname := fs.String("hostname", "library", "Tailscale node hostname")
+	hostname := fs.String("hostname", "", "Tailscale node hostname (default: keep the configured one, initially \"library\")")
 	name := fs.String("name", "", "Library display name")
 	dataDir := fs.String("data-dir", config.DefaultDataDir(), "rebuildable index/cache/state directory")
 	sidecarDir := fs.String("sidecar-dir", "", "optional external sidecar directory for :ro mounts")
