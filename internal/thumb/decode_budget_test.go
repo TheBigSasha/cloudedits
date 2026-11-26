@@ -67,11 +67,13 @@ func TestDecodeBudgetRefusesOversizedFrames(t *testing.T) {
 		progressive bool
 		wantErr     bool
 	}{
-		{"100 MP camera JPEG", image.Config{ColorModel: color.YCbCrModel, Width: 11648, Height: 8736}, false, false},
-		{"100 MP 16-bit TIFF", image.Config{ColorModel: color.RGBA64Model, Width: 11648, Height: 8736}, false, false},
-		{"100 MP progressive JPEG", image.Config{ColorModel: color.YCbCrModel, Width: 11648, Height: 8736}, true, true},
-		{"45 MP progressive JPEG", image.Config{ColorModel: color.YCbCrModel, Width: 8192, Height: 5464}, true, false},
-		{"max lossless WebP", image.Config{ColorModel: color.NRGBAModel, Width: 16383, Height: 16383}, false, false},
+		{"45 MP camera JPEG (128 MiB YCbCr <= 192 MiB)", image.Config{ColorModel: color.YCbCrModel, Width: 8192, Height: 5464}, false, false},
+		{"12 MP RGBA PNG (45.8 MiB <= 192 MiB)", image.Config{ColorModel: color.NRGBAModel, Width: 4000, Height: 3000}, false, false},
+		{"10 MP progressive JPEG (148 MiB <= 192 MiB)", image.Config{ColorModel: color.YCbCrModel, Width: 4000, Height: 2600}, true, false},
+		{"100 MP full-decode YCbCr (> 192 MiB budget)", image.Config{ColorModel: color.YCbCrModel, Width: 11648, Height: 8736}, false, true},
+		{"100 MP 16-bit TIFF (776 MiB > 192 MiB budget)", image.Config{ColorModel: color.RGBA64Model, Width: 11648, Height: 8736}, false, true},
+		{"45 MP progressive JPEG (640 MiB > 192 MiB budget)", image.Config{ColorModel: color.YCbCrModel, Width: 8192, Height: 5464}, true, true},
+		{"max lossless WebP (1024 MiB > 192 MiB budget)", image.Config{ColorModel: color.NRGBAModel, Width: 16383, Height: 16383}, false, true},
 		{"gigapixel PNG", image.Config{ColorModel: color.NRGBAModel, Width: 40000, Height: 40000}, false, true},
 		{"max-dimension JPEG", image.Config{ColorModel: color.YCbCrModel, Width: 65535, Height: 65535}, false, true},
 		{"int overflow dimensions", image.Config{ColorModel: color.RGBA64Model, Width: 1 << 31, Height: 1 << 31}, false, true},
