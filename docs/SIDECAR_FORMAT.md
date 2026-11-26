@@ -133,6 +133,6 @@ A folder can therefore hold a copy in each layout. Every read joins the two with
 
 - The copy beside the photo is strictly read-only: it is never written, moved, or removed.
 - A portable document beside the photo (`document.role: "portable"`) is a shared edit file, not folder truth, and is ignored.
-- Writes **always** commit the joined state atomically to `<sidecarRoot>/<rel>.edits` via temp file in `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename`.
+- Writes **always** commit the joined state atomically to `<sidecarRoot>/<rel>.edits` via temp file in `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> `fsync` of the target directory. Only then is a write acknowledged as durable. Setting `CLOUDEDITS_FSYNC=0` skips both flushes: writes stay atomic against a crash of the server process, but an OS crash or power loss can lose or truncate an acknowledged edit. Staging files orphaned by a killed process are swept from `.tmp/` once they are 15 minutes old.
 
 If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by the other copy.

@@ -9,10 +9,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -227,47 +229,128 @@ func ChangeStamp(folderRoot, sidecarRoot, relPosix string) int64 {
 	return int64(stamp)
 }
 
+// staleStagingAge is how old an orphaned staging file must be before it is
+// swept. It is far longer than any single write, so a file another process is
+// still writing is never touched.
+const staleStagingAge = 15 * time.Minute
+
 var (
-	strictFsync = strings.TrimSpace(os.Getenv("CLOUDEDITS_FSYNC")) == "1"
-	ensuredDirs sync.Map
+	// durableWrites flushes every sidecar and render write to stable storage
+	// before it is acknowledged. CLOUDEDITS_FSYNC=0 trades that guarantee for
+	// latency: writes stay atomic against crashes of this process, but an OS
+	// crash or power loss can lose or truncate an acknowledged write.
+	durableWrites = strings.TrimSpace(os.Getenv("CLOUDEDITS_FSYNC")) != "0"
+	ensuredDirs   sync.Map
+
+	// Seams so tests can observe the flush sequence.
+	syncFile = func(f *os.File) error { return f.Sync() }
+	syncDir  = syncDirectory
 )
 
-func ensureDir(dir string) error {
+// syncDirectory flushes a directory's entries (a completed rename or a newly
+// created child) to stable storage.
+func syncDirectory(dir string) error {
+	if runtime.GOOS == "windows" {
+		// A directory handle cannot be flushed on Windows; NTFS journals the
+		// rename as part of the metadata transaction.
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	// Some network and FUSE filesystems do not implement directory fsync.
+	if syncErr != nil && !errors.Is(syncErr, syscall.EINVAL) && !errors.Is(syncErr, errors.ErrUnsupported) {
+		return syncErr
+	}
+	return closeErr
+}
+
+// ensureDir creates dir (and parents) once per process. When it actually had
+// to create something under a durable write, the new directory entries are
+// flushed up to and including stopAt's parent.
+func ensureDir(dir, stopAt string, durable bool) error {
 	if _, ok := ensuredDirs.Load(dir); ok {
 		return nil
 	}
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	if statErr != nil && durable {
+		for p := dir; ; p = filepath.Dir(p) {
+			parent := filepath.Dir(p)
+			if parent == p {
+				break
+			}
+			if err := syncDir(parent); err != nil {
+				return err
+			}
+			if p == stopAt {
+				break
+			}
+		}
 	}
 	ensuredDirs.Store(dir, struct{}{})
 	return nil
 }
 
-// WriteAtomic writes data atomically using <sidecarRoot>/.tmp/<uuid> -> write
-// -> close -> rename, creating parent directories as needed. Matches SQLite's
-// PRAGMA synchronous=NORMAL durability tier by default (100% atomic against
-// concurrent readers and process crashes); set CLOUDEDITS_FSYNC=1 to force a
-// per-write hardware fsync barrier before rename.
+// sweepStaleStaging removes staging files orphaned by a process that died
+// between creating one and renaming it into place. Only this server's own
+// "<32 hex>.tmp" names are considered, and only once they are old.
+func sweepStaleStaging(tmpDir string) {
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleStagingAge)
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || len(name) != 32+len(".tmp") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		if _, err := hex.DecodeString(strings.TrimSuffix(name, ".tmp")); err != nil {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(tmpDir, name))
+		}
+	}
+}
+
+// WriteAtomic durably replaces targetPath with data: stage in
+// <sidecarRoot>/.tmp/<uuid>, write, fsync, close, rename, fsync the target
+// directory. A reader sees the old bytes or the new bytes, never a mixture,
+// and once WriteAtomic returns the new bytes survive power loss.
 func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
+	return writeAtomic(sidecarRoot, targetPath, data, durableWrites)
+}
+
+func writeAtomic(sidecarRoot, targetPath string, data []byte, durable bool) error {
 	tmpDir := filepath.Join(sidecarRoot, ".tmp")
-	if err := ensureDir(tmpDir); err != nil {
+	if _, known := ensuredDirs.Load(tmpDir); !known {
+		sweepStaleStaging(tmpDir)
+	}
+	if err := ensureDir(tmpDir, sidecarRoot, durable); err != nil {
 		return fmt.Errorf("create .tmp dir: %w", err)
 	}
 	targetDir := filepath.Dir(targetPath)
-	if err := ensureDir(targetDir); err != nil {
+	if err := ensureDir(targetDir, sidecarRoot, durable); err != nil {
 		return fmt.Errorf("create target dir: %w", err)
 	}
 
 	tmpPath := filepath.Join(tmpDir, randomHex(16)+".tmp")
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		// Directory may have been removed externally; retry MkdirAll once.
+		// Directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(tmpDir)
 		ensuredDirs.Delete(targetDir)
-		if mkErr := os.MkdirAll(tmpDir, 0o755); mkErr != nil {
+		if mkErr := ensureDir(tmpDir, sidecarRoot, durable); mkErr != nil {
 			return fmt.Errorf("create .tmp dir: %w", mkErr)
 		}
-		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr != nil {
+		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
 			return fmt.Errorf("create target dir: %w", mkErr)
 		}
 		f, err = os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -276,9 +359,9 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 		}
 	}
 
-	cleanup := true
+	renamed := false
 	defer func() {
-		if cleanup {
+		if !renamed {
 			_ = os.Remove(tmpPath)
 		}
 	}()
@@ -287,8 +370,8 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 		_ = f.Close()
 		return fmt.Errorf("write staging file: %w", err)
 	}
-	if strictFsync {
-		if err := f.Sync(); err != nil {
+	if durable {
+		if err := syncFile(f); err != nil {
 			_ = f.Close()
 			return fmt.Errorf("fsync staging file: %w", err)
 		}
@@ -298,17 +381,21 @@ func WriteAtomic(sidecarRoot, targetPath string, data []byte) error {
 	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
-		// Target parent directory may have been removed externally; ensure and retry once.
+		// Target parent directory may have been removed externally; recreate and retry once.
 		ensuredDirs.Delete(targetDir)
-		if mkErr := os.MkdirAll(targetDir, 0o755); mkErr == nil {
-			if err2 := os.Rename(tmpPath, targetPath); err2 == nil {
-				cleanup = false
-				return nil
-			}
+		if mkErr := ensureDir(targetDir, sidecarRoot, durable); mkErr != nil {
+			return fmt.Errorf("atomic rename: %w", err)
 		}
-		return fmt.Errorf("atomic rename: %w", err)
+		if err2 := os.Rename(tmpPath, targetPath); err2 != nil {
+			return fmt.Errorf("atomic rename: %w", err)
+		}
 	}
-	cleanup = false
+	renamed = true
+	if durable {
+		if err := syncDir(targetDir); err != nil {
+			return fmt.Errorf("fsync target directory: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -400,7 +487,8 @@ func (s *Store) WriteEditThumbnail(sidecarRoot, relPosix string, jpegBytes []byt
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if err := WriteAtomic(sidecarRoot, target, jpegBytes); err != nil {
+	// A disposable, rebuildable preview: atomic, but not worth a flush.
+	if err := writeAtomic(sidecarRoot, target, jpegBytes, false); err != nil {
 		return "", err
 	}
 	return target, nil
