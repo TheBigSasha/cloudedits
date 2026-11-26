@@ -68,6 +68,7 @@ type Server struct {
 	streamSem     chan struct{}
 	activeStreams atomic.Int64
 	routes        []RouteSpec
+	mux           *http.ServeMux
 	handler       http.Handler
 }
 
@@ -140,6 +141,7 @@ func New(opts Options) (*Server, error) {
 		mux.HandleFunc(specCopy.Method+" "+specCopy.Pattern, s.wrapRoute(specCopy))
 	}
 	mux.HandleFunc("/", s.handleFallback)
+	s.mux = mux
 	s.handler = s.withHeadersLaw(mux)
 	return s, nil
 }
@@ -151,6 +153,10 @@ func (s *Server) handleFallback(w http.ResponseWriter, r *http.Request) {
 	}
 	writeAPIError(w, http.StatusNotImplemented, "unsupported-capability", "unsupported capability")
 }
+
+// HasTestRoutes reports whether this binary was compiled with the dev_apis
+// build tag and therefore serves the destructive /__dev/* test endpoints.
+func HasTestRoutes() bool { return extraModeEnabled }
 
 // Routes returns a copy of the registered declarative RouteSpecs.
 func (s *Server) Routes() []RouteSpec {
