@@ -9,7 +9,7 @@ Every HTTP response (JSON, binary blobs, redirects, and errors) includes:
 - `Cross-Origin-Resource-Policy: cross-origin`
 - `Access-Control-Allow-Origin` (reflecting allowed origin or `*`)
 - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
-- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile`
+- `Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, If-None-Match, Idempotency-Key, X-HDRT-Profile, X-HDRToys-Client, X-HDRToys-Image-Id, X-HDRToys-Render-Id, X-HDRToys-Variant-Id, X-HDRToys-Channel, X-HDRToys-Filename, X-HDRToys-Schema-Version`
 - `Access-Control-Expose-Headers: Content-Disposition, Content-Range, ETag, X-HDRT-Source-Revision, X-HDRT-Tier-Source, Server-Timing`
 - `Server-Timing: app;dur=<ms>`
 
@@ -52,7 +52,7 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 | `POST` | `/ops` | Authenticated | `edits:write` | Canonical batch HLC mutation endpoint (accepts raw `[op, ...]` or `{ "ops": [...] }`; returns `{ durable, applied, duplicates, stale, receipts }`) |
 | `GET` | `/changes` | Authenticated | `library:read` | Monotonic change feed `?since=<seq>` |
 | `PUT` | `/assets/{id}/edit-thumbnail` | Authenticated | `media:write` | Persist edited JPEG preview (<= 4 MiB, `FF D8` verified) |
-| `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` / `renderId`) |
+| `POST` | `/assets/{id}/renders` | Authenticated | `variants:write` | Idempotent rendered export upload (`Idempotency-Key` header or `renderId` query; owning variant from `variantId` query or `X-HDRToys-Variant-Id` header) |
 | `GET` | `/assets/{id}/renders` | Authenticated | `asset:read` | List stored rendered exports for an asset |
 | `DELETE` | `/assets/{id}/variants/{variantId}` | Authenticated | `variants:write` | Append a tombstone op for a variant |
 | `POST` | `/handoff` | Authenticated | `handoff:create` | Create ephemeral 5-minute UI state handoff (`8`-char base62 ID) |

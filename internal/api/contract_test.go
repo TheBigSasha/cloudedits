@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"image/color"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -31,5 +34,61 @@ func TestRepeatedKindParameterIsOR(t *testing.T) {
 		if code != http.StatusOK || body["total"] != float64(1) {
 			t.Errorf("%s: code=%d body=%v, want total=1", target, code, body)
 		}
+	}
+}
+
+// TestPreflightAllowsEveryEditorRequestHeader pins that a browser preflight
+// admits every non-safelisted request header the editor attaches to Remote
+// Library calls. A header missing from Access-Control-Allow-Headers makes the
+// browser block the request before it is sent.
+func TestPreflightAllowsEveryEditorRequestHeader(t *testing.T) {
+	srv, _, assetID := newTestServer(t, "")
+	req := httptest.NewRequest(http.MethodOptions, "/assets/"+assetID+"/renders", nil)
+	req.Header.Set("Origin", "https://hdr.toys")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	allowed := map[string]bool{}
+	for _, h := range strings.Split(rec.Header().Get("Access-Control-Allow-Headers"), ",") {
+		allowed[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	for _, h := range []string{
+		"Authorization", "Content-Type", "Range", "If-Range", "If-None-Match",
+		"Idempotency-Key", "X-HDRT-Profile",
+		"X-HDRToys-Client", "X-HDRToys-Image-Id", "X-HDRToys-Render-Id",
+		"X-HDRToys-Variant-Id", "X-HDRToys-Channel", "X-HDRToys-Filename",
+		"X-HDRToys-Schema-Version",
+	} {
+		if !allowed[strings.ToLower(h)] {
+			t.Errorf("preflight does not allow request header %q", h)
+		}
+	}
+}
+
+// TestRenderUploadReadsVariantFromHeader pins that the variant a render
+// belongs to is taken from the X-HDRToys-Variant-Id request header when the
+// variantId query parameter is absent.
+func TestRenderUploadReadsVariantFromHeader(t *testing.T) {
+	srv, _, assetID := newTestServer(t, t.TempDir())
+	body := bytes.NewReader(sampleJPEG(t, 32, 24, color.RGBA{10, 20, 30, 255}))
+	req := httptest.NewRequest(http.MethodPost, "/assets/"+assetID+"/renders", body)
+	req.RemoteAddr = "127.0.0.1:50000"
+	req.Header.Set("Content-Type", "image/jpeg")
+	req.Header.Set("Idempotency-Key", "render-hdr-1")
+	req.Header.Set("X-HDRToys-Variant-Id", "variant-7")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	var out struct {
+		Render struct {
+			VariantID string `json:"variantId"`
+		} `json:"render"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("code=%d err=%v body=%s", rec.Code, err, rec.Body.String())
+	}
+	if out.Render.VariantID != "variant-7" {
+		t.Errorf("render variantId = %q, want %q", out.Render.VariantID, "variant-7")
 	}
 }
