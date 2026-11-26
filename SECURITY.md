@@ -13,6 +13,7 @@ We try to keep cloudedits secure, but it is only as secure as your Tailscale set
 - **Bounded thumbnail decoding:** Source images whose declared dimensions exceed the decode budget (1 GiB of decoded pixels) are not thumbnailed.
 - **No warranty on network configuration:** Your photo library is as secure as your Tailscale ACLs, device security, and token hygiene. Anyone you grant network access to can read assets permitted by your configuration.
 - **Read-only source files:** `cloudedits` never modifies source media files and guards all file resolution against directory traversal (`..`, symlink escapes outside configured roots).
+- **Untrusted folder contents:** Sidecars, edited-preview thumbnails and auxiliary channels are read only from regular files within fixed size limits (16 MiB per `.edits` document and per auxiliary channel, 32 MiB per edited preview). A symbolic link, device, FIFO or oversized file found at one of those names is never followed or read, and symbolic links are never indexed as photos.
 - **Compile-time dev route elimination:** `/__dev/*` test endpoints are gated by `//go:build dev_apis` and are completely absent from release binaries. A `dev_apis` test build refuses to listen beyond loopback unless started with `--allow-dev-apis-on-network`.
 
 ## Reporting a Vulnerability

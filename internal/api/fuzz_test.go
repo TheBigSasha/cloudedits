@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,8 @@ func FuzzRequestPath(f *testing.F) {
 		"/ASSETS/" + assetID + "/FILE", "/assets/.hidden-canary.jpg/file", "/assets/%252e%252e/x",
 		"/assets?q=%25&sort=name%3BDROP&dir=asc&folder=%27&kind=..&rating=-1&keyword=%00&cursor=!!&limit=-5",
 		"/changes?since=-1&limit=99999999999", "/handoff/..", "/__dev/stats", "/assets/%ff%fe/file", "*", "http://evil.example/assets",
+		"/assets/" + assetID + "/aux/depth", "/assets/" + assetID + "/aux/DEPTH", "/assets/" + assetID + "/aux/..%2f..%2fcanary.jpg",
+		"/assets/" + assetID + "/aux/depth.png", "/assets/" + assetID + "/aux/depth%00", "/assets/" + assetID + "/aux/", "/assets/x/aux/depth/extra",
 	} {
 		f.Add(uint8(0), s)
 	}
@@ -120,6 +123,70 @@ func FuzzRequestPath(f *testing.F) {
 		}
 		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("%s %q response lacks X-Content-Type-Options: nosniff", method, target)
+		}
+	})
+}
+
+// FuzzAuxChannel drives the auxiliary channel routes with arbitrary channel
+// names and bodies as an authenticated owner. The server must never answer
+// 5xx, must store only bodies carrying the PNG signature and only under the
+// asset's own sidecar name, and must serve back exactly what it stored.
+func FuzzAuxChannel(f *testing.F) {
+	srv, photoDir, assetID := newTestServer(f, "")
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 1, 2, 3}
+	for _, channel := range []string{"depth", "DEPTH", "depth.png", "../depth", "..", "", "a", "depth%2f..", "normal", "depth\x00", strings.Repeat("d", 40)} {
+		f.Add(channel, png)
+		f.Add(channel, []byte("not a png"))
+	}
+	f.Add("depth", []byte{})
+	f.Add("depth", png[:8])
+
+	sidecarDir := filepath.Join(photoDir, ".hdrtoys")
+	f.Fuzz(func(t *testing.T, channel string, body []byte) {
+		if strings.ContainsAny(channel, "/?#") || len(body) > 1<<16 {
+			t.Skip()
+		}
+		target := "http://127.0.0.1/assets/" + assetID + "/aux/" + url.PathEscape(channel)
+		do := func(method string, payload []byte) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(method, target, bytes.NewReader(payload))
+			req.RemoteAddr = "127.0.0.1:50000"
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if rec.Code >= 500 && rec.Code != http.StatusNotImplemented {
+				t.Fatalf("%s aux/%q answered %d: %s", method, channel, rec.Code, rec.Body.String())
+			}
+			return rec
+		}
+
+		put := do(http.MethodPut, body)
+		get := do(http.MethodGet, nil)
+		if put.Code == http.StatusOK {
+			if channel != "depth" || !bytes.HasPrefix(body, png[:8]) {
+				t.Fatalf("PUT aux/%q accepted a %d-byte body (PNG signature: %v)", channel, len(body), bytes.HasPrefix(body, png[:8]))
+			}
+			if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), body) || get.Header().Get("Content-Type") != "image/png" {
+				t.Fatalf("GET after PUT: status %d, %d bytes, type %q", get.Code, get.Body.Len(), get.Header().Get("Content-Type"))
+			}
+		}
+		del := do(http.MethodDelete, nil)
+		if del.Code == http.StatusOK {
+			if after := do(http.MethodGet, nil); after.Code != http.StatusNotFound {
+				t.Fatalf("GET after DELETE answered %d", after.Code)
+			}
+		}
+
+		// Nothing but the asset's own artifacts may ever appear on disk.
+		entries, err := os.ReadDir(sidecarDir)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if name := e.Name(); name != ".tmp" && !strings.HasPrefix(name, "IMG_0001.JPG.") {
+				t.Fatalf("aux/%q left an unexpected entry in the sidecar folder: %q", channel, name)
+			}
+		}
+		if stray, _ := filepath.Glob(filepath.Join(photoDir, "*.png")); len(stray) != 0 {
+			t.Fatalf("aux/%q wrote into the photo folder: %q", channel, stray)
 		}
 	})
 }
