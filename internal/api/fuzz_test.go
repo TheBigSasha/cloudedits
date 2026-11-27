@@ -129,17 +129,22 @@ func FuzzRequestPath(f *testing.F) {
 
 // FuzzAuxChannel drives the auxiliary channel routes with arbitrary channel
 // names and bodies as an authenticated owner. The server must never answer
-// 5xx, must store only bodies carrying the PNG signature and only under the
-// asset's own sidecar name, and must serve back exactly what it stored.
+// 5xx, must store only bodies carrying a JPEG or PNG signature and only under
+// the asset's own sidecar name, and must serve back exactly what it stored
+// with the matching Content-Type.
 func FuzzAuxChannel(f *testing.F) {
 	srv, photoDir, assetID := newTestServer(f, "")
 	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 1, 2, 3}
-	for _, channel := range []string{"depth", "DEPTH", "depth.png", "../depth", "..", "", "a", "depth%2f..", "normal", "depth\x00", strings.Repeat("d", 40)} {
+	jpg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xFF, 0xD9}
+	for _, channel := range []string{"depth", "DEPTH", "depth.png", "depth.jpg", "../depth", "..", "", "a", "depth%2f..", "normal", "depth\x00", strings.Repeat("d", 40)} {
+		f.Add(channel, jpg)
 		f.Add(channel, png)
-		f.Add(channel, []byte("not a png"))
+		f.Add(channel, []byte("not an image"))
 	}
 	f.Add("depth", []byte{})
 	f.Add("depth", png[:8])
+	f.Add("depth", jpg[:3])
+	f.Add("depth", jpg[:2])
 
 	sidecarDir := filepath.Join(photoDir, ".hdrtoys")
 	f.Fuzz(func(t *testing.T, channel string, body []byte) {
@@ -161,11 +166,17 @@ func FuzzAuxChannel(f *testing.F) {
 		put := do(http.MethodPut, body)
 		get := do(http.MethodGet, nil)
 		if put.Code == http.StatusOK {
-			if channel != "depth" || !bytes.HasPrefix(body, png[:8]) {
-				t.Fatalf("PUT aux/%q accepted a %d-byte body (PNG signature: %v)", channel, len(body), bytes.HasPrefix(body, png[:8]))
+			isPNG := bytes.HasPrefix(body, png[:8])
+			isJPG := len(body) >= 3 && body[0] == 0xFF && body[1] == 0xD8 && body[2] == 0xFF
+			if channel != "depth" || (!isPNG && !isJPG) {
+				t.Fatalf("PUT aux/%q accepted a %d-byte body (PNG: %v, JPEG: %v)", channel, len(body), isPNG, isJPG)
 			}
-			if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), body) || get.Header().Get("Content-Type") != "image/png" {
-				t.Fatalf("GET after PUT: status %d, %d bytes, type %q", get.Code, get.Body.Len(), get.Header().Get("Content-Type"))
+			wantCT := "image/png"
+			if isJPG {
+				wantCT = "image/jpeg"
+			}
+			if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), body) || get.Header().Get("Content-Type") != wantCT {
+				t.Fatalf("GET after PUT: status %d, %d bytes, type %q (want %q)", get.Code, get.Body.Len(), get.Header().Get("Content-Type"), wantCT)
 			}
 		}
 		del := do(http.MethodDelete, nil)
@@ -185,8 +196,10 @@ func FuzzAuxChannel(f *testing.F) {
 				t.Fatalf("aux/%q left an unexpected entry in the sidecar folder: %q", channel, name)
 			}
 		}
-		if stray, _ := filepath.Glob(filepath.Join(photoDir, "*.png")); len(stray) != 0 {
-			t.Fatalf("aux/%q wrote into the photo folder: %q", channel, stray)
+		for _, pattern := range []string{"*.png", "*.depth.jpg"} {
+			if stray, _ := filepath.Glob(filepath.Join(photoDir, pattern)); len(stray) != 0 {
+				t.Fatalf("aux/%q wrote into the photo folder: %q", channel, stray)
+			}
 		}
 	})
 }

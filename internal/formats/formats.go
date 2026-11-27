@@ -80,31 +80,101 @@ func IsEditThumbnailName(name string) bool {
 	return len(base) > len(EditThumbnailSuffix) && strings.EqualFold(base[len(base)-len(EditThumbnailSuffix):], EditThumbnailSuffix)
 }
 
-// auxChannelSuffixes maps recognized auxiliary channel names to their canonical
-// compound filename suffixes appended to a photo filename
-// (e.g. "<photo filename>.depth.png").
-var auxChannelSuffixes = map[string]string{
-	"depth": ".depth.png",
+// auxChannelAllowedSuffixes maps recognized auxiliary channel names to all
+// compound filename suffixes they may use on disk, ordered with the preferred
+// default format first (e.g. "<photo filename>.depth.jpg", ".depth.png").
+var auxChannelAllowedSuffixes = map[string][]string{
+	"depth": {".depth.jpg", ".depth.png"},
 }
 
-// AuxChannelSuffix returns the canonical filename suffix (such as ".depth.png")
-// for a recognized auxiliary channel name.
+// AuxChannelSuffix returns the legacy default filename suffix (".depth.png")
+// for a recognized auxiliary channel name. Prefer AuxChannelSuffixForFormat,
+// AuxChannelSuffixForData, and AuxChannelSuffixes for multi-format channels.
 func AuxChannelSuffix(channel string) (string, bool) {
-	suffix, ok := auxChannelSuffixes[channel]
-	return suffix, ok
+	suffixes, ok := auxChannelAllowedSuffixes[channel]
+	if !ok || len(suffixes) == 0 {
+		return "", false
+	}
+	return suffixes[len(suffixes)-1], true
+}
+
+// AuxChannelSuffixes returns a copy of all recognized filename suffixes for
+// channel (for example [".depth.jpg", ".depth.png"] for "depth").
+func AuxChannelSuffixes(channel string) ([]string, bool) {
+	suffixes, ok := auxChannelAllowedSuffixes[channel]
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, len(suffixes))
+	copy(out, suffixes)
+	return out, true
+}
+
+// AuxChannelSuffixForFormat returns the compound filename suffix for channel
+// and format ("jpg"/"jpeg"/"image/jpeg" or "png"/"image/png").
+func AuxChannelSuffixForFormat(channel, format string) (string, bool) {
+	suffixes, ok := auxChannelAllowedSuffixes[channel]
+	if !ok {
+		return "", false
+	}
+	var wantExt string
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "jpg", ".jpg", "jpeg", ".jpeg", "image/jpeg":
+		wantExt = ".jpg"
+	case "png", ".png", "image/png":
+		wantExt = ".png"
+	default:
+		return "", false
+	}
+	for _, s := range suffixes {
+		if strings.HasSuffix(s, wantExt) {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+// AuxChannelContentType detects the media type ("image/jpeg" or "image/png")
+// from an auxiliary channel payload's magic bytes.
+func AuxChannelContentType(data []byte) (string, bool) {
+	switch {
+	case IsJPEGMagic(data):
+		return "image/jpeg", true
+	case IsPNGMagic(data):
+		return "image/png", true
+	default:
+		return "", false
+	}
+}
+
+// AuxChannelSuffixForData validates data's magic bytes for channel and returns
+// the matching filename suffix and Content-Type ("image/jpeg" or "image/png").
+func AuxChannelSuffixForData(channel string, data []byte) (suffix, contentType string, ok bool) {
+	contentType, ok = AuxChannelContentType(data)
+	if !ok {
+		return "", "", false
+	}
+	suffix, ok = AuxChannelSuffixForFormat(channel, contentType)
+	if !ok {
+		return "", "", false
+	}
+	return suffix, contentType, true
 }
 
 // IsAuxChannelName reports whether name is a recognized auxiliary channel
-// sidecar artifact (for example "<photo filename>.depth.png"). An editor that
-// keeps artifacts beside the photos writes these into the photo folder itself,
-// where they carry a .png extension but are derived channels of another asset,
-// never standalone photos. The suffix match is case-insensitive and requires a
-// source filename in front of it.
+// sidecar artifact (for example "<photo filename>.depth.jpg" or
+// "<photo filename>.depth.png"). An editor that keeps artifacts beside the
+// photos writes these into the photo folder itself, where they carry an image
+// extension but are derived channels of another asset, never standalone photos.
+// The suffix match is case-insensitive and requires a source filename in front
+// of it.
 func IsAuxChannelName(name string) bool {
 	base := filepath.Base(name)
-	for _, suffix := range auxChannelSuffixes {
-		if len(base) > len(suffix) && strings.EqualFold(base[len(base)-len(suffix):], suffix) {
-			return true
+	for _, suffixes := range auxChannelAllowedSuffixes {
+		for _, suffix := range suffixes {
+			if len(base) > len(suffix) && strings.EqualFold(base[len(base)-len(suffix):], suffix) {
+				return true
+			}
 		}
 	}
 	return false

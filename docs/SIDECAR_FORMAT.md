@@ -13,7 +13,7 @@
     ├── DCIM/
     │   ├── IMG_0001.ARW.edits               # Canonical truth sidecar (hdrt: 1)
     │   ├── IMG_0001.ARW.edit_thumbnail.jpg  # Disposable edited preview JPEG (UltraHDR when HDR)
-    │   └── IMG_0001.ARW.depth.png           # Auxiliary channel PNG sidecar (e.g. depth buffer)
+    │   └── IMG_0001.ARW.depth.jpg           # Auxiliary channel sidecar (.depth.jpg default, or .depth.png)
     ├── renders/                             # Optional uploaded rendered exports
     ├── .tmp/                                # Same-filesystem atomic rename staging
     └── .quarantine/                         # Corrupt .edits files moved here instead of silently dropped
@@ -141,10 +141,10 @@ A folder can therefore hold a copy in each layout. Every read joins the two with
 
 If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by the other copy.
 
-## Auxiliary Channels (`<rel>.<channel>.png`)
+## Auxiliary Channels (`<rel>.<channel>.{jpg,png}`)
 
-Disposable auxiliary channel PNGs (starting with `depth`) live next to `.edits` inside `.hdrtoys/`:
+Disposable auxiliary channel images (starting with `depth`, stored as compressed 8-bit `.depth.jpg` by default or 16-bit `.depth.png`) live next to `.edits` inside `.hdrtoys/`:
 
-- **Canonical path:** `<sidecarRoot>/<rel-posix-path>.<channel>.png` (for example `.hdrtoys/DCIM/IMG_0001.ARW.depth.png`).
-- **Colocated read fallback:** If the canonical file is absent, readers fall back to a read-only colocated `<photoFolder>/<rel-posix-path>.<channel>.png`. Colocated auxiliary files are excluded from library scanning and are never indexed as standalone photos.
-- **Writes and deletes:** Writes always commit atomically into `<sidecarRoot>` via `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> directory `fsync`. Deletes remove only `<sidecarRoot>/<rel-posix-path>.<channel>.png`; source photo folders remain strictly read-only.
+- **Canonical paths:** `<sidecarRoot>/<rel-posix-path>.<channel>.jpg` (JPEG) or `<sidecarRoot>/<rel-posix-path>.<channel>.png` (PNG), for example `.hdrtoys/DCIM/IMG_0001.ARW.depth.jpg`. When both exist, readers prefer the newest mtime.
+- **Colocated read fallback:** If no canonical file exists, readers fall back to a read-only colocated `<photoFolder>/<rel-posix-path>.<channel>.{jpg,png}`. Colocated auxiliary files are excluded from library scanning and are never indexed as standalone photos.
+- **Writes and deletes:** Writes always commit atomically into `<sidecarRoot>` via `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> directory `fsync`, and remove any stale opposite-format sibling under the same asset-channel lock. Deletes remove only `<sidecarRoot>/<rel-posix-path>.<channel>.{jpg,png}`; source photo folders remain strictly read-only.

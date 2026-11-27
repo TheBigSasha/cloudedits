@@ -133,7 +133,7 @@ func FuzzSafeJoinRel(f *testing.F) {
 // auxiliary channel path outside the sidecar root or without a recognised
 // channel suffix.
 func FuzzAuxChannelPath(f *testing.F) {
-	for _, c := range []string{"depth", "DEPTH", "depth.png", "../depth", "..", "", "depth/..", "a\\b", "depth\x00", "normal", "d-e_p0"} {
+	for _, c := range []string{"depth", "DEPTH", "depth.png", "depth.jpg", "../depth", "..", "", "depth/..", "a\\b", "depth\x00", "normal", "d-e_p0"} {
 		f.Add("a/b.jpg", c)
 		f.Add("../../etc/passwd", c)
 	}
@@ -145,16 +145,34 @@ func FuzzAuxChannelPath(f *testing.F) {
 			if err == nil {
 				t.Fatalf("AuxChannelPath accepted channel %q that ValidateAuxChannel rejects", channel)
 			}
+			for _, format := range []string{"jpeg", "png"} {
+				if _, ferr := AuxChannelPathForFormat(base, rel, channel, format); ferr == nil {
+					t.Fatalf("AuxChannelPathForFormat(%q, %q) accepted rejected channel", channel, format)
+				}
+			}
 			return
 		}
-		if channel != strings.ToLower(channel) || strings.ContainsAny(channel, "/\\.\x00") || !strings.HasSuffix(suffix, ".png") {
+		if channel != strings.ToLower(channel) || strings.ContainsAny(channel, "/\\.\x00") || (!strings.HasSuffix(suffix, ".png") && !strings.HasSuffix(suffix, ".jpg")) {
 			t.Fatalf("channel %q validated with suffix %q", channel, suffix)
 		}
-		if err != nil {
-			return
+		if err == nil {
+			if filepath.Clean(full) != full || !strings.HasPrefix(full, base+string(filepath.Separator)) || !strings.HasSuffix(full, suffix) {
+				t.Fatalf("AuxChannelPath(%q, %q) = %q escapes %q or lacks suffix %q", rel, channel, full, base, suffix)
+			}
 		}
-		if filepath.Clean(full) != full || !strings.HasPrefix(full, base+string(filepath.Separator)) || !strings.HasSuffix(full, suffix) {
-			t.Fatalf("AuxChannelPath(%q, %q) = %q escapes %q or lacks suffix %q", rel, channel, full, base, suffix)
+		for _, tc := range []struct {
+			format, ext string
+		}{
+			{"jpeg", ".jpg"},
+			{"png", ".png"},
+		} {
+			ffull, ferr := AuxChannelPathForFormat(base, rel, channel, tc.format)
+			if ferr != nil {
+				continue
+			}
+			if filepath.Clean(ffull) != ffull || !strings.HasPrefix(ffull, base+string(filepath.Separator)) || !strings.HasSuffix(ffull, "."+channel+tc.ext) {
+				t.Fatalf("AuxChannelPathForFormat(%q, %q, %q) = %q escapes %q or lacks suffix", rel, channel, tc.format, ffull, base)
+			}
 		}
 	})
 }

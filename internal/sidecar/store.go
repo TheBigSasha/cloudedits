@@ -115,6 +115,10 @@ func EditThumbnailPath(sidecarRoot, relPosix string) (string, error) {
 // unrecognized auxiliary channel name.
 var ErrInvalidAuxChannel = errors.New("invalid auxiliary channel")
 
+// ErrUnsupportedAuxFormat indicates an auxiliary channel payload whose format
+// or magic bytes are not permitted for that channel.
+var ErrUnsupportedAuxFormat = errors.New("unsupported auxiliary channel format")
+
 // ErrSidecarTooLarge indicates a write that would grow a .edits document past
 // MaxSidecarBytes.
 var ErrSidecarTooLarge = errors.New("sidecar exceeds size limit")
@@ -124,7 +128,8 @@ const (
 	// documents are kilobytes; the bound keeps a hostile or runaway file from
 	// being parsed into memory (the JSON tree is several times its size).
 	MaxSidecarBytes = 16 * 1024 * 1024
-	// MaxAuxChannelBytes bounds an auxiliary channel PNG, on upload and on read.
+	// MaxAuxChannelBytes bounds an auxiliary channel image (JPEG or PNG), on
+	// upload and on read.
 	MaxAuxChannelBytes = 16 * 1024 * 1024
 )
 
@@ -132,7 +137,7 @@ var auxChannelNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 
 // ValidateAuxChannel validates channel against the safe channel name syntax
 // (^[a-z][a-z0-9_-]{0,31}$) and the explicit recognized channel -> suffix
-// mapping, returning the canonical filename suffix (e.g. ".depth.png") or
+// mapping, returning the legacy default suffix (e.g. ".depth.png") or
 // ErrInvalidAuxChannel.
 func ValidateAuxChannel(channel string) (string, error) {
 	if !auxChannelNamePattern.MatchString(channel) {
@@ -146,13 +151,40 @@ func ValidateAuxChannel(channel string) (string, error) {
 }
 
 // AuxChannelPath returns <sidecarRoot>/<relPosix>.<channel>.png for a valid
-// auxiliary channel.
+// auxiliary channel. Prefer AuxChannelPathForFormat when selecting between
+// JPEG and PNG representations.
 func AuxChannelPath(sidecarRoot, relPosix, channel string) (string, error) {
 	suffix, err := ValidateAuxChannel(channel)
 	if err != nil {
 		return "", err
 	}
 	return SafeJoinRel(sidecarRoot, relPosix+suffix)
+}
+
+// AuxChannelPathForFormat returns <sidecarRoot>/<relPosix><suffix> for a valid
+// auxiliary channel and format ("jpg"/"jpeg"/"image/jpeg" or "png"/"image/png").
+func AuxChannelPathForFormat(sidecarRoot, relPosix, channel, format string) (string, error) {
+	if _, err := ValidateAuxChannel(channel); err != nil {
+		return "", err
+	}
+	suffix, ok := formats.AuxChannelSuffixForFormat(channel, format)
+	if !ok {
+		return "", fmt.Errorf("%w: %q for channel %q", ErrUnsupportedAuxFormat, format, channel)
+	}
+	return SafeJoinRel(sidecarRoot, relPosix+suffix)
+}
+
+// auxChannelLockKey returns the single per-asset, per-channel mutex key shared
+// across all on-disk formats of channel (e.g. both .depth.jpg and .depth.png).
+func auxChannelLockKey(sidecarRoot, relPosix, channel string) (string, error) {
+	if _, err := ValidateAuxChannel(channel); err != nil {
+		return "", err
+	}
+	base, err := SafeJoinRel(sidecarRoot, relPosix)
+	if err != nil {
+		return "", err
+	}
+	return "aux:" + base + "\x00" + channel, nil
 }
 
 // ReadResult describes a sidecar read outcome.
@@ -783,115 +815,253 @@ func (s *Store) WriteEditThumbnail(sidecarRoot, relPosix string, jpegBytes []byt
 	return target, nil
 }
 
+// auxChannelMagicMatchesSuffix verifies that data starts with the image
+// signature corresponding to suffix (".jpg" -> JPEG SOI, ".png" -> PNG magic).
+func auxChannelMagicMatchesSuffix(suffix string, data []byte) bool {
+	switch {
+	case strings.HasSuffix(suffix, ".jpg"):
+		return formats.IsJPEGMagic(data)
+	case strings.HasSuffix(suffix, ".png"):
+		return formats.IsPNGMagic(data)
+	default:
+		return false
+	}
+}
+
 // ReadAuxChannel loads an auxiliary channel sidecar for an asset, checking the
-// canonical path (<sidecarRoot>/<relPosix>.<channel>.png) first and falling
-// back to a read-only colocated copy beside the photo
-// (<folderRoot>/<relPosix>.<channel>.png). Returns os.ErrNotExist when neither
-// exists, or ErrInvalidAuxChannel when channel is not allowed.
+// canonical paths under sidecarRoot (e.g. .depth.jpg and .depth.png via os.Root,
+// preferring the newest mtime if both exist) first, then falling back to a
+// read-only colocated copy beside the photo under folderRoot (also preferring
+// newest mtime if both exist). Returns os.ErrNotExist when no valid copy exists,
+// or ErrInvalidAuxChannel when channel is not allowed.
 func (s *Store) ReadAuxChannel(folderRoot, sidecarRoot, relPosix, channel string) ([]byte, string, error) {
-	suffix, err := ValidateAuxChannel(channel)
+	lockKey, err := auxChannelLockKey(sidecarRoot, relPosix, channel)
 	if err != nil {
 		return nil, "", err
 	}
-	canonical, err := SafeJoinRel(sidecarRoot, relPosix+suffix)
-	if err != nil {
-		return nil, "", err
+	suffixes, ok := formats.AuxChannelSuffixes(channel)
+	if !ok {
+		return nil, "", fmt.Errorf("%w: unsupported channel %q", ErrInvalidAuxChannel, channel)
 	}
-	lk := s.lockFor(canonical)
+	lk := s.lockFor(lockKey)
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	if data, err := readAuxChannelFileUnderRoot(sidecarRoot, canonical); err == nil {
-		return data, canonical, nil
+	if data, src, err := readNewestAuxChannelUnderRoot(sidecarRoot, relPosix, suffixes); err == nil {
+		return data, src, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, "", err
 	}
 
 	if folderRoot != "" {
-		if beside, err := SafeJoinRel(folderRoot, relPosix+suffix); err == nil {
-			if data, err := readAuxChannelFile(beside); err == nil {
-				return data, beside, nil
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return nil, "", err
-			}
+		if data, src, err := readNewestAuxChannelColocated(folderRoot, relPosix, suffixes); err == nil {
+			return data, src, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, "", err
 		}
 	}
 	return nil, "", os.ErrNotExist
 }
 
-// readAuxChannelFileUnderRoot reads an auxiliary channel file strictly beneath
-// sidecarRoot via os.Root, rejecting symlinked directories escaping sidecarRoot
-// as well as non-regular, oversized, or non-PNG files.
-func readAuxChannelFileUnderRoot(sidecarRoot, targetPath string) ([]byte, error) {
-	data, err := readRegularUnderRoot(sidecarRoot, targetPath, MaxAuxChannelBytes)
+// readNewestAuxChannelUnderRoot scans all recognized format suffixes for a
+// channel strictly beneath sidecarRoot via os.Root, returning the valid regular
+// file with the newest ModTime (ties broken by suffixes slice order).
+func readNewestAuxChannelUnderRoot(sidecarRoot, relPosix string, suffixes []string) ([]byte, string, error) {
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = root.Close() }()
+
+	var bestData []byte
+	var bestPath string
+	var bestMod time.Time
+	found := false
+
+	for _, suffix := range suffixes {
+		canonical, err := SafeJoinRel(sidecarRoot, relPosix+suffix)
+		if err != nil {
+			return nil, "", err
+		}
+		rel, err := relWithinRoot(sidecarRoot, canonical)
+		if err != nil {
+			return nil, "", err
+		}
+		data, info, err := readAuxChannelFileInRoot(root, rel, suffix)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if !found || info.ModTime().After(bestMod) {
+			bestData = data
+			bestPath = canonical
+			bestMod = info.ModTime()
+			found = true
+		}
+	}
+	if !found {
+		return nil, "", os.ErrNotExist
+	}
+	return bestData, bestPath, nil
+}
+
+// readNewestAuxChannelColocated scans read-only colocated auxiliary channel
+// files beside the source photo, returning the valid regular file with the
+// newest ModTime (ties broken by suffixes slice order).
+func readNewestAuxChannelColocated(folderRoot, relPosix string, suffixes []string) ([]byte, string, error) {
+	var bestData []byte
+	var bestPath string
+	var bestMod time.Time
+	found := false
+
+	for _, suffix := range suffixes {
+		beside, err := SafeJoinRel(folderRoot, relPosix+suffix)
+		if err != nil {
+			continue
+		}
+		data, info, err := readAuxChannelFile(beside, suffix)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		if !found || info.ModTime().After(bestMod) {
+			bestData = data
+			bestPath = beside
+			bestMod = info.ModTime()
+			found = true
+		}
+	}
+	if !found {
+		return nil, "", os.ErrNotExist
+	}
+	return bestData, bestPath, nil
+}
+
+// readAuxChannelFileInRoot reads an auxiliary channel file strictly beneath
+// root via os.Root, rejecting symlinked directories escaping sidecarRoot as
+// well as non-regular, oversized, or magic-mismatched files.
+func readAuxChannelFileInRoot(root *os.Root, rel, suffix string) ([]byte, os.FileInfo, error) {
+	data, info, err := safefile.ReadRegularInRoot(root, rel, MaxAuxChannelBytes)
 	if errors.Is(err, safefile.ErrNotRegular) || errors.Is(err, safefile.ErrTooLarge) {
-		return nil, os.ErrNotExist
+		return nil, nil, os.ErrNotExist
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if !formats.IsPNGMagic(data) {
-		return nil, os.ErrNotExist
+	if !auxChannelMagicMatchesSuffix(suffix, data) {
+		return nil, nil, os.ErrNotExist
 	}
-	return data, nil
+	return data, info, nil
 }
 
 // readAuxChannelFile returns an auxiliary channel file only if it is something
 // the server would itself have stored: a regular file within the upload limit
-// that begins with the PNG signature. Anything else found at that name (a
-// symbolic link, a device, an oversized or non-PNG file) is reported as absent
-// rather than followed, read into memory, or served as an image.
-func readAuxChannelFile(path string) ([]byte, error) {
-	data, _, err := safefile.ReadRegular(path, MaxAuxChannelBytes)
+// whose leading bytes match suffix's expected image signature (JPEG or PNG).
+// Anything else found at that name (a symbolic link, a device, an oversized or
+// mismatched file) is reported as absent rather than followed, read into
+// memory, or served as an image.
+func readAuxChannelFile(path, suffix string) ([]byte, os.FileInfo, error) {
+	data, info, err := safefile.ReadRegular(path, MaxAuxChannelBytes)
 	if errors.Is(err, safefile.ErrNotRegular) || errors.Is(err, safefile.ErrTooLarge) {
-		return nil, os.ErrNotExist
+		return nil, nil, os.ErrNotExist
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if !formats.IsPNGMagic(data) {
-		return nil, os.ErrNotExist
+	if !auxChannelMagicMatchesSuffix(suffix, data) {
+		return nil, nil, os.ErrNotExist
 	}
-	return data, nil
+	return data, info, nil
 }
 
-// WriteAuxChannel atomically commits an auxiliary channel sidecar to
-// <sidecarRoot>/<relPosix>.<channel>.png via <sidecarRoot>/.tmp/<uuid> ->
-// Sync() -> Close() -> os.Rename(). Source photo folders are never modified.
+// WriteAuxChannel atomically commits an auxiliary channel sidecar (JPEG ->
+// .<channel>.jpg or PNG -> .<channel>.png) to <sidecarRoot> via
+// <sidecarRoot>/.tmp/<uuid> -> Sync() -> Close() -> os.Rename(), and removes
+// any stale opposite-format sibling under the same asset-level channel lock.
+// Source photo folders are never modified.
 func (s *Store) WriteAuxChannel(sidecarRoot, relPosix, channel string, data []byte) (string, error) {
-	target, err := AuxChannelPath(sidecarRoot, relPosix, channel)
+	lockKey, err := auxChannelLockKey(sidecarRoot, relPosix, channel)
 	if err != nil {
 		return "", err
 	}
-	if len(data) > MaxAuxChannelBytes || !formats.IsPNGMagic(data) {
-		return "", fmt.Errorf("auxiliary channel must be a PNG of at most %d bytes", MaxAuxChannelBytes)
+	suffix, _, ok := formats.AuxChannelSuffixForData(channel, data)
+	if len(data) > MaxAuxChannelBytes || !ok {
+		return "", fmt.Errorf("%w: auxiliary channel must be a JPEG or PNG of at most %d bytes", ErrUnsupportedAuxFormat, MaxAuxChannelBytes)
 	}
-	lk := s.lockFor(target)
+	target, err := SafeJoinRel(sidecarRoot, relPosix+suffix)
+	if err != nil {
+		return "", err
+	}
+	allSuffixes, _ := formats.AuxChannelSuffixes(channel)
+
+	lk := s.lockFor(lockKey)
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
 	if err := WriteAtomic(sidecarRoot, target, data); err != nil {
 		return "", err
 	}
+
+	// Clean up any stale opposite-format sibling (e.g. remove old .depth.png
+	// after committing .depth.jpg) strictly under os.Root.
+	root, err := openSidecarRoot(sidecarRoot, false, false)
+	if err != nil {
+		return target, err
+	}
+	defer func() { _ = root.Close() }()
+
+	removedSibling := false
+	var syncTargetDir string
+	for _, otherSuffix := range allSuffixes {
+		if otherSuffix == suffix {
+			continue
+		}
+		otherPath, err := SafeJoinRel(sidecarRoot, relPosix+otherSuffix)
+		if err != nil {
+			return target, err
+		}
+		relOther, err := relWithinRoot(sidecarRoot, otherPath)
+		if err != nil {
+			return target, err
+		}
+		if err := root.Remove(relOther); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return target, err
+		}
+		removedSibling = true
+		syncTargetDir = filepath.Join(sidecarRoot, filepath.Dir(relOther))
+	}
+	if removedSibling && durableWrites {
+		if err := syncDir(syncTargetDir); err != nil {
+			return target, fmt.Errorf("fsync target directory after stale format cleanup: %w", err)
+		}
+	}
 	return target, nil
 }
 
-// DeleteAuxChannel removes the disposable auxiliary channel sidecar under
-// <sidecarRoot>/<relPosix>.<channel>.png. It never touches files in the source
-// photo folder. Reports whether a file was removed.
+// DeleteAuxChannel removes all disposable format variants (e.g. .depth.jpg and
+// .depth.png) of an auxiliary channel sidecar under sidecarRoot. It never
+// touches files in the source photo folder. Reports whether any file was
+// removed.
 func (s *Store) DeleteAuxChannel(sidecarRoot, relPosix, channel string) (bool, error) {
-	target, err := AuxChannelPath(sidecarRoot, relPosix, channel)
+	lockKey, err := auxChannelLockKey(sidecarRoot, relPosix, channel)
 	if err != nil {
 		return false, err
 	}
-	lk := s.lockFor(target)
+	suffixes, ok := formats.AuxChannelSuffixes(channel)
+	if !ok {
+		return false, fmt.Errorf("%w: unsupported channel %q", ErrInvalidAuxChannel, channel)
+	}
+	lk := s.lockFor(lockKey)
 	lk.mu.Lock()
 	defer lk.mu.Unlock()
 
-	relTarget, err := relWithinRoot(sidecarRoot, target)
-	if err != nil {
-		return false, err
-	}
 	root, err := openSidecarRoot(sidecarRoot, false, false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -901,18 +1071,32 @@ func (s *Store) DeleteAuxChannel(sidecarRoot, relPosix, channel string) (bool, e
 	}
 	defer func() { _ = root.Close() }()
 
-	if err := root.Remove(relTarget); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+	deleted := false
+	var syncTargetDir string
+	for _, suffix := range suffixes {
+		target, err := SafeJoinRel(sidecarRoot, relPosix+suffix)
+		if err != nil {
+			return deleted, err
 		}
-		return false, err
+		relTarget, err := relWithinRoot(sidecarRoot, target)
+		if err != nil {
+			return deleted, err
+		}
+		if err := root.Remove(relTarget); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted = true
+		syncTargetDir = filepath.Join(sidecarRoot, filepath.Dir(relTarget))
 	}
-	if durableWrites {
-		if err := syncDir(filepath.Join(sidecarRoot, filepath.Dir(relTarget))); err != nil {
+	if deleted && durableWrites {
+		if err := syncDir(syncTargetDir); err != nil {
 			return true, fmt.Errorf("fsync target directory after delete: %w", err)
 		}
 	}
-	return true, nil
+	return deleted, nil
 }
 
 // RenderEntry describes a stored rendered export for an asset.
