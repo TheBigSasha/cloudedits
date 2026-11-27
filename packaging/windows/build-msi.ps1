@@ -59,6 +59,23 @@ function Get-PEMachineType {
     }
 }
 
+function Convert-LicenseToRtf {
+    param(
+        [string]$LicensePath,
+        [string]$RtfOutPath
+    )
+    $lines = Get-Content -Path $LicensePath -Encoding UTF8
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\fs20 ")
+    foreach ($line in $lines) {
+        $escaped = $line.Replace("\", "\\").Replace("{", "\{").Replace("}", "\}")
+        [void]$sb.Append($escaped)
+        [void]$sb.Append("\par`r`n")
+    }
+    [void]$sb.Append("}")
+    [System.IO.File]::WriteAllText($RtfOutPath, $sb.ToString(), [System.Text.Encoding]::ASCII)
+}
+
 try {
     Push-Location $RootDir
 
@@ -71,6 +88,8 @@ try {
     $iconPath = Join-Path $RootDir "packaging\assets\cloudedits.ico"
     $licensePath = Join-Path $RootDir "LICENSE"
     $readmePath = Join-Path $RootDir "README.md"
+    $licenseRtfPath = Join-Path $WorkDir "LICENSE.rtf"
+    Convert-LicenseToRtf -LicensePath $licensePath -RtfOutPath $licenseRtfPath
 
     foreach ($t in $targets) {
         $goArch = $t.GoArch
@@ -78,6 +97,7 @@ try {
         $binDir = Join-Path $WorkDir $goArch
         New-Item -ItemType Directory -Force -Path $binDir | Out-Null
         $binPath = Join-Path $binDir "cloudedits.exe"
+        $setupBinPath = Join-Path $binDir "cloudedits-setup.exe"
 
         Write-Host "==> Cross-compiling windows/$goArch ($Version)"
         $env:CGO_ENABLED = "0"
@@ -85,16 +105,22 @@ try {
         $env:GOARCH = $goArch
         & go build -trimpath "-ldflags=-s -w -X main.version=$Version" -o $binPath ./cmd/cloudedits
         if ($LASTEXITCODE -ne 0) {
-            throw "go build failed for windows/$goArch"
+            throw "go build failed for cloudedits windows/$goArch"
         }
 
-        Assert-ZeroDevSymbols -BinaryPath $binPath
-
-        $machine = Get-PEMachineType -ExePath $binPath
-        if ($machine -ne $t.ExpectedMachine) {
-            throw ("Unexpected PE machine header for windows/{0}: got 0x{1:X4}, expected 0x{2:X4}" -f $goArch, $machine, $t.ExpectedMachine)
+        & go build -trimpath "-ldflags=-H=windowsgui -s -w -X main.version=$Version" -o $setupBinPath ./cmd/cloudedits-setup
+        if ($LASTEXITCODE -ne 0) {
+            throw "go build failed for cloudedits-setup windows/$goArch"
         }
-        Write-Host ("OK: verified PE machine header 0x{0:X4} for windows/{1}" -f $machine, $goArch)
+
+        foreach ($builtExe in @($binPath, $setupBinPath)) {
+            Assert-ZeroDevSymbols -BinaryPath $builtExe
+            $machine = Get-PEMachineType -ExePath $builtExe
+            if ($machine -ne $t.ExpectedMachine) {
+                throw ("Unexpected PE machine header for {0} (windows/{1}): got 0x{2:X4}, expected 0x{3:X4}" -f $builtExe, $goArch, $machine, $t.ExpectedMachine)
+            }
+            Write-Host ("OK: verified PE machine header 0x{0:X4} for {1}" -f $machine, (Split-Path -Leaf $builtExe))
+        }
 
         $msiOut = Join-Path $OutDir $t.OutName
         if (Test-Path $msiOut) {
@@ -103,11 +129,15 @@ try {
 
         Write-Host "==> Building $($t.OutName) with WiX v5 (arch=$wixArch, Version=$NumericVersion)"
         & wix build `
+            -ext WixToolset.UI.wixext `
+            -ext WixToolset.Util.wixext `
             -arch $wixArch `
             -d "Version=$NumericVersion" `
             -d "BinaryPath=$binPath" `
+            -d "SetupBinaryPath=$setupBinPath" `
             -d "IconPath=$iconPath" `
             -d "LicensePath=$licensePath" `
+            -d "LicenseRtfPath=$licenseRtfPath" `
             -d "ReadmePath=$readmePath" `
             -o $msiOut `
             $wxsPath
@@ -130,17 +160,19 @@ try {
                 throw "msiexec /a failed for $($t.OutName) with exit code $($proc.ExitCode)"
             }
 
+            foreach ($exeName in @("cloudedits.exe", "cloudedits-setup.exe")) {
+                $extracted = Get-ChildItem -Path $extractDir -Filter $exeName -Recurse | Select-Object -First 1
+                if (-not $extracted) {
+                    throw "$exeName not found in extracted MSI directory $extractDir"
+                }
+                $extractedMachine = Get-PEMachineType -ExePath $extracted.FullName
+                if ($extractedMachine -ne $t.ExpectedMachine) {
+                    throw ("Extracted PE machine mismatch for {0}: got 0x{1:X4}, expected 0x{2:X4}" -f $exeName, $extractedMachine, $t.ExpectedMachine)
+                }
+                Write-Host ("OK: extracted MSI binary {0} PE machine 0x{1:X4}" -f $exeName, $extractedMachine)
+            }
+
             $extractedExe = Get-ChildItem -Path $extractDir -Filter "cloudedits.exe" -Recurse | Select-Object -First 1
-            if (-not $extractedExe) {
-                throw "cloudedits.exe not found in extracted MSI directory $extractDir"
-            }
-
-            $extractedMachine = Get-PEMachineType -ExePath $extractedExe.FullName
-            if ($extractedMachine -ne $t.ExpectedMachine) {
-                throw ("Extracted PE machine mismatch: got 0x{0:X4}, expected 0x{1:X4}" -f $extractedMachine, $t.ExpectedMachine)
-            }
-            Write-Host ("OK: extracted MSI binary PE machine 0x{0:X4} ({1})" -f $extractedMachine, $extractedExe.FullName)
-
             $hostIsArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
             if (($goArch -eq "amd64" -and -not $hostIsArm64) -or ($goArch -eq "arm64" -and $hostIsArm64)) {
                 $verOut = & $extractedExe.FullName version --json
