@@ -92,7 +92,7 @@ func TestSetupUIEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = stateResp.Body.Close()
-	if payload["indexedCount"].(float64) != 42 || !strings.HasPrefix(payload["qrSvg"].(string), "<svg ") {
+	if payload["indexedCount"].(float64) != 42 || payload["publicUrl"] == "" {
 		t.Fatalf("unexpected setup UI state: %+v", payload)
 	}
 }
@@ -118,8 +118,8 @@ func TestSetupUIOffersNoPhoneLinkBeforeTheNodeIsEnrolled(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if payload["publicUrl"] != "" || payload["qrSvg"] != "" {
-		t.Fatalf("state before enrollment: publicUrl=%q qrSvg set=%v, want both empty", payload["publicUrl"], payload["qrSvg"] != "")
+	if payload["publicUrl"] != "" {
+		t.Fatalf("state before enrollment: publicUrl=%q, want empty", payload["publicUrl"])
 	}
 
 	page, err := http.Get(ts.URL + "/setup")

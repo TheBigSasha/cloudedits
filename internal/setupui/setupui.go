@@ -16,7 +16,6 @@ import (
 
 	"github.com/thebigsasha/cloudedits/internal/auth"
 	"github.com/thebigsasha/cloudedits/internal/config"
-	"github.com/thebigsasha/cloudedits/internal/qr"
 )
 
 const maxRequestBytes = 64 * 1024
@@ -181,13 +180,6 @@ func newMux(sp StateProvider) *http.ServeMux {
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		cfg := sp.GetConfig()
 		pubURL := sp.PublicURL()
-		var qrSVG string
-		if pubURL != "" {
-			// The library's own root redirects to hdr.toys with the
-			// library preselected, so the link, the QR code and the
-			// open button are all this one URL.
-			qrSVG, _ = qr.SVG(pubURL)
-		}
 		srv := sp.Server(r.Context())
 		indexed := sp.IndexedCount()
 		if srv.Indexed != nil {
@@ -200,7 +192,6 @@ func newMux(sp StateProvider) *http.ServeMux {
 			"sidecarDir":   cfg.SidecarDir,
 			"publicUrl":    pubURL,
 			"indexedCount": indexed,
-			"qrSvg":        qrSVG,
 			"server":       srv,
 			"connect":      job.snapshot(),
 		})
