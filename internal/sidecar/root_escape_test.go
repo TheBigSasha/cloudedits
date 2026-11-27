@@ -60,9 +60,15 @@ func TestSidecarWritesConfinedByOSRoot(t *testing.T) {
 			t.Fatalf("outside edit thumbnail created via symlinked subdir: err=%v", err)
 		}
 
-		// WriteAuxChannel must fail and leave outside victim untouched.
+		// WriteAuxChannel must fail for both PNG and JPEG and leave outside victim untouched.
 		if _, err := store.WriteAuxChannel(root, "sub/IMG.JPG", "depth", validPNG); err == nil {
-			t.Fatal("WriteAuxChannel escaped sidecar root through symlinked subdir")
+			t.Fatal("WriteAuxChannel (PNG) escaped sidecar root through symlinked subdir")
+		}
+		if _, err := store.WriteAuxChannel(root, "sub/IMG.JPG", "depth", validJPEG); err == nil {
+			t.Fatal("WriteAuxChannel (JPEG) escaped sidecar root through symlinked subdir")
+		}
+		if _, err := os.Stat(filepath.Join(outside, "IMG.JPG.depth.jpg")); !os.IsNotExist(err) {
+			t.Fatalf("outside .depth.jpg created via symlinked subdir: err=%v", err)
 		}
 
 		// DeleteAuxChannel must fail and must NOT delete victim outside sidecarRoot.

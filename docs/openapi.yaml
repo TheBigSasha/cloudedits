@@ -661,7 +661,7 @@ paths:
           description: Thumbnail saved
   /assets/{id}/aux/{channel}:
     get:
-      summary: Fetch an auxiliary channel PNG sidecar (e.g. depth)
+      summary: Fetch an auxiliary channel image sidecar (JPEG or PNG, e.g. depth)
       security:
         - BearerAuth: []
       parameters:
@@ -678,8 +678,12 @@ paths:
             enum: [depth]
       responses:
         "200":
-          description: Raw auxiliary channel PNG bytes with strong ETag and X-HDRT-Aux-Channel
+          description: Raw auxiliary channel JPEG or PNG bytes with strong ETag and X-HDRT-Aux-Channel
           content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
             image/png:
               schema:
                 type: string
@@ -699,7 +703,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
     put:
-      summary: Upload an auxiliary channel PNG sidecar (<= 16 MiB)
+      summary: Upload an auxiliary channel JPEG or PNG sidecar (<= 16 MiB)
       security:
         - BearerAuth: []
       parameters:
@@ -717,6 +721,10 @@ paths:
       requestBody:
         required: true
         content:
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
           image/png:
             schema:
               type: string
@@ -747,7 +755,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "415":
-          description: Payload does not start with a valid PNG signature
+          description: Payload does not start with a valid JPEG or PNG signature
           content:
             application/json:
               schema:

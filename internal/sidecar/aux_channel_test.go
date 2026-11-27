@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestValidateAuxChannel(t *testing.T) {
@@ -145,17 +146,17 @@ func TestAuxChannelConcurrentAccessIsSerialized(t *testing.T) {
 	sidecarRoot := filepath.Join(folderRoot, ".hdrtoys")
 	st := NewStore()
 
-	payloadA := []byte("\x89PNG\r\n\x1a\npayload-AAAA")
-	payloadB := []byte("\x89PNG\r\n\x1a\npayload-BBBB")
+	payloadPNG := []byte("\x89PNG\r\n\x1a\npayload-PNG-AAAA")
+	payloadJPG := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'J', 'P', 'E', 'G', '-', 'B', 'B', 'B', 'B', 0xFF, 0xD9}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			payload := payloadA
+			payload := payloadPNG
 			if id%2 == 1 {
-				payload = payloadB
+				payload = payloadJPG
 			}
 			for j := 0; j < 10; j++ {
 				if _, err := st.WriteAuxChannel(sidecarRoot, "IMG_0001.JPG", "depth", payload); err != nil {
@@ -167,7 +168,7 @@ func TestAuxChannelConcurrentAccessIsSerialized(t *testing.T) {
 					t.Errorf("ReadAuxChannel: %v", err)
 					return
 				}
-				if !bytes.Equal(data, payloadA) && !bytes.Equal(data, payloadB) {
+				if !bytes.Equal(data, payloadPNG) && !bytes.Equal(data, payloadJPG) {
 					t.Errorf("observed torn aux channel bytes: %q", data)
 					return
 				}
@@ -175,4 +176,129 @@ func TestAuxChannelConcurrentAccessIsSerialized(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+
+	// Single asset-channel lock guarantees only one format sibling remains on disk.
+	_, errJPG := os.Stat(filepath.Join(sidecarRoot, "IMG_0001.JPG.depth.jpg"))
+	_, errPNG := os.Stat(filepath.Join(sidecarRoot, "IMG_0001.JPG.depth.png"))
+	if (errJPG == nil) == (errPNG == nil) {
+		t.Fatalf("expected exactly one format sibling after concurrent writes (jpg err=%v, png err=%v)", errJPG, errPNG)
+	}
+}
+
+func TestAuxChannelDualFormatSwitchNewestMtimeAndDelete(t *testing.T) {
+	folderRoot := t.TempDir()
+	sidecarRoot := filepath.Join(folderRoot, ".hdrtoys")
+	rel := "DCIM/IMG_0002.JPG"
+	st := NewStore()
+
+	jpegV1 := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'd', 'e', 'p', 't', 'h', '1', 0xFF, 0xD9}
+	pngV1 := []byte("\x89PNG\r\n\x1a\ndepth-png-v1")
+	jpegV2 := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'd', 'e', 'p', 't', 'h', '2', 0xFF, 0xD9}
+
+	// Unsupported magic fails with ErrUnsupportedAuxFormat.
+	if _, err := st.WriteAuxChannel(sidecarRoot, rel, "depth", []byte("not-an-image")); !errors.Is(err, ErrUnsupportedAuxFormat) {
+		t.Fatalf("WriteAuxChannel invalid payload err = %v, want ErrUnsupportedAuxFormat", err)
+	}
+
+	// 1. Write JPEG -> creates .depth.jpg.
+	jpgPath, err := st.WriteAuxChannel(sidecarRoot, rel, "depth", jpegV1)
+	if err != nil {
+		t.Fatalf("WriteAuxChannel(JPEG): %v", err)
+	}
+	wantJPG := filepath.Join(sidecarRoot, "DCIM", "IMG_0002.JPG.depth.jpg")
+	wantPNG := filepath.Join(sidecarRoot, "DCIM", "IMG_0002.JPG.depth.png")
+	if jpgPath != wantJPG {
+		t.Fatalf("jpgPath = %q, want %q", jpgPath, wantJPG)
+	}
+	got, src, err := st.ReadAuxChannel(folderRoot, sidecarRoot, rel, "depth")
+	if err != nil || src != wantJPG || !bytes.Equal(got, jpegV1) {
+		t.Fatalf("ReadAuxChannel(JPEG) = (%q, %d bytes, %v)", src, len(got), err)
+	}
+
+	// 2. Switch to PNG -> writes .depth.png and removes stale .depth.jpg.
+	pngPath, err := st.WriteAuxChannel(sidecarRoot, rel, "depth", pngV1)
+	if err != nil || pngPath != wantPNG {
+		t.Fatalf("WriteAuxChannel(PNG) = (%q, %v), want (%q, nil)", pngPath, err, wantPNG)
+	}
+	if _, err := os.Stat(wantJPG); !os.IsNotExist(err) {
+		t.Fatalf("stale .depth.jpg was not removed when switching to PNG: err=%v", err)
+	}
+
+	// 3. Switch back to JPEG -> writes .depth.jpg and removes stale .depth.png.
+	if _, err := st.WriteAuxChannel(sidecarRoot, rel, "depth", jpegV2); err != nil {
+		t.Fatalf("WriteAuxChannel(JPEG v2): %v", err)
+	}
+	if _, err := os.Stat(wantPNG); !os.IsNotExist(err) {
+		t.Fatalf("stale .depth.png was not removed when switching to JPEG: err=%v", err)
+	}
+
+	// 4. When both .depth.jpg and .depth.png coexist on disk, ReadAuxChannel prefers newest mtime.
+	if err := os.WriteFile(wantPNG, pngV1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	older := time.Now().Add(-2 * time.Minute)
+	newer := time.Now().Add(-10 * time.Second)
+	if err := os.Chtimes(wantJPG, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(wantPNG, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	got, src, err = st.ReadAuxChannel(folderRoot, sidecarRoot, rel, "depth")
+	if err != nil || src != wantPNG || !bytes.Equal(got, pngV1) {
+		t.Fatalf("newest-mtime (PNG newer): got (%q, %v), want %q", src, err, wantPNG)
+	}
+	// Flip mtimes so JPEG is newer.
+	evenNewer := time.Now()
+	if err := os.Chtimes(wantJPG, evenNewer, evenNewer); err != nil {
+		t.Fatal(err)
+	}
+	got, src, err = st.ReadAuxChannel(folderRoot, sidecarRoot, rel, "depth")
+	if err != nil || src != wantJPG || !bytes.Equal(got, jpegV2) {
+		t.Fatalf("newest-mtime (JPEG newer): got (%q, %v), want %q", src, err, wantJPG)
+	}
+
+	// 5. DeleteAuxChannel removes BOTH .depth.jpg and .depth.png under sidecarRoot.
+	deleted, err := st.DeleteAuxChannel(sidecarRoot, rel, "depth")
+	if err != nil || !deleted {
+		t.Fatalf("DeleteAuxChannel both = (%v, %v), want (true, nil)", deleted, err)
+	}
+	if _, err := os.Stat(wantJPG); !os.IsNotExist(err) {
+		t.Fatalf("expected .depth.jpg deleted, err=%v", err)
+	}
+	if _, err := os.Stat(wantPNG); !os.IsNotExist(err) {
+		t.Fatalf("expected .depth.png deleted, err=%v", err)
+	}
+
+	// 6. Mismatched magic on disk (e.g. PNG bytes in .depth.jpg) is rejected as absent.
+	if err := os.WriteFile(wantJPG, pngV1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ReadAuxChannel(folderRoot, sidecarRoot, rel, "depth"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mismatched magic read err = %v, want os.ErrNotExist", err)
+	}
+	_, _ = st.DeleteAuxChannel(sidecarRoot, rel, "depth")
+
+	// 7. Colocated fallback supports both .depth.jpg and .depth.png with newest-mtime preference.
+	colocJPG := filepath.Join(folderRoot, "DCIM", "IMG_0002.JPG.depth.jpg")
+	colocPNG := filepath.Join(folderRoot, "DCIM", "IMG_0002.JPG.depth.png")
+	if err := os.MkdirAll(filepath.Dir(colocJPG), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(colocJPG, jpegV1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(colocPNG, pngV1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(colocPNG, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(colocJPG, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	got, src, err = st.ReadAuxChannel(folderRoot, sidecarRoot, rel, "depth")
+	if err != nil || src != colocJPG || !bytes.Equal(got, jpegV1) {
+		t.Fatalf("colocated newest-mtime JPEG: got (%q, %v), want %q", src, err, colocJPG)
+	}
 }

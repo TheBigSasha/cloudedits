@@ -1206,6 +1206,12 @@ func (s *Server) handleGetAuxChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	contentType, ok := formats.AuxChannelContentType(data)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "unrecognized auxiliary channel media type")
+		return
+	}
+
 	etag := auxChannelETag(data)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
@@ -1215,7 +1221,7 @@ func (s *Server) handleGetAuxChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
@@ -1248,14 +1254,19 @@ func (s *Server) handlePutAuxChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "read body failed")
 		return
 	}
-	if !formats.IsPNGMagic(data) {
-		writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid PNG")
+	_, contentType, ok := formats.AuxChannelSuffixForData(channel, data)
+	if !ok {
+		writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid JPEG or PNG")
 		return
 	}
 
 	if _, err := s.idx.Sidecars().WriteAuxChannel(asset.SidecarRoot, asset.RelPath, channel, data); err != nil {
 		if errors.Is(err, sidecar.ErrInvalidAuxChannel) {
 			writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+			return
+		}
+		if errors.Is(err, sidecar.ErrUnsupportedAuxFormat) {
+			writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid JPEG or PNG")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1270,7 +1281,7 @@ func (s *Server) handlePutAuxChannel(w http.ResponseWriter, r *http.Request) {
 		"assetId":     asset.ID,
 		"channel":     channel,
 		"bytes":       len(data),
-		"contentType": "image/png",
+		"contentType": contentType,
 		"etag":        etag,
 	})
 }
