@@ -33,7 +33,7 @@ const (
 	maxCursorLimit        = 200
 	maxEditThumbnailBytes = 4 * 1024 * 1024
 	// MaxAuxChannelBytes caps uploaded auxiliary channel sidecars (16 MiB).
-	MaxAuxChannelBytes   = 16 * 1024 * 1024
+	MaxAuxChannelBytes   = sidecar.MaxAuxChannelBytes
 	maxRenderBytes       = 64 * 1024 * 1024
 	maxHandoffBytes      = 64 * 1024
 	maxSmallJSONBytes    = 64 * 1024
@@ -497,7 +497,6 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, exp := s.sessions.Issue(p)
-	bt := s.sessions.SignBlobToken(p.Subject, "*", 15*time.Minute)
 	perms := make([]string, 0, len(p.Scopes))
 	for perm, ok := range p.Scopes {
 		if ok {
@@ -506,7 +505,6 @@ func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":       token,
-		"blobToken":   bt,
 		"subject":     p.Subject,
 		"expiresAt":   exp.Format(time.RFC3339),
 		"permissions": perms,
@@ -543,7 +541,10 @@ func parseFilter(r *http.Request) index.Filter {
 func (s *Server) populateAssetURLs(r *http.Request, a *index.Asset, includeFullEXIF bool) {
 	origin := s.selfOrigin(r)
 	esc := url.PathEscape(a.ID)
-	a.ThumbnailURL = origin + "/assets/" + esc + "/file?tier=thumb"
+	// The version makes the URL name exactly the bytes it returns, so a
+	// browser never shows a cached thumbnail after the photo or its edited
+	// preview was replaced.
+	a.ThumbnailURL = origin + "/assets/" + esc + "/file?tier=thumb&v=" + url.QueryEscape(a.ThumbnailVersion)
 	a.RawURL = origin + "/assets/" + esc + "/file?tier=original"
 	a.RecipeURL = origin + "/assets/" + esc + "/recipe"
 	if !includeFullEXIF {
@@ -853,7 +854,7 @@ func (s *Server) handlePostRating(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 	if status, message, rejected := singleOpRejection(receipts); rejected {
@@ -972,7 +973,7 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 	if status, message, rejected := singleOpRejection(receipts); rejected {
@@ -983,6 +984,19 @@ func (s *Server) handleDeleteVariant(w http.ResponseWriter, r *http.Request) {
 		"durable":  true,
 		"receipts": receipts,
 	})
+}
+
+// writeApplyFailure answers a failed op application. A sidecar another
+// process kept rewriting is a passing condition, so it is 503 with Retry-After
+// (the client keeps the ops and sends them again); anything else is the
+// request's own fault.
+func writeApplyFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, sidecar.ErrContended) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // singleOpRejection maps the receipt of a one-op endpoint onto an HTTP error:
@@ -1061,7 +1075,7 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeApplyFailure(w, err)
 		return
 	}
 
@@ -1133,6 +1147,9 @@ func (s *Server) handlePutEditThumbnail(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The preview is stored; a journal that cannot be appended only delays
+	// other clients until the next folder scan notices the new file.
+	_ = s.idx.NoteEditThumbnail(r.Context(), asset)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"assetId":    asset.ID,
@@ -1189,6 +1206,12 @@ func (s *Server) handleGetAuxChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	contentType, ok := formats.AuxChannelContentType(data)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "unrecognized auxiliary channel media type")
+		return
+	}
+
 	etag := auxChannelETag(data)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "private, max-age=3600")
@@ -1198,7 +1221,7 @@ func (s *Server) handleGetAuxChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
@@ -1231,14 +1254,19 @@ func (s *Server) handlePutAuxChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "read body failed")
 		return
 	}
-	if !formats.IsPNGMagic(data) {
-		writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid PNG")
+	_, contentType, ok := formats.AuxChannelSuffixForData(channel, data)
+	if !ok {
+		writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid JPEG or PNG")
 		return
 	}
 
 	if _, err := s.idx.Sidecars().WriteAuxChannel(asset.SidecarRoot, asset.RelPath, channel, data); err != nil {
 		if errors.Is(err, sidecar.ErrInvalidAuxChannel) {
 			writeError(w, http.StatusBadRequest, "invalid auxiliary channel")
+			return
+		}
+		if errors.Is(err, sidecar.ErrUnsupportedAuxFormat) {
+			writeError(w, http.StatusUnsupportedMediaType, "auxiliary channel must be a valid JPEG or PNG")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1253,7 +1281,7 @@ func (s *Server) handlePutAuxChannel(w http.ResponseWriter, r *http.Request) {
 		"assetId":     asset.ID,
 		"channel":     channel,
 		"bytes":       len(data),
-		"contentType": "image/png",
+		"contentType": contentType,
 		"etag":        etag,
 	})
 }

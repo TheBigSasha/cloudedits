@@ -1,0 +1,227 @@
+{
+  "comment": "Shared by this server's tests and the browser editor's. Both must agree on every case.",
+  "maxDriftMillis": 86400000,
+  "parse": [
+    {
+      "s": "019a2f0012ab-0001-devA",
+      "ok": true,
+      "millis": 1761725125291,
+      "counter": 1,
+      "device": "devA"
+    },
+    {
+      "s": "ff-100-device-with-hyphens",
+      "ok": true,
+      "millis": 255,
+      "counter": 256,
+      "device": "device-with-hyphens"
+    },
+    {
+      "s": "019A2F0012AB-000A-devA",
+      "ok": true,
+      "millis": 1761725125291,
+      "counter": 10,
+      "device": "devA"
+    },
+    {
+      "s": "1fffffffffffff-ffffffff-z",
+      "ok": true,
+      "millis": 9007199254740991,
+      "counter": 4294967295,
+      "device": "z"
+    },
+    {
+      "s": "20000000000000-0000-z",
+      "ok": false
+    },
+    {
+      "s": "ffffffffffffffff-0000-z",
+      "ok": false
+    },
+    {
+      "s": "10000000000000000-0000-z",
+      "ok": false
+    },
+    {
+      "s": "019a2f0012ab-100000000-z",
+      "ok": false
+    },
+    {
+      "s": "019a2f0012ab-0001-",
+      "ok": false
+    },
+    {
+      "s": "-0001-devA",
+      "ok": false
+    },
+    {
+      "s": "019a2f0012ab--devA",
+      "ok": false
+    },
+    {
+      "s": "0x19a-0001-devA",
+      "ok": false
+    },
+    {
+      "s": "019a2f0012ab-00g1-devA",
+      "ok": false
+    },
+    {
+      "s": " 19a-0001-devA",
+      "ok": false
+    },
+    {
+      "s": "",
+      "ok": false
+    }
+  ],
+  "compare": [
+    {
+      "a": "ff-0000-devA",
+      "b": "100-0000-devA",
+      "want": -1
+    },
+    {
+      "a": "019a2f0012ab-0001-devB",
+      "b": "019a2f0012ab-0002-devA",
+      "want": -1
+    },
+    {
+      "a": "019a2f0012ab-0001-devA",
+      "b": "019a2f0012ab-0001-devB",
+      "want": -1
+    },
+    {
+      "a": "019a2f0012ab-0001-devA",
+      "b": "019A2F0012AB-1-devA",
+      "want": 0
+    },
+    {
+      "a": "019a2f0012ab-10000-devA",
+      "b": "019a2f0012ab-ffff-devA",
+      "want": 1
+    },
+    {
+      "a": "1fffffffffffff-ffffffff-a",
+      "b": "1ffffffffffffe-ffffffff-z",
+      "want": 1
+    }
+  ],
+  "clock": [
+    {
+      "name": "same millisecond bumps the counter",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [],
+      "ticks": [
+        "01a3185c5000-0000-d",
+        "01a3185c5000-0001-d",
+        "01a3185c5000-0002-d"
+      ]
+    },
+    {
+      "name": "an observed HLC inside the drift bound moves the clock",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [
+        "01a318933e80-0005-peer"
+      ],
+      "observed": [
+        true
+      ],
+      "ticks": [
+        "01a318933e80-0006-d",
+        "01a318933e80-0007-d"
+      ]
+    },
+    {
+      "name": "an observed HLC at exactly the drift bound is accepted",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [
+        "01a31d82ac00-0000-peer"
+      ],
+      "observed": [
+        true
+      ],
+      "ticks": [
+        "01a31d82ac00-0001-d"
+      ]
+    },
+    {
+      "name": "an observed HLC beyond the drift bound is ignored",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [
+        "01a31d82ac01-0000-peer",
+        "1fffffffffffff-ffffffff-z"
+      ],
+      "observed": [
+        false,
+        false
+      ],
+      "ticks": [
+        "01a3185c5000-0000-d",
+        "01a3185c5000-0001-d"
+      ]
+    },
+    {
+      "name": "an exhausted counter carries into the next millisecond",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [
+        "01a318933e80-ffffffff-peer"
+      ],
+      "observed": [
+        true
+      ],
+      "ticks": [
+        "01a318933e81-0000-d",
+        "01a318933e81-0001-d"
+      ]
+    },
+    {
+      "name": "a malformed HLC is not observed",
+      "device": "d",
+      "now": 1800000000000,
+      "observe": [
+        "not-an-hlc",
+        "20000000000000-0000-z"
+      ],
+      "observed": [
+        false,
+        false
+      ],
+      "ticks": [
+        "01a3185c5000-0000-d"
+      ]
+    }
+  ],
+  "drift": [
+    {
+      "now": 1800000000000,
+      "hlc": "01a2e4dcb800-0000-a",
+      "beyond": false
+    },
+    {
+      "now": 1800000000000,
+      "hlc": "01a3185c5000-ffffffff-a",
+      "beyond": false
+    },
+    {
+      "now": 1800000000000,
+      "hlc": "01a31d82ac00-ffffffff-a",
+      "beyond": false
+    },
+    {
+      "now": 1800000000000,
+      "hlc": "01a31d82ac01-0000-a",
+      "beyond": true
+    },
+    {
+      "now": 1800000000000,
+      "hlc": "1fffffffffffff-0000-a",
+      "beyond": true
+    }
+  ]
+}

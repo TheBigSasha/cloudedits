@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/thebigsasha/cloudedits/internal/auth"
 )
@@ -164,7 +163,44 @@ func TestAuxChannelFullLifecycle(t *testing.T) {
 		t.Fatalf("If-None-Match mismatch: status=%d, want 200", missResp.StatusCode)
 	}
 
-	// 5. Overwriting changes ETag and bytes cleanly.
+	// 5. Switching from PNG to JPEG writes .depth.jpg, removes stale .depth.png,
+	// updates Content-Type to image/jpeg, and changes ETag cleanly.
+	depthJPG := sampleJPEG(t, 16, 16, color.RGBA{200, 200, 200, 255})
+	putReqJPG, _ := http.NewRequest(http.MethodPut, auxURL, bytes.NewReader(depthJPG))
+	putReqJPG.Header.Set("Content-Type", "image/jpeg")
+	putRespJPG, err := http.DefaultClient.Do(putReqJPG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var putBodyJPG struct {
+		OK          bool   `json:"ok"`
+		Bytes       int    `json:"bytes"`
+		ContentType string `json:"contentType"`
+		ETag        string `json:"etag"`
+	}
+	_ = json.NewDecoder(putRespJPG.Body).Decode(&putBodyJPG)
+	_ = putRespJPG.Body.Close()
+	if putRespJPG.StatusCode != http.StatusOK || !putBodyJPG.OK || putBodyJPG.ContentType != "image/jpeg" || putBodyJPG.Bytes != len(depthJPG) || putBodyJPG.ETag == putBody.ETag {
+		t.Fatalf("JPEG PUT: status=%d body=%+v (prev etag=%q)", putRespJPG.StatusCode, putBodyJPG, putBody.ETag)
+	}
+	jpgDiskPath := filepath.Join(photoDir, ".hdrtoys", "IMG_0001.JPG.depth.jpg")
+	if gotDisk, err := os.ReadFile(jpgDiskPath); err != nil || !bytes.Equal(gotDisk, depthJPG) {
+		t.Fatalf("expected .depth.jpg on disk matching payload (err=%v)", err)
+	}
+	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale .depth.png removed after JPEG upload, stat err=%v", err)
+	}
+	getRespJPG, err := http.Get(auxURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotJPGBytes, _ := io.ReadAll(getRespJPG.Body)
+	_ = getRespJPG.Body.Close()
+	if getRespJPG.StatusCode != http.StatusOK || getRespJPG.Header.Get("Content-Type") != "image/jpeg" || !bytes.Equal(gotJPGBytes, depthJPG) {
+		t.Fatalf("GET JPEG: status=%d ct=%q len=%d", getRespJPG.StatusCode, getRespJPG.Header.Get("Content-Type"), len(gotJPGBytes))
+	}
+
+	// Overwriting back to PNG removes stale .depth.jpg and serves image/png again.
 	depthV2 := samplePNG(t, 16, 16, color.RGBA{240, 240, 240, 255})
 	putReq2, _ := http.NewRequest(http.MethodPut, auxURL, bytes.NewReader(depthV2))
 	putResp2, err := http.DefaultClient.Do(putReq2)
@@ -172,12 +208,16 @@ func TestAuxChannelFullLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var putBody2 struct {
-		ETag string `json:"etag"`
+		ContentType string `json:"contentType"`
+		ETag        string `json:"etag"`
 	}
 	_ = json.NewDecoder(putResp2.Body).Decode(&putBody2)
 	_ = putResp2.Body.Close()
-	if putResp2.StatusCode != http.StatusOK || putBody2.ETag == putBody.ETag {
-		t.Fatalf("overwrite PUT status=%d etag=%q (prev=%q)", putResp2.StatusCode, putBody2.ETag, putBody.ETag)
+	if putResp2.StatusCode != http.StatusOK || putBody2.ContentType != "image/png" || putBody2.ETag == putBodyJPG.ETag {
+		t.Fatalf("overwrite PUT status=%d body=%+v (prev=%q)", putResp2.StatusCode, putBody2, putBodyJPG.ETag)
+	}
+	if _, err := os.Stat(jpgDiskPath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale .depth.jpg removed after PNG upload, stat err=%v", err)
 	}
 
 	// 6. DELETE removes disposable sidecar only, never touching original photo.
@@ -236,36 +276,41 @@ func TestAuxChannelFullLifecycle(t *testing.T) {
 
 func TestAuxChannelColocatedReadFallbackAndScannerExclusion(t *testing.T) {
 	srv, photoDir, assetID := newTestServer(t, "")
-	colocatedData := samplePNG(t, 8, 8, color.RGBA{30, 60, 90, 255})
-	colocatedPath := filepath.Join(photoDir, "IMG_0001.JPG.depth.png")
-	if err := os.WriteFile(colocatedPath, colocatedData, 0o644); err != nil {
+	colocatedPNGData := samplePNG(t, 8, 8, color.RGBA{30, 60, 90, 255})
+	colocatedPNGPath := filepath.Join(photoDir, "IMG_0001.JPG.depth.png")
+	if err := os.WriteFile(colocatedPNGPath, colocatedPNGData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	colocatedJPGData := sampleJPEG(t, 8, 8, color.RGBA{120, 120, 120, 255})
+	colocatedJPGPath := filepath.Join(photoDir, "IMG_0001.JPG.depth.jpg")
+	if err := os.WriteFile(colocatedJPGPath, colocatedJPGData, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := srv.idx.ScanAll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Colocated IMG_0001.JPG.depth.png must NOT be indexed as a standalone asset.
+	// Neither colocated .depth.png nor .depth.jpg may be indexed as a standalone asset.
 	if code, body := getJSON(t, srv, "/assets/count"); code != http.StatusOK || body["total"] != float64(1) {
-		t.Fatalf("asset count after placing colocated depth PNG: code=%d body=%v, want total=1", code, body)
+		t.Fatalf("asset count after placing colocated depth files: code=%d body=%v, want total=1", code, body)
 	}
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	auxURL := ts.URL + "/assets/" + assetID + "/aux/depth"
 
-	// GET serves colocated fallback bytes.
+	// GET serves colocated fallback bytes (JPEG was written after PNG, so JPEG wins).
 	resp, err := http.Get(auxURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !bytes.Equal(got, colocatedData) {
-		t.Fatalf("GET colocated fallback: status=%d len=%d", resp.StatusCode, len(got))
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/jpeg" || !bytes.Equal(got, colocatedJPGData) {
+		t.Fatalf("GET colocated JPEG fallback: status=%d ct=%q len=%d", resp.StatusCode, resp.Header.Get("Content-Type"), len(got))
 	}
 
-	// PUT commits to .hdrtoys/ and leaves colocated file untouched.
+	// PUT commits to .hdrtoys/ and leaves colocated files untouched.
 	canonicalData := samplePNG(t, 8, 8, color.RGBA{200, 150, 100, 255})
 	putReq, _ := http.NewRequest(http.MethodPut, auxURL, bytes.NewReader(canonicalData))
 	putResp, err := http.DefaultClient.Do(putReq)
@@ -284,11 +329,11 @@ func TestAuxChannelColocatedReadFallbackAndScannerExclusion(t *testing.T) {
 	}
 	got2, _ := io.ReadAll(resp2.Body)
 	_ = resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK || !bytes.Equal(got2, canonicalData) {
-		t.Fatalf("GET canonical override: status=%d match=%v", resp2.StatusCode, bytes.Equal(got2, canonicalData))
+	if resp2.StatusCode != http.StatusOK || resp2.Header.Get("Content-Type") != "image/png" || !bytes.Equal(got2, canonicalData) {
+		t.Fatalf("GET canonical override: status=%d ct=%q match=%v", resp2.StatusCode, resp2.Header.Get("Content-Type"), bytes.Equal(got2, canonicalData))
 	}
 
-	// DELETE removes canonical copy but never deletes colocated copy in source folder.
+	// DELETE removes canonical copy but never deletes colocated copies in source folder.
 	delReq, _ := http.NewRequest(http.MethodDelete, auxURL, nil)
 	delResp, err := http.DefaultClient.Do(delReq)
 	if err != nil {
@@ -298,9 +343,13 @@ func TestAuxChannelColocatedReadFallbackAndScannerExclusion(t *testing.T) {
 	if delResp.StatusCode != http.StatusOK {
 		t.Fatalf("DELETE status=%d", delResp.StatusCode)
 	}
-	stillColocated, err := os.ReadFile(colocatedPath)
-	if err != nil || !bytes.Equal(stillColocated, colocatedData) {
-		t.Fatalf("colocated file in source folder was altered or removed (err=%v)", err)
+	stillColocatedPNG, err := os.ReadFile(colocatedPNGPath)
+	if err != nil || !bytes.Equal(stillColocatedPNG, colocatedPNGData) {
+		t.Fatalf("colocated PNG in source folder was altered or removed (err=%v)", err)
+	}
+	stillColocatedJPG, err := os.ReadFile(colocatedJPGPath)
+	if err != nil || !bytes.Equal(stillColocatedJPG, colocatedJPGData) {
+		t.Fatalf("colocated JPEG in source folder was altered or removed (err=%v)", err)
 	}
 }
 
@@ -315,18 +364,26 @@ func TestAuxChannelValidationAndLimits(t *testing.T) {
 		return rec
 	}
 
-	// 1. 415 Unsupported Media Type on non-PNG payloads.
-	nonPNGPayloads := [][]byte{
-		sampleJPEG(t, 16, 16, color.RGBA{10, 20, 30, 255}),
-		[]byte("not-a-png"),
+	// 1. 415 Unsupported Media Type on non-JPEG/non-PNG payloads.
+	invalidPayloads := [][]byte{
+		[]byte("RIFF\x00\x00\x00\x00WEBP"),
+		[]byte("GIF89a\x01\x00\x01\x00"),
+		[]byte("not-an-image"),
 		{},
+		{0xFF, 0xD8},
 		{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A},
 	}
-	for i, payload := range nonPNGPayloads {
+	for i, payload := range invalidPayloads {
 		rec := do(http.MethodPut, "/assets/"+assetID+"/aux/depth", bytes.NewReader(payload))
 		if rec.Code != http.StatusUnsupportedMediaType {
-			t.Errorf("non-PNG case %d: status=%d, want 415 (body=%s)", i, rec.Code, rec.Body.String())
+			t.Errorf("invalid media case %d: status=%d, want 415 (body=%s)", i, rec.Code, rec.Body.String())
 		}
+	}
+
+	// Valid JPEG payload is accepted with 200 and contentType=image/jpeg.
+	jpegRec := do(http.MethodPut, "/assets/"+assetID+"/aux/depth", bytes.NewReader(sampleJPEG(t, 16, 16, color.RGBA{10, 20, 30, 255})))
+	if jpegRec.Code != http.StatusOK || !strings.Contains(jpegRec.Body.String(), `"contentType":"image/jpeg"`) {
+		t.Fatalf("valid JPEG PUT: status=%d body=%s", jpegRec.Code, jpegRec.Body.String())
 	}
 
 	// 2. 413 Payload Too Large when exceeding MaxAuxChannelBytes.
@@ -423,14 +480,27 @@ func TestAuxChannelCORSOriginAndPermissions(t *testing.T) {
 		t.Fatalf("Access-Control-Expose-Headers=%q missing X-HDRT-Aux-Channel", putRec.Header().Get("Access-Control-Expose-Headers"))
 	}
 
-	// 3. ?bt= blob token grants asset:read (GET succeeds) but NOT media:write (PUT/DELETE -> 403).
-	bt := srv.sessions.SignBlobToken("tailnet:alice", assetID, 5*time.Minute)
-	getReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target+"?bt="+bt, nil)
+	// 3. Read-only session token (asset:read only) grants GET but NOT media:write (PUT/DELETE -> 403),
+	// and ?bt= query parameter credentials are rejected (401).
+	readTok, _ := srv.sessions.Issue(&auth.Principal{
+		Subject: "tailnet:alice",
+		Scopes:  map[auth.Permission]bool{auth.PermAssetRead: true},
+	})
+	getReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target, nil)
 	getReq.RemoteAddr = "203.0.113.7:50000"
+	getReq.Header.Set("Authorization", "Bearer "+readTok)
 	getRec := httptest.NewRecorder()
 	srv.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusOK {
-		t.Fatalf("GET with blob token status=%d, want 200", getRec.Code)
+		t.Fatalf("GET with read-only session token status=%d, want 200", getRec.Code)
+	}
+
+	btReq := httptest.NewRequest(http.MethodGet, "http://library.example"+target+"?bt="+readTok, nil)
+	btReq.RemoteAddr = "203.0.113.7:50000"
+	btRec := httptest.NewRecorder()
+	srv.ServeHTTP(btRec, btReq)
+	if btRec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET with ?bt= query token status=%d, want 401", btRec.Code)
 	}
 
 	for _, method := range []string{http.MethodPut, http.MethodDelete} {
@@ -438,12 +508,13 @@ func TestAuxChannelCORSOriginAndPermissions(t *testing.T) {
 		if method == http.MethodPut {
 			body = bytes.NewReader(validPNG)
 		}
-		req := httptest.NewRequest(method, "http://library.example"+target+"?bt="+bt, body)
+		req := httptest.NewRequest(method, "http://library.example"+target, body)
 		req.RemoteAddr = "203.0.113.7:50000"
+		req.Header.Set("Authorization", "Bearer "+readTok)
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("%s with read-only blob token status=%d, want 403", method, rec.Code)
+			t.Fatalf("%s with read-only session token status=%d, want 403", method, rec.Code)
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,8 @@ func FuzzRequestPath(f *testing.F) {
 		"/ASSETS/" + assetID + "/FILE", "/assets/.hidden-canary.jpg/file", "/assets/%252e%252e/x",
 		"/assets?q=%25&sort=name%3BDROP&dir=asc&folder=%27&kind=..&rating=-1&keyword=%00&cursor=!!&limit=-5",
 		"/changes?since=-1&limit=99999999999", "/handoff/..", "/__dev/stats", "/assets/%ff%fe/file", "*", "http://evil.example/assets",
+		"/assets/" + assetID + "/aux/depth", "/assets/" + assetID + "/aux/DEPTH", "/assets/" + assetID + "/aux/..%2f..%2fcanary.jpg",
+		"/assets/" + assetID + "/aux/depth.png", "/assets/" + assetID + "/aux/depth%00", "/assets/" + assetID + "/aux/", "/assets/x/aux/depth/extra",
 	} {
 		f.Add(uint8(0), s)
 	}
@@ -120,6 +123,83 @@ func FuzzRequestPath(f *testing.F) {
 		}
 		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("%s %q response lacks X-Content-Type-Options: nosniff", method, target)
+		}
+	})
+}
+
+// FuzzAuxChannel drives the auxiliary channel routes with arbitrary channel
+// names and bodies as an authenticated owner. The server must never answer
+// 5xx, must store only bodies carrying a JPEG or PNG signature and only under
+// the asset's own sidecar name, and must serve back exactly what it stored
+// with the matching Content-Type.
+func FuzzAuxChannel(f *testing.F) {
+	srv, photoDir, assetID := newTestServer(f, "")
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 1, 2, 3}
+	jpg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xFF, 0xD9}
+	for _, channel := range []string{"depth", "DEPTH", "depth.png", "depth.jpg", "../depth", "..", "", "a", "depth%2f..", "normal", "depth\x00", strings.Repeat("d", 40)} {
+		f.Add(channel, jpg)
+		f.Add(channel, png)
+		f.Add(channel, []byte("not an image"))
+	}
+	f.Add("depth", []byte{})
+	f.Add("depth", png[:8])
+	f.Add("depth", jpg[:3])
+	f.Add("depth", jpg[:2])
+
+	sidecarDir := filepath.Join(photoDir, ".hdrtoys")
+	f.Fuzz(func(t *testing.T, channel string, body []byte) {
+		if strings.ContainsAny(channel, "/?#") || len(body) > 1<<16 {
+			t.Skip()
+		}
+		target := "http://127.0.0.1/assets/" + assetID + "/aux/" + url.PathEscape(channel)
+		do := func(method string, payload []byte) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(method, target, bytes.NewReader(payload))
+			req.RemoteAddr = "127.0.0.1:50000"
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if rec.Code >= 500 && rec.Code != http.StatusNotImplemented {
+				t.Fatalf("%s aux/%q answered %d: %s", method, channel, rec.Code, rec.Body.String())
+			}
+			return rec
+		}
+
+		put := do(http.MethodPut, body)
+		get := do(http.MethodGet, nil)
+		if put.Code == http.StatusOK {
+			isPNG := bytes.HasPrefix(body, png[:8])
+			isJPG := len(body) >= 3 && body[0] == 0xFF && body[1] == 0xD8 && body[2] == 0xFF
+			if channel != "depth" || (!isPNG && !isJPG) {
+				t.Fatalf("PUT aux/%q accepted a %d-byte body (PNG: %v, JPEG: %v)", channel, len(body), isPNG, isJPG)
+			}
+			wantCT := "image/png"
+			if isJPG {
+				wantCT = "image/jpeg"
+			}
+			if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), body) || get.Header().Get("Content-Type") != wantCT {
+				t.Fatalf("GET after PUT: status %d, %d bytes, type %q (want %q)", get.Code, get.Body.Len(), get.Header().Get("Content-Type"), wantCT)
+			}
+		}
+		del := do(http.MethodDelete, nil)
+		if del.Code == http.StatusOK {
+			if after := do(http.MethodGet, nil); after.Code != http.StatusNotFound {
+				t.Fatalf("GET after DELETE answered %d", after.Code)
+			}
+		}
+
+		// Nothing but the asset's own artifacts may ever appear on disk.
+		entries, err := os.ReadDir(sidecarDir)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if name := e.Name(); name != ".tmp" && !strings.HasPrefix(name, "IMG_0001.JPG.") {
+				t.Fatalf("aux/%q left an unexpected entry in the sidecar folder: %q", channel, name)
+			}
+		}
+		for _, pattern := range []string{"*.png", "*.depth.jpg"} {
+			if stray, _ := filepath.Glob(filepath.Join(photoDir, pattern)); len(stray) != 0 {
+				t.Fatalf("aux/%q wrote into the photo folder: %q", channel, stray)
+			}
 		}
 	})
 }

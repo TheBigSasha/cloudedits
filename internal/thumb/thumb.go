@@ -9,6 +9,7 @@ package thumb
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -18,9 +19,11 @@ import (
 	"image/jpeg"
 	_ "image/png" // Register PNG decoder for raster thumbnail generation.
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +33,7 @@ import (
 	_ "golang.org/x/image/webp" // Register WebP decoder for raster thumbnail generation.
 
 	"github.com/thebigsasha/cloudedits/internal/formats"
+	"github.com/thebigsasha/cloudedits/internal/safefile"
 )
 
 // ErrOverloaded is returned when the bounded decode pool is saturated.
@@ -40,19 +44,42 @@ var ErrOverloaded = errors.New("thumbnail worker pool saturated")
 var ErrImageTooLarge = errors.New("image dimensions exceed thumbnail decode budget")
 
 const (
-	// maxDecodeBytes bounds the estimated decoded pixel buffer of one source
-	// image. A file header can claim any dimensions in a few bytes (a 1 KiB
-	// lossless WebP or PNG may declare gigapixels), and the decoders allocate
-	// the full frame before reading pixel data, so without a bound a single
-	// hostile or corrupt file exhausts memory. 1 GiB admits every current
-	// camera format (100 MP at 16-bit RGBA is 0.8 GiB).
-	maxDecodeBytes = 1 << 30
-	// largeDecodeBytes is the estimate above which decodes run one at a time,
-	// so the worker pool cannot multiply the budget.
-	largeDecodeBytes = 256 << 20
+	// defaultMaxDecodeBytes bounds the estimated decoded pixel buffer of one
+	// source image when GOMEMLIMIT is not explicitly configured. Aligned with
+	// the server's default 192 MiB GOMEMLIMIT so a single full-frame decode
+	// cannot blow past the soft memory limit or trigger OOM kills in 512 MiB
+	// containers. Large baseline JPEGs use the 1/8-scale DC decoder (~64x less
+	// memory) and camera RAWs extract embedded previews, so they do not pay
+	// full-frame decode memory.
+	defaultMaxDecodeBytes = 192 << 20
+	minDecodeBudgetBytes  = 32 << 20
+	maxDecodeBudgetCap    = 1 << 30
+
+	// defaultNegCacheMaxEntries and defaultNegCacheTTL bound negative-caching
+	// of deterministic thumbnail failures (corrupt files, oversized bombs,
+	// unsupported containers) so repeated grid requests do not re-decode them.
+	defaultNegCacheMaxEntries = 4096
+	defaultNegCacheTTL        = 10 * time.Minute
 )
 
 var largeDecodeGate = make(chan struct{}, 1)
+
+// activeDecodeBudget returns the per-decode pixel-memory budget aligned with
+// runtime GOMEMLIMIT (defaulting to 192 MiB when GOMEMLIMIT is unset) and the
+// serialization threshold (budget/4) above which decodes run one at a time so
+// concurrent workers cannot multiply past the memory limit.
+func activeDecodeBudget() (maxBytes, largeBytes int64) {
+	maxBytes = defaultMaxDecodeBytes
+	if lim := debug.SetMemoryLimit(-1); lim > 0 && lim < math.MaxInt64 {
+		maxBytes = min(max(lim, minDecodeBudgetBytes), maxDecodeBudgetCap)
+	}
+	return maxBytes, maxBytes / 4
+}
+
+// maxEditThumbnailReadBytes bounds an edited-preview thumbnail read from the
+// sidecar folder. Uploads are capped at 4 MiB; a local editor may write a
+// larger gain-mapped preview, so reads allow a generous multiple.
+const maxEditThumbnailReadBytes = 32 * 1024 * 1024
 
 // acquireDecodeBudget validates cfg against the decode budget and, for large
 // frames, serialises the decode. progressiveJPEG must be set for progressive
@@ -80,11 +107,12 @@ func acquireDecodeBudget(cfg image.Config, progressiveJPEG bool) (release func()
 	if progressiveJPEG {
 		bytesPerPixel *= 5
 	}
+	maxBytes, largeBytes := activeDecodeBudget()
 	// Width and Height are at most 2^31 each, so compare by division.
-	if int64(cfg.Width) > maxDecodeBytes/bytesPerPixel/int64(cfg.Height) {
+	if int64(cfg.Width) > maxBytes/bytesPerPixel/int64(cfg.Height) {
 		return nil, fmt.Errorf("%w (%dx%d)", ErrImageTooLarge, cfg.Width, cfg.Height)
 	}
-	if int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel <= largeDecodeBytes {
+	if int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel <= largeBytes {
 		return func() {}, nil
 	}
 	largeDecodeGate <- struct{}{}
@@ -105,12 +133,26 @@ type inflightCall struct {
 	err  error
 }
 
-// Service generates and caches thumbnails with single-flight dedup and bounded concurrency.
+type negEntry struct {
+	key       string
+	err       error
+	expiresAt time.Time
+}
+
+// Service generates and caches thumbnails with single-flight dedup, bounded
+// concurrency, and bounded TTL/LRU negative caching of failed decodes.
 type Service struct {
 	cacheDir string
 	sem      chan struct{}
 	sfMu     sync.Mutex
 	inFlight map[string]*inflightCall
+
+	negMu  sync.Mutex
+	negMap map[string]*list.Element
+	negLRU *list.List
+	negMax int
+	negTTL time.Duration
+	nowFn  func() time.Time
 }
 
 // NewService creates a bounded thumbnail service storing cache files under cacheDir.
@@ -124,7 +166,72 @@ func NewService(cacheDir string, maxWorkers int) *Service {
 		cacheDir: cacheDir,
 		sem:      make(chan struct{}, maxWorkers),
 		inFlight: make(map[string]*inflightCall),
+		negMap:   make(map[string]*list.Element),
+		negLRU:   list.New(),
+		negMax:   defaultNegCacheMaxEntries,
+		negTTL:   defaultNegCacheTTL,
+		nowFn:    time.Now,
 	}
+}
+
+func (s *Service) lookupNeg(key string) (bool, error) {
+	if s.negMax <= 0 || s.negTTL <= 0 {
+		return false, nil
+	}
+	now := s.nowFn()
+	s.negMu.Lock()
+	defer s.negMu.Unlock()
+	el, ok := s.negMap[key]
+	if !ok {
+		return false, nil
+	}
+	ent := el.Value.(*negEntry)
+	if !now.Before(ent.expiresAt) {
+		s.negLRU.Remove(el)
+		delete(s.negMap, key)
+		return false, nil
+	}
+	s.negLRU.MoveToFront(el)
+	return true, ent.err
+}
+
+func (s *Service) recordNeg(key string, err error) {
+	if err == nil || s.negMax <= 0 || s.negTTL <= 0 {
+		return
+	}
+	// Never negative-cache transient overload or caller cancellation.
+	if errors.Is(err, ErrOverloaded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	now := s.nowFn()
+	exp := now.Add(s.negTTL)
+	s.negMu.Lock()
+	defer s.negMu.Unlock()
+	if el, ok := s.negMap[key]; ok {
+		ent := el.Value.(*negEntry)
+		ent.err = err
+		ent.expiresAt = exp
+		s.negLRU.MoveToFront(el)
+		return
+	}
+	for len(s.negMap) >= s.negMax {
+		tail := s.negLRU.Back()
+		if tail == nil {
+			break
+		}
+		ent := tail.Value.(*negEntry)
+		s.negLRU.Remove(tail)
+		delete(s.negMap, ent.key)
+	}
+	el := s.negLRU.PushFront(&negEntry{key: key, err: err, expiresAt: exp})
+	s.negMap[key] = el
+}
+
+func (s *Service) clearNeg() {
+	s.negMu.Lock()
+	defer s.negMu.Unlock()
+	clear(s.negMap)
+	s.negLRU.Init()
 }
 
 // Resolve serves a thumbnail according to the normative tier priority:
@@ -141,18 +248,18 @@ func (s *Service) Resolve(
 	normTier := normalizeTier(tier)
 
 	// Priority 1: edited preview thumbnail (.hdrtoys/<rel>.edit_thumbnail.jpg).
+	// Only a regular file of sane size is trusted: the sidecar folder is
+	// writable by other software, so a symbolic link or oversized file there
+	// falls through to the generated thumbnail.
 	if editThumbPath != "" {
-		if info, err := os.Stat(editThumbPath); err == nil && !info.IsDir() && info.Size() > 0 {
-			data, err := os.ReadFile(editThumbPath)
-			if err == nil && formats.IsJPEGMagic(data) {
-				etag := fmt.Sprintf(`"et-%d-%d"`, info.ModTime().UTC().UnixNano(), info.Size())
-				return &Result{
-					Data:       data,
-					TierSource: "edit-thumbnail",
-					ETag:       etag,
-					MIME:       "image/jpeg",
-				}, nil
-			}
+		if data, info, err := safefile.ReadRegular(editThumbPath, maxEditThumbnailReadBytes); err == nil && formats.IsJPEGMagic(data) {
+			etag := fmt.Sprintf(`"et-%d-%d"`, info.ModTime().UTC().UnixNano(), info.Size())
+			return &Result{
+				Data:       data,
+				TierSource: "edit-thumbnail",
+				ETag:       etag,
+				MIME:       "image/jpeg",
+			}, nil
 		}
 	}
 
@@ -175,14 +282,24 @@ func (s *Service) Resolve(
 		}, nil
 	}
 
+	// Negative cache check: avoid re-opening and re-decoding deterministic
+	// failures (corrupt files, oversized bombs, unsupported containers) for
+	// the same (sourcePath, sourceRevision, normTier). Priority 1
+	// (editThumbPath) and Priority 2 (disk cache) still run first, and any
+	// source file change updates sourceRevision and misses the cache.
+	sfKey := sourcePath + "\x00" + cacheKey
+	if hit, negErr := s.lookupNeg(sfKey); hit {
+		return nil, negErr
+	}
+
 	// Fast-fail empty or explicitly unsupported formats (e.g. EXR, JXL) before
 	// acquiring a decode slot or allocating scan buffers.
 	if err := fastRejectUnsupported(sourcePath); err != nil {
+		s.recordNeg(sfKey, err)
 		return nil, err
 	}
 
 	// Priority 3: single-flight deduplication per (sourcePath, sourceRevision, normTier).
-	sfKey := sourcePath + "\x00" + cacheKey
 	s.sfMu.Lock()
 	if existing, ok := s.inFlight[sfKey]; ok {
 		s.sfMu.Unlock()
@@ -202,6 +319,9 @@ func (s *Service) Resolve(
 			if r := recover(); r != nil {
 				call.res = nil
 				call.err = fmt.Errorf("thumbnail panic: %v", r)
+			}
+			if call.err != nil {
+				s.recordNeg(sfKey, call.err)
 			}
 			s.sfMu.Lock()
 			delete(s.inFlight, sfKey)
@@ -318,8 +438,10 @@ func (s *Service) generateAndCache(
 	}, nil
 }
 
-// ClearCache removes all cached thumbnails under cacheDir.
+// ClearCache removes all cached thumbnails under cacheDir and resets the
+// in-memory negative cache.
 func (s *Service) ClearCache() error {
+	s.clearNeg()
 	if s.cacheDir == "" {
 		return nil
 	}

@@ -13,7 +13,7 @@
     ├── DCIM/
     │   ├── IMG_0001.ARW.edits               # Canonical truth sidecar (hdrt: 1)
     │   ├── IMG_0001.ARW.edit_thumbnail.jpg  # Disposable edited preview JPEG (UltraHDR when HDR)
-    │   └── IMG_0001.ARW.depth.png           # Auxiliary channel PNG sidecar (e.g. depth buffer)
+    │   └── IMG_0001.ARW.depth.jpg           # Auxiliary channel sidecar (.depth.jpg default, or .depth.png)
     ├── renders/                             # Optional uploaded rendered exports
     ├── .tmp/                                # Same-filesystem atomic rename staging
     └── .quarantine/                         # Corrupt .edits files moved here instead of silently dropped
@@ -28,6 +28,10 @@
 - `unixMillis-hex`: lowercase hex Unix milliseconds, zero-padded to at least 12 hex digits (`%012x`).
 - `counter-hex`: lowercase hex logical counter, zero-padded to at least 4 hex digits (`%04x`).
 - `deviceId`: non-empty string identifying the originating device. `deviceId` may contain `-`; parsers MUST split only on the **first two** `-` characters.
+- **Range:** `unixMillis` is at most `2^53 - 1` (`1fffffffffffff`) and `counter` at most `2^32 - 1` (`ffffffff`). A string outside either range is not an HLC. The bound on `unixMillis` is the largest integer a browser represents exactly; a larger value would compare differently there.
+- **Issuing:** a clock issues `(max(wall, last.millis), counter)`, with the counter restarting at 0 when the millisecond advances and incrementing otherwise. When the counter is at `2^32 - 1` the clock carries into the next millisecond with counter 0 instead of emitting a wider counter.
+- **Drift bound:** an HLC whose `unixMillis` is more than 24 hours (`86400000` ms) ahead of the receiver's wall clock is not folded into any clock ("observed"), and the server rejects an op carrying one with the receipt reason `clock-skew`. Last-writer-wins trusts the timestamp, so without the bound one edit stamped far in the future would win against every later edit, and every clock that observed it would stamp its own edits there too. The bound does not change how two cells already in a sidecar compare: a far-future cell written directly into a file still wins until that time has passed.
+- `testdata/hlc_vectors.json` holds the parse, compare, clock and drift cases both implementations run.
 - **Comparison order:** Parse `unixMillis` as `uint64` and `counter` as `uint32`. Compare `unixMillis`, then `counter`, then `deviceId` in UTF-16 code-unit order (the order of the ECMAScript `<` operator). Never compare raw HLC strings lexicographically, because variable-width hex (`ff` vs `100`) would sort incorrectly.
 
 ## JSON Envelope (`hdrt: 1`)
@@ -137,10 +141,10 @@ A folder can therefore hold a copy in each layout. Every read joins the two with
 
 If `<sidecarRoot>/<rel>.edits` exists but fails JSON or schema parsing, it is moved into `<sidecarRoot>/.quarantine/<timestamp>-<rel>.edits` rather than being silently masked by the other copy.
 
-## Auxiliary Channels (`<rel>.<channel>.png`)
+## Auxiliary Channels (`<rel>.<channel>.{jpg,png}`)
 
-Disposable auxiliary channel PNGs (starting with `depth`) live next to `.edits` inside `.hdrtoys/`:
+Disposable auxiliary channel images (starting with `depth`, stored as compressed 8-bit `.depth.jpg` by default or 16-bit `.depth.png`) live next to `.edits` inside `.hdrtoys/`:
 
-- **Canonical path:** `<sidecarRoot>/<rel-posix-path>.<channel>.png` (for example `.hdrtoys/DCIM/IMG_0001.ARW.depth.png`).
-- **Colocated read fallback:** If the canonical file is absent, readers fall back to a read-only colocated `<photoFolder>/<rel-posix-path>.<channel>.png`. Colocated auxiliary files are excluded from library scanning and are never indexed as standalone photos.
-- **Writes and deletes:** Writes always commit atomically into `<sidecarRoot>` via `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> directory `fsync`. Deletes remove only `<sidecarRoot>/<rel-posix-path>.<channel>.png`; source photo folders remain strictly read-only.
+- **Canonical paths:** `<sidecarRoot>/<rel-posix-path>.<channel>.jpg` (JPEG) or `<sidecarRoot>/<rel-posix-path>.<channel>.png` (PNG), for example `.hdrtoys/DCIM/IMG_0001.ARW.depth.jpg`. When both exist, readers prefer the newest mtime.
+- **Colocated read fallback:** If no canonical file exists, readers fall back to a read-only colocated `<photoFolder>/<rel-posix-path>.<channel>.{jpg,png}`. Colocated auxiliary files are excluded from library scanning and are never indexed as standalone photos.
+- **Writes and deletes:** Writes always commit atomically into `<sidecarRoot>` via `<sidecarRoot>/.tmp/<uuid>` -> `fsync` -> `close` -> `rename` -> directory `fsync`, and remove any stale opposite-format sibling under the same asset-channel lock. Deletes remove only `<sidecarRoot>/<rel-posix-path>.<channel>.{jpg,png}`; source photo folders remain strictly read-only.

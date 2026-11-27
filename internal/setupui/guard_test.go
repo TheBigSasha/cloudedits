@@ -1,6 +1,7 @@
 package setupui
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -47,7 +48,11 @@ func (p wizardProbe) do(h http.Handler) *httptest.ResponseRecorder {
 // web page the user happens to visit must not be able to drive it: browsers
 // let any site send a preflight-free text/plain POST to http://127.0.0.1.
 func TestWizardRefusesCrossSiteAndRemoteRequests(t *testing.T) {
-	st := &stubState{cfg: config.Default(t.TempDir())}
+	connected := false
+	st := &stubState{cfg: config.Default(t.TempDir()), connectFn: func(context.Context, string, func(Phase)) (ConnectResult, error) {
+		connected = true
+		return ConnectResult{}, nil
+	}}
 	h := Handler(st)
 	folder := t.TempDir()
 	addFolder := `{"path":"` + folder + `"}`
@@ -65,8 +70,19 @@ func TestWizardRefusesCrossSiteAndRemoteRequests(t *testing.T) {
 		"DNS-rebound state read":    {path: "/api/state", host: "rebind.evil.example:49152"},
 		"DNS-rebound write": {method: http.MethodPost, path: "/api/folders", host: "rebind.evil.example:49152",
 			origin: "http://rebind.evil.example:49152", ctype: "application/json", body: addFolder},
-		"LAN client":      {path: "/api/state", remote: "192.168.1.50:40000", host: "192.168.1.10:49152"},
-		"proxied request": {path: "/api/state", headers: map[string]string{"X-Forwarded-For": "203.0.113.7"}},
+		"cross-site connect":       {method: http.MethodPost, path: "/api/connect", origin: "https://evil.example", ctype: "application/json", body: `{"authKey":"tskey-auth-evil"}`},
+		"text/plain connect":       {method: http.MethodPost, path: "/api/connect", ctype: "text/plain", body: `{"authKey":"tskey-auth-evil"}`},
+		"cross-site pick-folder":   {method: http.MethodPost, path: "/api/pick-folder", origin: "https://evil.example", ctype: "application/json", body: `{}`},
+		"text/plain pick-folder":   {method: http.MethodPost, path: "/api/pick-folder", ctype: "text/plain", body: `{}`},
+		"cross-site remove-folder": {method: http.MethodPost, path: "/api/folders/remove", origin: "https://evil.example", ctype: "application/json", body: `{"id":"pics"}`},
+		"text/plain remove-folder": {method: http.MethodPost, path: "/api/folders/remove", ctype: "text/plain", body: `{"id":"pics"}`},
+		"cross-site browse":        {path: "/api/browse-folders", headers: map[string]string{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "cors"}},
+		"same-site browse":         {path: "/api/browse-folders", headers: map[string]string{"Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors"}},
+		"DNS-rebound browse":       {path: "/api/browse-folders", host: "rebind.evil.example:49152"},
+		"LAN client":               {path: "/api/state", remote: "192.168.1.50:40000", host: "192.168.1.10:49152"},
+		"LAN browse":               {path: "/api/browse-folders", remote: "192.168.1.50:40000", host: "192.168.1.10:49152"},
+		"proxied request":          {path: "/api/state", headers: map[string]string{"X-Forwarded-For": "203.0.113.7"}},
+		"proxied browse":           {path: "/api/browse-folders", headers: map[string]string{"X-Forwarded-For": "203.0.113.7"}},
 	} {
 		rec := p.do(h)
 		if rec.Code != http.StatusForbidden && rec.Code != http.StatusUnsupportedMediaType {
@@ -75,6 +91,9 @@ func TestWizardRefusesCrossSiteAndRemoteRequests(t *testing.T) {
 		if strings.Contains(rec.Body.String(), "folders") {
 			t.Errorf("%s: response discloses wizard state: %.160s", name, rec.Body.String())
 		}
+	}
+	if connected {
+		t.Fatal("a refused request started the connect job")
 	}
 	if len(st.cfg.Folders) != 0 || st.cfg.Hostname == "pwned" {
 		t.Fatalf("a refused request changed the configuration: folders=%v hostname=%q", st.cfg.Folders, st.cfg.Hostname)
@@ -107,7 +126,17 @@ func TestWizardRefusesCrossSiteAndRemoteRequests(t *testing.T) {
 func TestWizardMuxIsFullyGuarded(t *testing.T) {
 	st := &stubState{cfg: config.Default(t.TempDir())}
 	got := muxaudit.Patterns(newMux(st))
-	want := []string{"GET /", "GET /api/state", "GET /setup", "POST /api/config", "POST /api/folders"}
+	want := []string{
+		"GET /",
+		"GET /api/browse-folders",
+		"GET /api/state",
+		"GET /setup",
+		"POST /api/config",
+		"POST /api/connect",
+		"POST /api/folders",
+		"POST /api/folders/remove",
+		"POST /api/pick-folder",
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wizard routes = %q, want %q", got, want)
 	}

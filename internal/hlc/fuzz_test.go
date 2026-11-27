@@ -3,6 +3,7 @@ package hlc
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // FuzzParseCompare checks that Parse never panics, that every accepted HLC
@@ -53,21 +54,23 @@ func FuzzParseCompare(f *testing.F) {
 
 		c := NewClock("fuzz", nil)
 		before := c.Tick()
-		if err := c.Observe(a); (err == nil) != (errA == nil) {
-			t.Fatalf("Observe(%q) error %v disagrees with Parse error %v", a, err, errA)
+		observeErr := c.Observe(a)
+		// Observe accepts exactly the well-formed HLCs inside the drift bound.
+		wantObserved := errA == nil && !BeyondDrift(pa, time.Now().Add(-time.Minute))
+		mayObserve := errA == nil && !BeyondDrift(pa, time.Now().Add(time.Minute))
+		if observeErr == nil && !mayObserve || observeErr != nil && wantObserved {
+			t.Fatalf("Observe(%q) error %v disagrees with Parse error %v and the drift bound", a, observeErr, errA)
 		}
 		after := c.Tick()
 		if cmp, err := Compare(after, before); err != nil || cmp <= 0 {
 			t.Fatalf("clock went backwards after Observe(%q): %q then %q", a, before, after)
 		}
-		if errA == nil {
+		if observeErr == nil {
 			if cmp, err := Compare(after, a); err != nil || cmp <= 0 {
-				// A remote HLC at the counter ceiling cannot be exceeded within
-				// the same millisecond; that is the only permitted exception.
-				if pa.Counter != ^uint32(0) {
-					t.Fatalf("Tick %q is not greater than observed %q", after, a)
-				}
+				t.Fatalf("Tick %q is not greater than observed %q", after, a)
 			}
+		} else if pAfter, err := Parse(after); err != nil || BeyondDrift(pAfter, time.Now()) {
+			t.Fatalf("clock moved beyond the drift bound after a refused Observe(%q): %q", a, after)
 		}
 	})
 }

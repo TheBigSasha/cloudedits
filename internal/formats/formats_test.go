@@ -21,14 +21,40 @@ func TestSupportedFormatsAndExclusions(t *testing.T) {
 	}
 
 	rawCount := 0
+	wantNonRAW := map[string]string{
+		"photo.jpg":  "jpeg",
+		"PHOTO.JPEG": "jpeg",
+		"a.png":      "png",
+		"b.webp":     "image",
+		"c.avif":     "image",
+		"d.jxl":      "image",
+		"e.heic":     "image",
+		"f.heif":     "image",
+		"g.hif":      "image",
+		"h.tif":      "image",
+		"i.tiff":     "image",
+		"j.exr":      "exr",
+	}
 	for _, f := range supported {
 		if IsRAW(f) {
 			rawCount++
 			if Kind(f) != "raw" {
 				t.Errorf("expected Kind(%q)=raw, got %q", f, Kind(f))
 			}
-		} else if Kind(f) != "image" {
-			t.Errorf("expected Kind(%q)=image, got %q", f, Kind(f))
+			if AssetKind(f, true) != "raw" {
+				t.Errorf("expected AssetKind(%q, true)=raw, got %q", f, AssetKind(f, true))
+			}
+		} else {
+			want := wantNonRAW[f]
+			if Kind(f) != want {
+				t.Errorf("expected Kind(%q)=%q, got %q", f, want, Kind(f))
+			}
+			if AssetKind(f, false) != want {
+				t.Errorf("expected AssetKind(%q, false)=%q, got %q", f, want, AssetKind(f, false))
+			}
+			if AssetKind(f, true) != "ultrahdr" {
+				t.Errorf("expected AssetKind(%q, true)=ultrahdr, got %q", f, AssetKind(f, true))
+			}
 		}
 	}
 	if rawCount != 20 {
@@ -97,9 +123,9 @@ func TestEditThumbnailBesidePhotoIsNotAnAsset(t *testing.T) {
 	}
 }
 
-// Auxiliary channel sidecars (such as "<photo>.depth.png") may sit beside
-// photos in read-only colocated layouts; they carry a .png extension but are
-// derived channels of another asset, never standalone photos.
+// Auxiliary channel sidecars (such as "<photo>.depth.jpg" or "<photo>.depth.png")
+// may sit beside photos in read-only colocated layouts; they carry an image
+// extension but are derived channels of another asset, never standalone photos.
 func TestAuxChannelBesidePhotoIsNotAnAsset(t *testing.T) {
 	if suffix, ok := AuxChannelSuffix("depth"); !ok || suffix != ".depth.png" {
 		t.Fatalf("AuxChannelSuffix(depth) = (%q, %v), want (.depth.png, true)", suffix, ok)
@@ -108,7 +134,48 @@ func TestAuxChannelBesidePhotoIsNotAnAsset(t *testing.T) {
 		t.Fatalf("AuxChannelSuffix(unknown) = (%q, %v), want (\"\", false)", suffix, ok)
 	}
 
+	suffixes, ok := AuxChannelSuffixes("depth")
+	if !ok || len(suffixes) != 2 || suffixes[0] != ".depth.jpg" || suffixes[1] != ".depth.png" {
+		t.Fatalf("AuxChannelSuffixes(depth) = (%v, %v), want ([.depth.jpg .depth.png], true)", suffixes, ok)
+	}
+	suffixes[0] = "mutated"
+	if again, _ := AuxChannelSuffixes("depth"); again[0] != ".depth.jpg" {
+		t.Fatalf("AuxChannelSuffixes returned aliased slice: %v", again)
+	}
+
+	for _, tc := range []struct {
+		channel, format, want string
+		ok                    bool
+	}{
+		{"depth", "jpg", ".depth.jpg", true},
+		{"depth", "jpeg", ".depth.jpg", true},
+		{"depth", "image/jpeg", ".depth.jpg", true},
+		{"depth", "png", ".depth.png", true},
+		{"depth", "image/png", ".depth.png", true},
+		{"depth", "webp", "", false},
+		{"unknown", "jpg", "", false},
+	} {
+		got, gotOK := AuxChannelSuffixForFormat(tc.channel, tc.format)
+		if got != tc.want || gotOK != tc.ok {
+			t.Errorf("AuxChannelSuffixForFormat(%q, %q) = (%q, %v), want (%q, %v)", tc.channel, tc.format, got, gotOK, tc.want, tc.ok)
+		}
+	}
+
+	if s, ct, ok := AuxChannelSuffixForData("depth", []byte{0xFF, 0xD8, 0xFF, 0xE0}); !ok || s != ".depth.jpg" || ct != "image/jpeg" {
+		t.Fatalf("AuxChannelSuffixForData(JPEG) = (%q, %q, %v)", s, ct, ok)
+	}
+	if s, ct, ok := AuxChannelSuffixForData("depth", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}); !ok || s != ".depth.png" || ct != "image/png" {
+		t.Fatalf("AuxChannelSuffixForData(PNG) = (%q, %q, %v)", s, ct, ok)
+	}
+	if _, _, ok := AuxChannelSuffixForData("depth", []byte("RIFF\x00\x00\x00\x00WEBP")); ok {
+		t.Fatalf("AuxChannelSuffixForData accepted WebP")
+	}
+
 	for _, name := range []string{
+		"IMG_0001.JPG.depth.jpg",
+		"IMG_0001.ARW.DEPTH.JPG",
+		"DCIM/a.jpg.depth.jpg",
+		"scene.depth.jpg",
 		"IMG_0001.JPG.depth.png",
 		"IMG_0001.ARW.DEPTH.PNG",
 		"DCIM/a.jpg.depth.png",
@@ -122,7 +189,7 @@ func TestAuxChannelBesidePhotoIsNotAnAsset(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"depth.png", "photo.png", "my.photo.png", "IMG_0001.JPG"} {
+	for _, name := range []string{"depth.jpg", "depth.png", "photo.png", "my.photo.jpg", "my.photo.png", "IMG_0001.JPG"} {
 		if IsAuxChannelName(name) {
 			t.Errorf("IsAuxChannelName(%q) = true, want false", name)
 		}
@@ -130,7 +197,9 @@ func TestAuxChannelBesidePhotoIsNotAnAsset(t *testing.T) {
 			t.Errorf("IsSupportedFile(%q) = false, want true", name)
 		}
 	}
-	if IsSupportedFile(".depth.png") {
-		t.Errorf("IsSupportedFile(.depth.png) = true, want false")
+	for _, hidden := range []string{".depth.jpg", ".depth.png"} {
+		if IsSupportedFile(hidden) {
+			t.Errorf("IsSupportedFile(%q) = true, want false", hidden)
+		}
 	}
 }

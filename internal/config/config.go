@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -34,8 +35,13 @@ type Config struct {
 	// PublicURL and TailscaleIP are the tailnet address of the enrolled node,
 	// recorded when it last came up so commands that do not start the node
 	// (qr, status, the setup wizard) can show where the library is reachable.
-	PublicURL   string         `json:"publicUrl,omitempty"`
-	TailscaleIP string         `json:"tailscaleIp,omitempty"`
+	PublicURL   string `json:"publicUrl,omitempty"`
+	TailscaleIP string `json:"tailscaleIp,omitempty"`
+	// OwnerUserID pins the Tailscale UserID authorized as the library owner.
+	// Recorded automatically when enrolling a user-owned node (never a tagged
+	// node), or supplied explicitly via --owner-user-id / CLOUDEDITS_OWNER_USER_ID.
+	OwnerUserID int64          `json:"ownerUserId,omitempty"`
+	OwnerLogin  string         `json:"ownerLogin,omitempty"`
 	Folders     []FolderConfig `json:"folders"`
 	// AllowedOrigins lists extra browser origins allowed to call the API.
 	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
@@ -76,6 +82,12 @@ func Default(dataDir string) *Config {
 	if hostname == "" {
 		hostname = "library"
 	}
+	var ownerUserID int64
+	if rawOwner := strings.TrimSpace(os.Getenv("CLOUDEDITS_OWNER_USER_ID")); rawOwner != "" {
+		if parsed, err := strconv.ParseInt(rawOwner, 10, 64); err == nil && parsed > 0 {
+			ownerUserID = parsed
+		}
+	}
 	return &Config{
 		LibraryID:   "lib-" + randomHex(6),
 		LibraryName: "Cloud Library",
@@ -84,6 +96,7 @@ func Default(dataDir string) *Config {
 		SidecarDir:  strings.TrimSpace(os.Getenv("CLOUDEDITS_SIDECAR_DIR")),
 		AuthMode:    "tailnet",
 		ListenAddr:  "127.0.0.1:8787",
+		OwnerUserID: ownerUserID,
 		Folders:     []FolderConfig{},
 	}
 }
@@ -229,9 +242,14 @@ func WriteDockerBundle(outDir, folderPath, hostname string) (composePath, envPat
   cloudedits:
     image: ghcr.io/thebigsasha/cloudedits:latest
     restart: unless-stopped
+    user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       CLOUDEDITS_HOSTNAME: %s
       TS_AUTHKEY: ${TS_AUTHKEY}
+      # Uncomment if /library/photos is mounted read-only (:ro) or not writable by PUID:PGID:
+      # CLOUDEDITS_SIDECAR_DIR: /data/sidecars
+      # Required if TS_AUTHKEY creates a tagged Tailscale node (tagged nodes fail closed):
+      # CLOUDEDITS_OWNER_USER_ID: ${CLOUDEDITS_OWNER_USER_ID}
     volumes:
       - %s:/library/photos
       - cloudedits_data:/data
@@ -244,6 +262,16 @@ volumes:
 	envExample := `# Generate a one-time Tailscale auth key at:
 # https://login.tailscale.com/admin/settings/keys
 TS_AUTHKEY=tskey-auth-replace-me
+
+# Match the UID/GID that owns your host photo folder so .hdrtoys/ sidecars
+# are writable without changing host permissions (run 'id -u' and 'id -g').
+# Leave at 10001 if using CLOUDEDITS_SIDECAR_DIR=/data/sidecars with a :ro mount.
+PUID=10001
+PGID=10001
+
+# If TS_AUTHKEY carries an ACL tag, pin the Tailscale numeric UserID of the
+# library owner (tagged nodes fail closed unless an owner UserID or bearer token is set).
+# CLOUDEDITS_OWNER_USER_ID=
 `
 	composePath = filepath.Join(outDir, "docker-compose.yml")
 	envPath = filepath.Join(outDir, ".env.example")

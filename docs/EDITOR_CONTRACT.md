@@ -50,10 +50,10 @@ Requests to `GET /assets/{id}/blob?tier=original` (and alias `GET /assets/{id}/f
 
 Auxiliary channels store disposable, pre-transform derived image buffers alongside an asset's `.edits` sidecar so editors can reuse expensive computed maps (starting with `depth`) across reloads and devices. Servers advertise support with `caps.auxiliaryChannels: true` and `limits.maxAuxChannelBytes: 16777216` in `GET /capabilities`.
 
-- **Channel names:** Strictly validated against `^[a-z][a-z0-9_-]{0,31}$` and an explicit recognized channel allowlist (`depth` -> `.depth.png`). Unknown, malformed, or traversal names are rejected with `400`.
-- **Upload (`PUT`):** Capped at `limits.maxAuxChannelBytes` (16 MiB, `413` `payload-too-large` if exceeded), verified against the 8-byte PNG signature (`\x89PNG\r\n\x1a\n`, `415` `unsupported-media-type` on mismatch), and committed atomically to `<sidecarRoot>/<rel>.<channel>.png`. Responds `200 OK` with `{ ok: true, assetId, channel, bytes, contentType: "image/png", etag }`.
-- **Fetch (`GET`):** Reads `<sidecarRoot>/<rel>.<channel>.png` first, falling back to a read-only colocated `<photoFolder>/<rel>.<channel>.png`. Serves raw PNG bytes with `Content-Type: image/png`, strong quoted `ETag`, `Cache-Control: private, max-age=3600`, `X-HDRT-Aux-Channel: <channel>`, `If-None-Match` -> `304 Not Modified`, and `404` when absent.
-- **Delete (`DELETE`):** Removes only the disposable sidecar under `<sidecarRoot>/<rel>.<channel>.png` and returns `200 OK` `{ ok: true, assetId, channel, deleted }`. Original media and colocated files in the source folder are never modified or removed.
+- **Channel names:** Strictly validated against `^[a-z][a-z0-9_-]{0,31}$` and an explicit recognized channel allowlist (`depth` -> `.depth.jpg` or `.depth.png`). Unknown, malformed, or traversal names are rejected with `400`.
+- **Upload (`PUT`):** Capped at `limits.maxAuxChannelBytes` (16 MiB, `413` `payload-too-large` if exceeded), verified against the JPEG (`FF D8 FF`) or 8-byte PNG (`\x89PNG\r\n\x1a\n`) signature (`415` `unsupported-media-type` on mismatch), committed atomically to `<sidecarRoot>/<rel>.<channel>.jpg` (JPEG) or `<sidecarRoot>/<rel>.<channel>.png` (PNG), and removes any stale opposite-format sibling under the same asset-channel lock. Responds `200 OK` with `{ ok: true, assetId, channel, bytes, contentType: "image/jpeg" | "image/png", etag }`.
+- **Fetch (`GET`):** Reads `<sidecarRoot>/<rel>.<channel>.{jpg,png}` first (preferring newest mtime when both exist), falling back to a read-only colocated `<photoFolder>/<rel>.<channel>.{jpg,png}`. Serves raw bytes with matching `Content-Type` (`image/jpeg` or `image/png`), strong quoted `ETag`, `Cache-Control: private, max-age=3600`, `X-HDRT-Aux-Channel: <channel>`, `If-None-Match` -> `304 Not Modified`, and `404` when absent.
+- **Delete (`DELETE`):** Removes only disposable sidecars under `<sidecarRoot>/<rel>.<channel>.{jpg,png}` and returns `200 OK` `{ ok: true, assetId, channel, deleted }`. Original media and colocated files in the source folder are never modified or removed.
 
 ## Endpoints
 
@@ -63,12 +63,12 @@ Auxiliary channels store disposable, pre-transform derived image buffers alongsi
 | `GET` | `/open` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&image_id=<a>` |
 | `GET` | `/h/{id}` | Public | — | `302` redirect to `https://hdr.toys/?gallery_api_url=<self>&handoff=<id>` |
 | `GET` | `/capabilities` | Public | — | Advertise `protocol` (`hdrtoys-lp` v2), `profiles`, `caps`, `permissions`, `limits`, and `library` |
-| `POST` | `/auth/session` | Public | — | Exchange Tailnet WhoIs identity or bearer token for a short-lived session token and blob signing key scope |
+| `POST` | `/auth/session` | Public | — | Exchange Tailnet WhoIs identity or bearer token for a short-lived session bearer token |
 | `GET` | `/assets/count` | Authenticated | `library:read` | Count matching assets (`{ total, count, exact }`) |
 | `GET` | `/assets/range` | Authenticated | `library:read` | Offset/limit slice (`{ total, exact, offset, limit, assets[] }`, `limit <= 500`, `fields=grid|full`) |
 | `GET` | `/assets` | Authenticated | `library:read` | Cursor-paginated list (`{ assets[], nextCursor, total }`, `limit <= 200`) |
 | `GET` | `/assets/{id}` | Authenticated | `asset:read` | Full asset metadata (including `thumbnailUrl`, `rawUrl`, `recipeUrl`, `editedByHdrToys`, full `exif`) |
-| `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`, supports `&bt=<signed>`) |
+| `GET` | `/assets/{id}/blob` | Authenticated | `asset:read` | Asset bytes (`?tier=original|t0|t1|t2|thumb|preview`) |
 | `GET` | `/assets/{id}/file` | Authenticated | `asset:read` | Alias for `/assets/{id}/blob` |
 | `GET` | `/assets/{id}/recipe` | Authenticated | `asset:read` | Current working recipe envelope `{ assetId, recipe, hlc }` (`404` `not-found` when unedited) |
 | `POST` | `/assets/{id}/rating` | Authenticated | `edits:write` | Write asset rating (`0`–`5`) durably as an HLC op |
@@ -96,7 +96,7 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 - `flag`: `pick`, `reject`, `any` (any flagged), or `none`
 - `label`: color label string (e.g. `red`, `yellow`, `green`, `blue`, `purple`), `any` (any labeled), or `none`
 - `keyword`: repeatable (`&keyword=tokyo&keyword=night`), matched with logical AND
-- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image`, `photo` (every non-RAW asset), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
+- `kind`: repeatable or comma-separated, matched with logical OR: `raw`, `image` / `photo` (every non-RAW asset), `ultrahdr` (assets with an UltraHDR gain map), or a file extension (`jpeg` covers `.jpg`/`.jpeg`, `tiff` covers `.tif`/`.tiff`, `heif` covers `.heic`/`.heif`/`.hif`)
 - `folder`: folder ID or folder label filter
 - `sort`: `captured`, `imported`, `edited`, `name`, `rating` (default `captured`); the single-token forms `<field>_asc` / `<field>_desc` (for example `name_asc`, `rating_desc`) are accepted as well
 - `dir`: `asc` or `desc` (default `desc`; overrides a `sort` token suffix)
@@ -104,9 +104,16 @@ Supported on `/assets/count`, `/assets/range`, and `/assets`:
 
 ## Change Feed (`GET /changes`)
 
-- `since` is the opaque `nextCursor` of the previous page; omit it to bootstrap from the start of the journal.
-- Each page carries the applied ops after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array with an unchanged `nextCursor` means the client is caught up.
-- `snapshotRequired: true` means the cursor is not a position in this server's journal — the rebuildable index was re-created after the cursor was issued. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- `since` is the opaque `nextCursor` of the previous page. Omit it to read from the oldest retained entry. Pass `since=head` to receive no entries and the current head as `nextCursor`: the starting point for a client that has just listed the assets and only needs what changes from now on.
+- Each page carries the journal entries after the cursor (oldest first), the current summaries of the assets they touched, and the `nextCursor` to poll with next. An empty `ops` array means the client is caught up.
+- An entry with `outcome: "applied"` is an op that `POST /ops` accepted. Apply it with the same last-writer-wins rule as a local edit.
+- An entry with `outcome: "observed"` is not an op. The server noticed the asset change outside the op stream, and `field` says what changed:
+  - `sidecar`: another program rewrote the asset's `.edits` state (a browser editor with direct access to the folder, a file sync, a hand edit, or a removed file). The entry's `hlc` is the newest HLC in the sidecar; fold it into the local clock so the next edit sorts after it. Take the asset's verdicts from `assets[]` and re-read its recipe and variants.
+  - `editThumbnail`: the asset's edited preview was replaced. The asset's `thumbnailUrl` in `assets[]` has changed; show that one.
+- `thumbnailUrl` carries a version (`v=`) that changes whenever the bytes it returns change, so a thumbnail may be cached for as long as its URL is in use.
+- `snapshotRequired: true` means the cursor is not a position in this server's retained journal: the rebuildable index was re-created after the cursor was issued, or the entries after it were already removed. The client must re-run its initial sync (`GET /assets` or `/assets/range`) and continue polling from the returned `nextCursor`.
+- The journal keeps its newest 20,000 entries. It is also what answers `duplicate` for a replayed `(device, hlc)`: an op replayed after its entry was removed is evaluated again and answered `stale` or `applied`.
+- Assets added to or removed from a folder are not journaled. A client learns of them by listing.
 
 ## Batch Operations (`POST /ops`)
 
@@ -143,6 +150,8 @@ Response body:
 
 `POST /ops` answers `200` with exactly one receipt per op, in request order. Only a body that is not a JSON op list (or exceeds the batch limit) fails the request as a whole; an op that cannot be applied gets its own `rejected` receipt and never blocks the ops around it.
 
+A `503` with `Retry-After` means another process (for example a browser editor that has the same folder open through direct file access) kept rewriting a target sidecar for the whole attempt. Nothing was applied; keep the ops and send them again.
+
 Limits: at most `limits.maxOpsBatch` ops and `limits.maxOpsBodyBytes` request-body bytes per call (both advertised by `GET /capabilities`). A request over either limit is rejected whole with `413` and error code `payload-too-large`; split the batch and retry.
 
 Receipt `status` values:
@@ -152,6 +161,7 @@ Receipt `status` values:
 - `rejected`: not applied and not journaled; `reason` says why.
   - `asset-not-found`: `assetKey` (and the optional `file` hint) resolve to no indexed asset, or the hint matches more than one. The photo may have been removed, or a rescan may be in progress, so a later retry can succeed.
   - `invalid-op`: missing `device`/`field`/`assetKey`, a malformed `hlc`, or a value the field cannot hold. Retrying the same op cannot succeed.
+  - `clock-skew`: the op's `hlc` is more than 24 hours ahead of the server's clock (see the drift bound in `docs/SIDECAR_FORMAT.md`). Retrying the same op cannot succeed until that time has passed, and it would then win against every edit made in between; the device has a wrong clock and must issue the edit again once it is corrected.
 
 `durable: true` covers every op reported `applied`.
 

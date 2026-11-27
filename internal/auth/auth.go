@@ -1,20 +1,16 @@
 // Package auth implements the declarative authentication, permission, and
-// scope primitives for cloudedits, plus short-lived session and ?bt= blob tokens.
+// scope primitives for cloudedits, plus short-lived session bearer tokens.
 package auth
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,11 +178,10 @@ func (DefaultAuthorizer) Authorize(p *Principal, perm Permission, _ ResourceScop
 // and whether the peer belongs to the owner account.
 type WhoIsFunc func(ctx context.Context, remoteAddr string) (login string, isOwner bool, err error)
 
-// SessionManager issues short-lived tab-scoped session tokens and HMAC-signed
-// ?bt= blob tokens (so <img> requests never need long-lived secrets in URLs).
+// SessionManager issues short-lived tab-scoped session bearer tokens held in
+// memory only (never in URLs).
 type SessionManager struct {
 	mu       sync.RWMutex
-	secret   []byte
 	sessions map[string]sessionRecord
 	ttl      time.Duration
 }
@@ -196,15 +191,12 @@ type sessionRecord struct {
 	expiresAt time.Time
 }
 
-// NewSessionManager creates a new SessionManager with a fresh random HMAC key.
+// NewSessionManager creates a new SessionManager.
 func NewSessionManager(ttl time.Duration) *SessionManager {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
 	return &SessionManager{
-		secret:   secret,
 		sessions: map[string]sessionRecord{},
 		ttl:      ttl,
 	}
@@ -268,62 +260,8 @@ func (sm *SessionManager) Validate(token string) (*Principal, bool) {
 	return rec.principal, true
 }
 
-// SignBlobToken generates a short-lived HMAC-signed ?bt= token scoped to assetID
-// (or "*" for library-wide session blob reads) and subject.
-func (sm *SessionManager) SignBlobToken(subject, assetID string, ttl time.Duration) string {
-	if ttl <= 0 {
-		ttl = 15 * time.Minute
-	}
-	exp := time.Now().UTC().Add(ttl).Unix()
-	payload := fmt.Sprintf("%s|%s|%d", subject, assetID, exp)
-	mac := hmac.New(sha256.New, sm.secret)
-	mac.Write([]byte(payload))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + sig
-}
-
-// VerifyBlobToken validates a ?bt= signed token for assetID and returns a
-// read-only Principal scoped to asset:read.
-func (sm *SessionManager) VerifyBlobToken(bt, assetID string) (*Principal, bool) {
-	parts := strings.Split(bt, ".")
-	if len(parts) != 2 {
-		return nil, false
-	}
-	rawPayload, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return nil, false
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, false
-	}
-	mac := hmac.New(sha256.New, sm.secret)
-	mac.Write(rawPayload)
-	if !hmac.Equal(sig, mac.Sum(nil)) {
-		return nil, false
-	}
-	fields := strings.Split(string(rawPayload), "|")
-	if len(fields) != 3 {
-		return nil, false
-	}
-	subject, scopedAsset, expStr := fields[0], fields[1], fields[2]
-	exp, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil || time.Now().UTC().Unix() > exp {
-		return nil, false
-	}
-	if scopedAsset != "*" && scopedAsset != assetID {
-		return nil, false
-	}
-	return &Principal{
-		Subject: subject,
-		Scopes: map[Permission]bool{
-			PermAssetRead: true,
-		},
-	}, true
-}
-
 // CompositeAuthenticator combines session tokens, static bearer tokens,
-// Tailnet WhoIs identity, ?bt= blob tokens, and optional loopback access.
+// Tailnet WhoIs identity, and optional loopback access.
 type CompositeAuthenticator struct {
 	Sessions      *SessionManager
 	StaticToken   string
@@ -346,21 +284,12 @@ func (a *CompositeAuthenticator) Authenticate(r *http.Request) (*Principal, erro
 		}
 	}
 
-	// 2. Signed ?bt= query parameter (scoped solely to asset blob reads).
-	if bt := r.URL.Query().Get("bt"); bt != "" && a.Sessions != nil {
-		assetID := r.PathValue("id")
-		if p, ok := a.Sessions.VerifyBlobToken(bt, assetID); ok {
-			return p, nil
-		}
-	}
-
 	// A token that is not recognised (expired, or issued before a restart:
-	// sessions and the blob-signing key live only in memory) authenticates
-	// nothing, but it does not disqualify the caller either. The identity
-	// checks below depend only on the connection, so a caller could reach
-	// them anyway by omitting the stale token; falling through lets an open
-	// tab keep working across a server restart. In token mode nothing below
-	// applies and the request is refused.
+	// sessions live only in memory) authenticates nothing, but it does not
+	// disqualify the caller either. The identity checks below depend only on
+	// the connection, so a caller could reach them anyway by omitting the stale
+	// token; falling through lets an open tab keep working across a server
+	// restart. In token mode nothing below applies and the request is refused.
 	if a.RequireToken {
 		return nil, ErrUnauthorized
 	}

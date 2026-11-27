@@ -48,7 +48,7 @@ components:
     Kind:
       name: kind
       in: query
-      description: Repeatable or comma-separated, matched with OR. `raw`, `image`, `photo`, or a file extension.
+      description: Repeatable or comma-separated, matched with OR. `raw`, `image`, `photo`, `ultrahdr`, or a file extension.
       schema:
         type: array
         items:
@@ -225,6 +225,13 @@ components:
         value: {}
         outcome:
           type: string
+          enum: [applied, observed]
+          description: >-
+            `applied` is an op accepted by `POST /ops`. `observed` is not an op: the server
+            noticed the asset change outside the op stream, and `field` says what changed
+            (`sidecar`: the `.edits` state was rewritten by another program; `editThumbnail`:
+            the edited preview was replaced). Re-read the asset from `assets` instead of
+            applying `value`.
     ChangesResponse:
       type: object
       required: [ops, assets, nextCursor]
@@ -242,7 +249,7 @@ components:
           description: Opaque cursor to pass as `since` on the next poll.
         snapshotRequired:
           type: boolean
-          description: True when `since` is not a position in this server's journal; re-run the initial sync and continue from `nextCursor`.
+          description: True when `since` is not a position in this server's retained journal (it belongs to another journal, or the entries after it were already removed); re-run the initial sync and continue from `nextCursor`.
     TruthOp:
       type: object
       required: [hlc, device, assetKey, field]
@@ -276,8 +283,8 @@ components:
           type: string
         reason:
           type: string
-          enum: [asset-not-found, invalid-op]
-          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will.
+          enum: [asset-not-found, invalid-op, clock-skew]
+          description: Present when status is rejected. asset-not-found may succeed on a later retry; invalid-op never will; clock-skew means the op's HLC is more than 24 hours ahead of the server's clock and the op must be issued again with a correct clock.
     OpsRequest:
       type: object
       required: [ops]
@@ -385,6 +392,23 @@ paths:
       responses:
         "200":
           description: Issued session token and expiry
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, subject, expiresAt, permissions]
+                properties:
+                  token:
+                    type: string
+                  subject:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  permissions:
+                    type: array
+                    items:
+                      type: string
         "401":
           description: Unauthorized
   /assets/count:
@@ -483,10 +507,6 @@ paths:
           schema:
             type: string
             enum: [original, t0, t1, t2, thumb, preview]
-        - name: bt
-          in: query
-          schema:
-            type: string
       responses:
         "200":
           description: Full media bytes
@@ -641,7 +661,7 @@ paths:
           description: Thumbnail saved
   /assets/{id}/aux/{channel}:
     get:
-      summary: Fetch an auxiliary channel PNG sidecar (e.g. depth)
+      summary: Fetch an auxiliary channel image sidecar (JPEG or PNG, e.g. depth)
       security:
         - BearerAuth: []
       parameters:
@@ -658,8 +678,12 @@ paths:
             enum: [depth]
       responses:
         "200":
-          description: Raw auxiliary channel PNG bytes with strong ETag and X-HDRT-Aux-Channel
+          description: Raw auxiliary channel JPEG or PNG bytes with strong ETag and X-HDRT-Aux-Channel
           content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
             image/png:
               schema:
                 type: string
@@ -679,7 +703,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
     put:
-      summary: Upload an auxiliary channel PNG sidecar (<= 16 MiB)
+      summary: Upload an auxiliary channel JPEG or PNG sidecar (<= 16 MiB)
       security:
         - BearerAuth: []
       parameters:
@@ -697,6 +721,10 @@ paths:
       requestBody:
         required: true
         content:
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
           image/png:
             schema:
               type: string
@@ -727,7 +755,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "415":
-          description: Payload does not start with a valid PNG signature
+          description: Payload does not start with a valid JPEG or PNG signature
           content:
             application/json:
               schema:
@@ -828,6 +856,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Another process kept rewriting a target sidecar; nothing was applied. Retry after `Retry-After` seconds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /changes:
     get:
       summary: Poll monotonic change feed
@@ -836,7 +870,7 @@ paths:
       parameters:
         - name: since
           in: query
-          description: Opaque `nextCursor` of the previous page; omit to bootstrap.
+          description: Opaque `nextCursor` of the previous page. Omit it to read from the oldest retained entry, or pass `head` to get only the current head as `nextCursor`.
           schema:
             type: string
         - name: limit

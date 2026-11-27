@@ -101,7 +101,7 @@ func TestScanOpsIdempotencyFilterAndLosslessRebuild(t *testing.T) {
 	}
 
 	// Changes feed must contain all 4 ops.
-	feed, err := idx.ChangesSince(ctx, "0", 50)
+	feed, err := idx.ChangesSince(ctx, "", 50)
 	if err != nil || len(feed.Ops) != 4 {
 		t.Fatalf("expected 4 ops in changes feed, got %d err=%v", len(feed.Ops), err)
 	}

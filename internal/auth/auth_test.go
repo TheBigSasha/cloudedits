@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestSessionAndBlobTokens(t *testing.T) {
+func TestSessionTokensAndQueryParamRejected(t *testing.T) {
 	sm := NewSessionManager(5 * time.Minute)
 	p := OwnerPrincipal("tailnet:alice@example.com")
 
@@ -21,13 +21,11 @@ func TestSessionAndBlobTokens(t *testing.T) {
 		t.Fatalf("expected valid session for %s", p.Subject)
 	}
 
-	bt := sm.SignBlobToken(p.Subject, "asset-123", 5*time.Minute)
-	bp, ok := sm.VerifyBlobToken(bt, "asset-123")
-	if !ok || !bp.HasPermission(PermAssetRead) || bp.HasPermission(PermEditsWrite) {
-		t.Fatalf("blob token must grant only asset:read for asset-123")
-	}
-	if _, ok := sm.VerifyBlobToken(bt, "asset-other"); ok {
-		t.Fatalf("blob token must reject mismatched asset ID")
+	// Query-string credentials (?bt=) are never accepted.
+	a := &CompositeAuthenticator{Sessions: sm, RequireToken: true}
+	r := httptest.NewRequest(http.MethodGet, "/assets/asset-123/blob?bt="+tok, nil)
+	if _, err := a.Authenticate(r); err == nil {
+		t.Fatal("expected ?bt= query parameter to be rejected")
 	}
 }
 

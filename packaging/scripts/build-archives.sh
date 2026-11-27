@@ -61,12 +61,18 @@ for target in "${TARGETS[@]}"; do
   cp "$ROOT_DIR/README.md" "$stage/README.md"
 
   if [[ "$goos" == "windows" ]]; then
+    setup_bin="$stage/cloudedits-setup.exe"
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+      go build -trimpath -ldflags="-H=windowsgui -s -w -X main.version=${VERSION}" \
+      -o "$setup_bin" ./cmd/cloudedits-setup
+    "$ROOT_DIR/packaging/scripts/check-release-symbols.sh" "$setup_bin"
+
     archive="$OUT_DIR/cloudedits_${goos}_${goarch}.zip"
     rm -f "$archive"
     (
       cd "$stage"
       if command -v zip >/dev/null 2>&1; then
-        zip -q -9 "$archive" "cloudedits.exe" LICENSE README.md
+        zip -q -9 "$archive" "cloudedits.exe" "cloudedits-setup.exe" LICENSE README.md
       else
         python3 -c '
 import sys, zipfile
@@ -75,7 +81,7 @@ files = sys.argv[2:]
 with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
     for f in files:
         zf.write(f)
-' "$archive" "cloudedits.exe" LICENSE README.md
+' "$archive" "cloudedits.exe" "cloudedits-setup.exe" LICENSE README.md
       fi
     )
   else

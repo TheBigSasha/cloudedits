@@ -156,13 +156,27 @@ func TestLiveResponsesMatchOpenAPI(t *testing.T) {
 	}
 	requireProps("GET /assets/range?fields=grid item", page.Assets[0], "GridAsset")
 
-	putAuxReq := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/assets/"+assetID+"/aux/depth", bytes.NewReader(samplePNG(t, 4, 4, color.RGBA{1, 2, 3, 255})))
-	putAuxReq.RemoteAddr = "127.0.0.1:50000"
-	putAuxRec := httptest.NewRecorder()
-	srv.ServeHTTP(putAuxRec, putAuxReq)
-	if putAuxRec.Code != http.StatusOK {
-		t.Fatalf("PUT /assets/{id}/aux/depth: status=%d body=%s", putAuxRec.Code, putAuxRec.Body.String())
+	for _, tc := range []struct {
+		label string
+		body  []byte
+		want  string
+	}{
+		{"JPEG", sampleJPEG(t, 4, 4, color.RGBA{1, 2, 3, 255}), "image/jpeg"},
+		{"PNG", samplePNG(t, 4, 4, color.RGBA{1, 2, 3, 255}), "image/png"},
+	} {
+		putAuxReq := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/assets/"+assetID+"/aux/depth", bytes.NewReader(tc.body))
+		putAuxReq.Header.Set("Content-Type", tc.want)
+		putAuxReq.RemoteAddr = "127.0.0.1:50000"
+		putAuxRec := httptest.NewRecorder()
+		srv.ServeHTTP(putAuxRec, putAuxReq)
+		if putAuxRec.Code != http.StatusOK {
+			t.Fatalf("PUT /assets/{id}/aux/depth (%s): status=%d body=%s", tc.label, putAuxRec.Code, putAuxRec.Body.String())
+		}
+		requireProps("PUT /assets/{id}/aux/depth ("+tc.label+")", putAuxRec.Body.Bytes(), "AuxChannelUploadResponse")
+		getAuxRec := do(http.MethodGet, "/assets/"+assetID+"/aux/depth")
+		if getAuxRec.Code != http.StatusOK || getAuxRec.Header().Get("Content-Type") != tc.want {
+			t.Fatalf("GET /assets/{id}/aux/depth (%s): status=%d ct=%q want %q", tc.label, getAuxRec.Code, getAuxRec.Header().Get("Content-Type"), tc.want)
+		}
 	}
-	requireProps("PUT /assets/{id}/aux/depth", putAuxRec.Body.Bytes(), "AuxChannelUploadResponse")
 	requireProps("DELETE /assets/{id}/aux/depth", do(http.MethodDelete, "/assets/"+assetID+"/aux/depth").Body.Bytes(), "AuxChannelDeleteResponse")
 }

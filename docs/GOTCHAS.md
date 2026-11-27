@@ -44,3 +44,9 @@ Keep `index.db` outside the photo folder (never on SMB/NFS network shares where 
 ## 10. Read-Only NAS Bind Mounts
 
 By default, `cloudedits` writes sidecars to `<folder>/.hdrtoys/` so local folder access and remote access share edits seamlessly. If a NAS administrator insists on mounting `/library/photos:ro`, pass `--sidecar-dir /data/sidecars` so `cloudedits` stays functional without failing on write; `cloudedits doctor` explicitly notes that external sidecars are not colocated inside the photo folder.
+
+## 11. A Second Writer on the Same Folder
+
+A browser editor with direct file access can have the same photo folder open while the server runs, and both rewrite `.hdrtoys/<rel>.edits` with read-merge-write. The per-asset mutex only serializes this server's own writers. Staging a rewrite (write + `fsync`) can take tens of milliseconds, long enough for the other process to save an edit after the server read the file; renaming over it would discard an edit that process already reported as saved. The server therefore compares the sidecar with the bytes it read immediately before the rename and restarts its read-merge-write when they differ. After six attempts it writes nothing and answers `503` with `Retry-After`, so the client resends.
+
+What remains is the interval between that comparison and the rename (two system calls), and the mirror image on the other side: a browser cannot take a file lock, so a browser editor can still replace a write the server made after the browser's own read. Both sides merge on every read, so such a lost write is repaired the next time its author saves, but until then it is missing from the file.

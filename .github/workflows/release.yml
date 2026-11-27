@@ -66,8 +66,9 @@ jobs:
       - name: Verify release binary strips all dev_apis symbols
         run: |
           go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-release ./cmd/cloudedits
-          ./packaging/scripts/check-release-symbols.sh /tmp/cloudedits-release
-          rm -f /tmp/cloudedits-release
+          go build -trimpath -ldflags="-s -w" -o /tmp/cloudedits-setup-release ./cmd/cloudedits-setup
+          ./packaging/scripts/check-release-symbols.sh /tmp/cloudedits-release /tmp/cloudedits-setup-release
+          rm -f /tmp/cloudedits-release /tmp/cloudedits-setup-release
 
   archives:
     needs: verify
@@ -133,6 +134,8 @@ jobs:
         run: |
           dotnet tool install --global wix --version 5.0.2
           wix --version
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
 
       - name: Build and smoke-test Windows amd64 & arm64 MSIs
         shell: pwsh
