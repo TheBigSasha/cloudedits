@@ -79,6 +79,34 @@ type TruthOp struct {
 	Field     string `json:"field"`
 	Value     any    `json:"value"`
 	UndoGroup string `json:"undoGroup,omitempty"`
+	// NoValue records that the op carried no "value" member at all (the
+	// browser editor drops an undefined value when it serializes an op). The
+	// cell it writes then has no "v" member either, which is what the editor
+	// itself writes for the same op; an explicit null still writes "v": null.
+	NoValue bool `json:"-"`
+}
+
+// DecodeOps decodes a JSON array of ops, keeping numbers as json.Number and
+// noting which ops carried no "value" member.
+func DecodeOps(data []byte) ([]TruthOp, error) {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return nil, err
+	}
+	ops := make([]TruthOp, len(raws))
+	for i, raw := range raws {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&ops[i]); err != nil {
+			return nil, fmt.Errorf("op %d: %w", i, err)
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err == nil {
+			_, has := members["value"]
+			ops[i].NoValue = !has
+		}
+	}
+	return ops, nil
 }
 
 // Origin names the on-disk layout a sidecar copy was read from. It only
@@ -694,7 +722,7 @@ func ApplyOp(s *Sidecar, op TruthOp) (bool, error) {
 	case "import":
 		return false, nil
 	case "recipe":
-		incoming := FieldCell{V: op.Value, HLC: op.HLC}
+		incoming := FieldCell{V: op.Value, HLC: op.HLC, NoValue: op.NoValue}
 		if s.Recipe != nil {
 			wins, err := FieldWins(incoming, *s.Recipe)
 			if err != nil {
@@ -713,7 +741,7 @@ func ApplyOp(s *Sidecar, op TruthOp) (bool, error) {
 		}
 		return joinVariant(&s.Variants, vr)
 	default:
-		incoming := FieldCell{V: op.Value, HLC: op.HLC}
+		incoming := FieldCell{V: op.Value, HLC: op.HLC, NoValue: op.NoValue}
 		if cur, exists := s.Fields[op.Field]; exists {
 			wins, err := FieldWins(incoming, cur)
 			if err != nil {

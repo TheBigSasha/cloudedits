@@ -1033,12 +1033,12 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 	var ops []sidecar.TruthOp
 	switch trimmed[0] {
 	case '[':
-		dec := json.NewDecoder(strings.NewReader(trimmed))
-		dec.UseNumber()
-		if err := dec.Decode(&ops); err != nil {
+		decoded, err := sidecar.DecodeOps([]byte(trimmed))
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid ops array JSON: "+err.Error())
 			return
 		}
+		ops = decoded
 	case '{':
 		var env map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
@@ -1050,12 +1050,12 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
 			return
 		}
-		dec := json.NewDecoder(strings.NewReader(string(rawOps)))
-		dec.UseNumber()
-		if err := dec.Decode(&ops); err != nil {
+		decoded, err := sidecar.DecodeOps(rawOps)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid ops array: "+err.Error())
 			return
 		}
+		ops = decoded
 	default:
 		writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
 		return
