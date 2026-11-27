@@ -9,9 +9,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 )
 
@@ -342,4 +345,124 @@ func TestIsTaggedSelfDetection(t *testing.T) {
 	if isTaggedSelf(&ipnstate.PeerStatus{UserID: 10}, tailcfg.UserProfile{ID: 10, LoginName: "alice@example.com"}, true) {
 		t.Error("normal user-owned node reported as tagged")
 	}
+}
+
+func TestCheckMagicDNSFromNetMap(t *testing.T) {
+	const (
+		fqdn   = "library.tail-scale.ts.net"
+		selfIP = "100.64.0.1"
+	)
+	origErr := errors.New("library.tail-scale.ts.net does not resolve on the tailnet (RCodeNameError)")
+
+	t.Run("MagicDNS disabled returns explicit error", func(t *testing.T) {
+		nm := &netmap.NetworkMap{
+			DNS: tailcfg.DNSConfig{Proxied: false},
+			SelfNode: (&tailcfg.Node{
+				Name:      fqdn + ".",
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			}).View(),
+		}
+		err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr)
+		if err == nil || !strings.Contains(err.Error(), "MagicDNS disabled") {
+			t.Fatalf("err = %v, want MagicDNS disabled error", err)
+		}
+	})
+
+	t.Run("SelfNode IPv4 match succeeds case-insensitively with trailing dot", func(t *testing.T) {
+		nm := &netmap.NetworkMap{
+			DNS: tailcfg.DNSConfig{Proxied: true},
+			SelfNode: (&tailcfg.Node{
+				Name: "LIBRARY.tail-scale.ts.net.",
+				Addresses: []netip.Prefix{
+					netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+					netip.MustParsePrefix("100.64.0.1/32"),
+				},
+			}).View(),
+		}
+		if err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr); err != nil {
+			t.Fatalf("SelfNode match failed: %v", err)
+		}
+	})
+
+	t.Run("ExtraRecord A and empty-type match succeed", func(t *testing.T) {
+		for _, recType := range []string{"A", ""} {
+			nm := &netmap.NetworkMap{
+				DNS: tailcfg.DNSConfig{
+					Proxied: true,
+					ExtraRecords: []tailcfg.DNSRecord{
+						{Name: fqdn, Type: "AAAA", Value: "fd7a:115c:a1e0::99"},
+						{Name: fqdn + ".", Type: recType, Value: selfIP},
+					},
+				},
+			}
+			if err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr); err != nil {
+				t.Fatalf("ExtraRecord type=%q failed: %v", recType, err)
+			}
+		}
+	})
+
+	t.Run("conflicting ExtraRecord returns not-this-node", func(t *testing.T) {
+		nm := &netmap.NetworkMap{
+			DNS: tailcfg.DNSConfig{
+				Proxied: true,
+				ExtraRecords: []tailcfg.DNSRecord{
+					{Name: fqdn, Type: "A", Value: "100.64.0.99"},
+				},
+			},
+		}
+		err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr)
+		if err == nil || !strings.Contains(err.Error(), "not this node") || !strings.Contains(err.Error(), "100.64.0.99") {
+			t.Fatalf("conflicting ExtraRecord err = %v, want not-this-node with 100.64.0.99", err)
+		}
+	})
+
+	t.Run("wrong peer owning fqdn returns not-this-node", func(t *testing.T) {
+		nm := &netmap.NetworkMap{
+			DNS: tailcfg.DNSConfig{Proxied: true},
+			SelfNode: (&tailcfg.Node{
+				Name:      "library-1.tail-scale.ts.net.",
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			}).View(),
+			Peers: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					Name:      fqdn + ".",
+					Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.42/32")},
+				}).View(),
+			},
+		}
+		err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr)
+		if err == nil || !strings.Contains(err.Error(), "not this node") || !strings.Contains(err.Error(), "100.64.0.42") {
+			t.Fatalf("wrong peer err = %v, want not-this-node with 100.64.0.42", err)
+		}
+	})
+
+	t.Run("missing record returns origErr or fallback message", func(t *testing.T) {
+		nm := &netmap.NetworkMap{
+			DNS: tailcfg.DNSConfig{Proxied: true},
+			SelfNode: (&tailcfg.Node{
+				Name:      "other.tail-scale.ts.net.",
+				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+			}).View(),
+		}
+		if err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, origErr); !errors.Is(err, origErr) {
+			t.Fatalf("missing record with origErr: got %v, want %v", err, origErr)
+		}
+		if err := checkMagicDNSFromNetMap(nm, fqdn, selfIP, nil); err == nil || !strings.Contains(err.Error(), "does not resolve on the tailnet") {
+			t.Fatalf("missing record without origErr: got %v", err)
+		}
+	})
+
+	t.Run("live WatchIPNBus fallback succeeds against testcontrol", func(t *testing.T) {
+		control := startTestControl(t, goodKey)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		n, err := Start(ctx, Options{Hostname: "library", StateDir: t.TempDir(), AuthKey: goodKey, ControlURL: control.HTTPTestServer.URL, Logf: logger.Discard})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = n.Close() }()
+		if err := n.checkMagicDNSViaNetMap(ctx, n.FQDN(), n.TailscaleIP(), origErr); err != nil {
+			t.Fatalf("checkMagicDNSViaNetMap live match failed: %v", err)
+		}
+	})
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,10 +20,13 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 )
 
 // taggedDevicesLogin is the shared pseudo-user login Tailscale assigns to
@@ -306,7 +310,10 @@ func (n *Node) WhoIs(ctx context.Context, remoteAddr string) (login string, isOw
 
 // CheckMagicDNS asks the node's own tailnet resolver, the one other tailnet
 // devices use, for the node's name and reports whether it answers with the
-// node's address.
+// node's address. On Linux and Windows, tsnet's noop OS DNS manager can prevent
+// the in-process resolver from populating host records; when QueryDNS returns
+// a non-success RCode or error, CheckMagicDNS falls back to inspecting the
+// node's authoritative NetMap via WatchIPNBus.
 func (n *Node) CheckMagicDNS(ctx context.Context) error {
 	fqdn, ip := n.FQDN(), n.TailscaleIP()
 	if fqdn == "" {
@@ -314,7 +321,7 @@ func (n *Node) CheckMagicDNS(ctx context.Context) error {
 	}
 	raw, _, err := n.lc.QueryDNS(ctx, fqdn+".", "A")
 	if err != nil {
-		return fmt.Errorf("query %s: %w", fqdn, err)
+		return n.checkMagicDNSViaNetMap(ctx, fqdn, ip, fmt.Errorf("query %s: %w", fqdn, err))
 	}
 	var p dnsmessage.Parser
 	hdr, err := p.Start(raw)
@@ -322,7 +329,8 @@ func (n *Node) CheckMagicDNS(ctx context.Context) error {
 		return fmt.Errorf("parse answer for %s: %w", fqdn, err)
 	}
 	if hdr.RCode != dnsmessage.RCodeSuccess {
-		return fmt.Errorf("%s does not resolve on the tailnet (%s)", fqdn, hdr.RCode)
+		origErr := fmt.Errorf("%s does not resolve on the tailnet (%s)", fqdn, hdr.RCode)
+		return n.checkMagicDNSViaNetMap(ctx, fqdn, ip, origErr)
 	}
 	if err := p.SkipAllQuestions(); err != nil {
 		return err
@@ -349,6 +357,117 @@ func (n *Node) CheckMagicDNS(ctx context.Context) error {
 			return nil
 		}
 		got = append(got, addr)
+	}
+	if len(got) == 0 {
+		origErr := fmt.Errorf("%s resolves to %v on the tailnet, not this node (%s)", fqdn, got, ip)
+		return n.checkMagicDNSViaNetMap(ctx, fqdn, ip, origErr)
+	}
+	return fmt.Errorf("%s resolves to %v on the tailnet, not this node (%s)", fqdn, got, ip)
+}
+
+func (n *Node) checkMagicDNSViaNetMap(ctx context.Context, fqdn, ip string, origErr error) error {
+	if n == nil || n.lc == nil {
+		return origErr
+	}
+	watchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	watcher, err := n.lc.WatchIPNBus(watchCtx, ipn.NotifyInitialNetMap)
+	if err != nil {
+		return origErr
+	}
+	defer func() { _ = watcher.Close() }()
+
+	for {
+		notify, err := watcher.Next()
+		if err != nil {
+			return origErr
+		}
+		if notify.NetMap != nil {
+			return checkMagicDNSFromNetMap(notify.NetMap, fqdn, ip, origErr)
+		}
+	}
+}
+
+func normalizeDNSName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+}
+
+// checkMagicDNSFromNetMap evaluates whether fqdn resolves to ip in the
+// authoritative Tailscale NetworkMap, mirroring tailscale's local DNS host
+// construction (SelfNode, Peers, and ExtraRecords) when MagicDNS is proxied.
+func checkMagicDNSFromNetMap(nm *netmap.NetworkMap, fqdn, ip string, origErr error) error {
+	if nm == nil {
+		if origErr != nil {
+			return origErr
+		}
+		return fmt.Errorf("%s does not resolve on the tailnet", fqdn)
+	}
+	if !nm.DNS.Proxied {
+		return fmt.Errorf("%s does not resolve on the tailnet (MagicDNS disabled)", fqdn)
+	}
+
+	target := normalizeDNSName(fqdn)
+	var got []string
+	seen := make(map[string]bool)
+	addIP := func(addr netip.Addr) {
+		if !addr.Is4() {
+			return
+		}
+		s := addr.String()
+		if !seen[s] {
+			seen[s] = true
+			got = append(got, s)
+		}
+	}
+	addNode := func(name string, addrs views.Slice[netip.Prefix]) {
+		if normalizeDNSName(name) != target {
+			return
+		}
+		for i := range addrs.Len() {
+			addIP(addrs.At(i).Addr())
+		}
+	}
+
+	if nm.SelfNode.Valid() {
+		selfName := nm.SelfNode.Name()
+		if selfName == "" {
+			selfName = nm.Name
+		}
+		addNode(selfName, nm.SelfNode.Addresses())
+	} else if nm.Name != "" {
+		addNode(nm.Name, nm.GetAddresses())
+	}
+	for _, peer := range nm.Peers {
+		if !peer.Valid() {
+			continue
+		}
+		addNode(peer.Name(), peer.Addresses())
+	}
+	for _, rec := range nm.DNS.ExtraRecords {
+		if rec.Type != "" && !strings.EqualFold(rec.Type, "A") {
+			continue
+		}
+		if normalizeDNSName(rec.Name) != target {
+			continue
+		}
+		addr, err := netip.ParseAddr(strings.TrimSpace(rec.Value))
+		if err != nil {
+			continue
+		}
+		addIP(addr)
+	}
+
+	if len(got) == 0 {
+		if origErr != nil {
+			return origErr
+		}
+		return fmt.Errorf("%s does not resolve on the tailnet", fqdn)
+	}
+	for _, addr := range got {
+		if addr == ip {
+			return nil
+		}
 	}
 	return fmt.Errorf("%s resolves to %v on the tailnet, not this node (%s)", fqdn, got, ip)
 }
