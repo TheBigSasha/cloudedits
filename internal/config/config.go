@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/thebigsasha/cloudedits/internal/safefile"
 )
 
 // FolderConfig defines one configured photo root folder.
@@ -156,11 +158,7 @@ func Save(cfg *Config) error {
 		return err
 	}
 	b = append(b, '\n')
-	tmp := filepath.Join(cfg.DataDir, ".config."+randomHex(6)+".tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, ConfigPath(cfg.DataDir))
+	return safefile.WriteFileAtomic(ConfigPath(cfg.DataDir), b, 0o600)
 }
 
 // AddFolder adds a photo folder cleanly (deduplicated by absolute path).

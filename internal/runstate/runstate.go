@@ -14,14 +14,14 @@
 package runstate
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/thebigsasha/cloudedits/internal/safefile"
 )
 
 const (
@@ -142,17 +142,7 @@ func WriteStatus(dataDir string, st Status) error {
 		return err
 	}
 	b = append(b, '\n')
-	var rnd [6]byte
-	_, _ = rand.Read(rnd[:])
-	tmp := filepath.Join(dataDir, ".serve-status."+hex.EncodeToString(rnd[:])+".tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, StatusPath(dataDir)); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return safefile.WriteFileAtomic(StatusPath(dataDir), b, 0o600)
 }
 
 // ReadStatus returns the last status written for dataDir, if any.
