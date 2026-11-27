@@ -75,7 +75,7 @@ const (
 
 func pickFolderNative(ctx context.Context) (FolderPickResult, error) {
 	if ctx.Err() != nil {
-		return FolderPickResult{Supported: true, Cancelled: true}, nil
+		return FolderPickResult{Supported: true, Cancelled: true}, nil //nolint:nilerr // an abandoned request is a cancelled pick, not an error
 	}
 	type outcome struct {
 		res FolderPickResult

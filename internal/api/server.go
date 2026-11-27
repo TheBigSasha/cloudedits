@@ -705,7 +705,7 @@ func (s *Server) handleAssetBlob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-HDRT-Tier-Source", res.TierSource)
 	w.Header().Set("Cache-Control", "private, max-age=3600, stale-while-revalidate=86400")
 
-	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == res.ETag {
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), res.ETag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -1033,12 +1033,12 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 	var ops []sidecar.TruthOp
 	switch trimmed[0] {
 	case '[':
-		dec := json.NewDecoder(strings.NewReader(trimmed))
-		dec.UseNumber()
-		if err := dec.Decode(&ops); err != nil {
+		decoded, err := sidecar.DecodeOps([]byte(trimmed))
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid ops array JSON: "+err.Error())
 			return
 		}
+		ops = decoded
 	case '{':
 		var env map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
@@ -1050,12 +1050,12 @@ func (s *Server) handlePostOps(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
 			return
 		}
-		dec := json.NewDecoder(strings.NewReader(string(rawOps)))
-		dec.UseNumber()
-		if err := dec.Decode(&ops); err != nil {
+		decoded, err := sidecar.DecodeOps(rawOps)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid ops array: "+err.Error())
 			return
 		}
+		ops = decoded
 	default:
 		writeError(w, http.StatusBadRequest, "ops body must be a JSON array or {\"ops\": [...]}")
 		return
@@ -1163,13 +1163,17 @@ func auxChannelETag(data []byte) string {
 	return fmt.Sprintf(`"sha256-%x"`, sum[:16])
 }
 
+// ifNoneMatchMatches reports whether an If-None-Match header names etag. The
+// header may list several tags or be "*", and it is evaluated with the weak
+// comparison (RFC 9110 13.1.2), so W/"x" matches "x".
 func ifNoneMatchMatches(header, etag string) bool {
 	if strings.TrimSpace(header) == "" {
 		return false
 	}
+	want := strings.TrimPrefix(etag, "W/")
 	for _, part := range strings.Split(header, ",") {
 		tag := strings.TrimSpace(part)
-		if tag == "*" || tag == etag {
+		if tag == "*" || strings.TrimPrefix(tag, "W/") == want {
 			return true
 		}
 	}
