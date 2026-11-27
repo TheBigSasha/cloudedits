@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
     Name="cloudedits"
     Manufacturer="hdr.toys"
@@ -18,6 +20,27 @@
     <Property Id="ARPPRODUCTICON" Value="CloudeditsIcon.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://hdr.toys" />
 
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtfPath)" />
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch cloudedits Setup" />
+    <Property Id="WixShellExecTarget" Value="[#CloudeditsSetupExe]" />
+    <CustomAction
+      Id="LaunchApplication"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixShellExec"
+      Impersonate="yes" />
+
+    <UI>
+      <Publish
+        Dialog="ExitDialog"
+        Control="Finish"
+        Event="DoAction"
+        Value="LaunchApplication"
+        Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="cloudedits">
         <Component Id="MainExecutable" Guid="9A5F1D42-7C83-4E21-B104-6F3E8A2C5D91">
@@ -30,6 +53,10 @@
             Part="last"
             Action="set"
             System="yes" />
+        </Component>
+
+        <Component Id="SetupLauncherExecutable" Guid="B4D2E8A1-3F90-4C62-8A17-5E9C2B4D6F03">
+          <File Id="CloudeditsSetupExe" Source="$(var.SetupBinaryPath)" KeyPath="yes" />
         </Component>
 
         <Component Id="LicenseComponent" Guid="3B1E7C94-2D60-4A85-9E12-4C7A6F8B3D20">
@@ -48,9 +75,8 @@
           <Shortcut
             Id="CloudeditsSetupShortcut"
             Name="cloudedits Setup"
-            Description="Launch cloudedits browser setup wizard"
-            Target="[INSTALLFOLDER]cloudedits.exe"
-            Arguments="gui"
+            Description="Launch cloudedits Setup"
+            Target="[INSTALLFOLDER]cloudedits-setup.exe"
             WorkingDirectory="INSTALLFOLDER"
             Icon="CloudeditsIcon.ico" />
           <RemoveFolder Id="CleanStartMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
@@ -65,11 +91,32 @@
       </Directory>
     </StandardDirectory>
 
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="8E2A5C71-4B19-4F83-9D62-1C3E7A9B5D40">
+        <Shortcut
+          Id="CloudeditsDesktopShortcut"
+          Name="cloudedits Setup"
+          Description="Launch cloudedits Setup"
+          Target="[INSTALLFOLDER]cloudedits-setup.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="CloudeditsIcon.ico" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\cloudedits"
+          Name="DesktopShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
     <Feature Id="MainFeature" Title="cloudedits" Level="1">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="SetupLauncherExecutable" />
       <ComponentRef Id="LicenseComponent" />
       <ComponentRef Id="ReadmeComponent" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
   </Package>
 </Wix>

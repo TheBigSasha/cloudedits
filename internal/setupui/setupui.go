@@ -280,6 +280,61 @@ func newMux(sp StateProvider) *http.ServeMux {
 		writeJSON(w, http.StatusOK, fc)
 	})
 
+	mux.HandleFunc("POST /api/folders/remove", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID   string `json:"id"`
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		id := strings.TrimSpace(req.ID)
+		path := strings.TrimSpace(req.Path)
+		if id == "" && path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "folder id or path is required"})
+			return
+		}
+		cfg := sp.GetConfig()
+		removed := false
+		if id != "" {
+			removed = cfg.RemoveFolder(id)
+		}
+		if !removed && path != "" {
+			removed = cfg.RemoveFolder(path)
+		}
+		if removed {
+			if err := sp.SaveConfig(cfg); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			sp.ConfigChanged(r.Context())
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"removed": removed,
+			"folders": cfg.Folders,
+		})
+	})
+
+	mux.HandleFunc("POST /api/pick-folder", func(w http.ResponseWriter, r *http.Request) {
+		res, err := pickFolder(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("GET /api/browse-folders", func(w http.ResponseWriter, r *http.Request) {
+		res, err := browseFolders(r.URL.Query().Get("path"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
 	mux.HandleFunc("POST /api/config", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Hostname    string `json:"hostname"`

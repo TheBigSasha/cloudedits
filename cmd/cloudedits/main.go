@@ -57,12 +57,23 @@ func (s *stringSliceFlag) Set(v string) error {
 	return nil
 }
 
+var (
+	isLaunchedFromDesktop = launchedDirectlyFromDesktop
+	runGUIFromDesktop     = func() int {
+		releaseOwnConsole()
+		return cmdGUI(nil)
+	}
+)
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
 func run(args []string) int {
 	if len(args) == 0 {
+		if isLaunchedFromDesktop() {
+			return runGUIFromDesktop()
+		}
 		printUsage()
 		return exitUsage
 	}
@@ -1142,6 +1153,22 @@ func cmdGUI(args []string) int {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		return exitStorage
 	}
+
+	// Reuse an already-running setup wizard for this data directory when using
+	// the default ephemeral loopback listener so relaunching Setup focuses the
+	// existing UI instead of stacking duplicate processes.
+	if *listen == "127.0.0.1:0" {
+		if existingURL, ok := probeActiveGUI(context.Background(), cfg.DataDir); ok {
+			fmt.Printf("Setup wizard already running at %s\n", existingURL)
+			if !*noBrowser {
+				if err := openSetupWindow(existingURL); err != nil {
+					fmt.Fprintf(os.Stderr, "note: could not open setup window automatically (%v); open %s manually\n", err, existingURL)
+				}
+			}
+			return exitOK
+		}
+	}
+
 	indexed := 0
 	idxPath := filepath.Join(cfg.DataDir, "index.db")
 	if _, statErr := os.Stat(idxPath); statErr == nil {
@@ -1155,6 +1182,10 @@ func cmdGUI(args []string) int {
 		fmt.Fprintf(os.Stderr, "listen %s: %v\n", *listen, err)
 		return exitStorage
 	}
+	boundAddr := ln.Addr().String()
+	writeGUIAddr(cfg.DataDir, boundAddr)
+	defer removeGUIAddrIfMatch(cfg.DataDir, boundAddr)
+
 	state := &guiState{dataDir: cfg.DataDir, indexed: indexed}
 	srv := newHTTPServer(setupui.Handler(state))
 
@@ -1167,11 +1198,11 @@ func cmdGUI(args []string) int {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	setupURL := fmt.Sprintf("http://%s/setup", ln.Addr().String())
+	setupURL := fmt.Sprintf("http://%s/setup", boundAddr)
 	fmt.Printf("Setup wizard listening at %s\n", setupURL)
 	if !*noBrowser {
 		go func() {
-			if err := openBrowser(setupURL); err != nil {
+			if err := openSetupWindow(setupURL); err != nil {
 				fmt.Fprintf(os.Stderr, "note: could not open browser automatically (%v); open %s manually\n", err, setupURL)
 			}
 		}()
@@ -1205,6 +1236,7 @@ func openBrowser(rawURL string) error {
 	}
 	cmd := exec.Command(name, args...)
 	cmd.Env = withoutSecrets(os.Environ())
+	configureAppLaunchCmd(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
