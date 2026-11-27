@@ -705,7 +705,7 @@ func (s *Server) handleAssetBlob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-HDRT-Tier-Source", res.TierSource)
 	w.Header().Set("Cache-Control", "private, max-age=3600, stale-while-revalidate=86400")
 
-	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == res.ETag {
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), res.ETag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -1163,13 +1163,17 @@ func auxChannelETag(data []byte) string {
 	return fmt.Sprintf(`"sha256-%x"`, sum[:16])
 }
 
+// ifNoneMatchMatches reports whether an If-None-Match header names etag. The
+// header may list several tags or be "*", and it is evaluated with the weak
+// comparison (RFC 9110 13.1.2), so W/"x" matches "x".
 func ifNoneMatchMatches(header, etag string) bool {
 	if strings.TrimSpace(header) == "" {
 		return false
 	}
+	want := strings.TrimPrefix(etag, "W/")
 	for _, part := range strings.Split(header, ",") {
 		tag := strings.TrimSpace(part)
-		if tag == "*" || tag == etag {
+		if tag == "*" || strings.TrimPrefix(tag, "W/") == want {
 			return true
 		}
 	}
